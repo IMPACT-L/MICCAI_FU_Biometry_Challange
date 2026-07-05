@@ -1,0 +1,16 @@
+data/
+baseline_repo/
+__pycache__/
+*.pyc
+*.pth
+log/
+logs/
+output/
+output_*/
+predictions/
+submission_output/
+submission_output_*/
+evaluation_results.json
+evaluation_summary.txt
+best_model.pth
+.DS_Store
