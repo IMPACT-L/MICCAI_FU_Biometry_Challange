@@ -15,7 +15,16 @@ from tqdm import tqdm
 
 from dataset import KeypointDataset, KeypointUniformSampler
 from model_factory import MultiTaskModelFactory
-from utils import evaluate_keypoint, keypoint_collate_fn, set_seed, softargmax_heatmaps_to_transformed_coords
+from utils import (
+    compute_combined_score,
+    compute_normalization_stats_from_dataframe,
+    compute_measurement_loss,
+    evaluate_keypoint,
+    keypoint_collate_fn,
+    set_seed,
+    softargmax_heatmaps_to_transformed_coords,
+    transformed_coords_to_original_normalized,
+)
 
 
 LEARNING_RATE = 1e-4
@@ -27,12 +36,24 @@ ENCODER = "vit_base_patch16_dinov3"
 ENCODER_WEIGHTS = "pretrained"
 RANDOM_SEED = 42
 VAL_SPLIT = 0.2
-HEATMAP_SIZE = (64, 64)
-HEATMAP_SIGMA = 1.8
+CHECKPOINT_SCORE_NAME = "Combined score"
 INPUT_SIZE = 512
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 USE_FPN = True  # ← 开关：设为 True 启用 FPN 特征金字塔
 HEAD_TYPE = "deep"
+HEATMAP_SIZE = (64, 64)
+HEATMAP_SIGMA = 1.8
+TASK_LOSS_WEIGHTS = {
+    "A4C": 1.35,
+    "AOP": 0.80,
+    "FA": 1.25,
+    "FUGC": 1.00,
+    "HC": 1.20,
+    "IVC": 1.10,
+    "PLAX": 1.35,
+    "PSAX": 1.10,
+    "fetal_femur": 1.25,
+}
 
 
 def _build_task_configs(dataframe):
@@ -122,9 +143,10 @@ def main(
     encoder_name: str = ENCODER,
     input_size: int = INPUT_SIZE,
     head_type: str = HEAD_TYPE,
+    measurement_loss_weight: float = 0.0,
 ):
     metric_column = "MRE (pixels)"
-    metric_label = "MRE (pixels)"
+    metric_label = CHECKPOINT_SCORE_NAME
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.abspath(output_dir)
     log_dir = os.path.join(output_dir, "log")
@@ -153,6 +175,9 @@ def main(
     logger.info(f"Encoder: {encoder_name}")
     logger.info(f"Input size: {input_size}")
     logger.info(f"Head type: {head_type}")
+    logger.info(f"Measurement loss weight: {measurement_loss_weight:.6f}")
+    logger.info(f"Heatmap size: {HEATMAP_SIZE}")
+    logger.info(f"Task loss weights: {TASK_LOSS_WEIGHTS}")
 
     logger.info(f"FPN neck: {'ENABLED' if use_fpn else 'DISABLED'} (set USE_FPN={use_fpn} at top of train.py)")
 
@@ -190,6 +215,9 @@ def main(
     )
     train_size = len(train_indices)
     val_size = len(val_indices)
+    normalization_stats = compute_normalization_stats_from_dataframe(
+        temp_dataset.dataframe.iloc[train_indices].reset_index(drop=True)
+    )
 
     train_dataset = KeypointDataset(
         data_root=DATA_ROOT_PATH,
@@ -295,7 +323,20 @@ def main(
                     target_coords_transformed = target_coords.clone()
                     coord_loss = F.l1_loss(pred_coords_transformed, target_coords_transformed)
                     heatmap_loss = F.mse_loss(pred_heatmaps, task_heatmaps)
-                    loss = heatmap_loss + 0.2 * coord_loss
+                    pred_coords_original = transformed_coords_to_original_normalized(
+                        pred_coords_transformed,
+                        [batch["meta"][i] for i in task_indices],
+                    ).to(device)
+                    target_coords_original = torch.stack([batch["label"][i] for i in task_indices], 0).to(device)
+                    measurement_loss = compute_measurement_loss(
+                        pred_coords_original,
+                        target_coords_original,
+                        [batch["meta"][i] for i in task_indices],
+                        current_task_id,
+                    )
+                    base_loss = heatmap_loss + 0.2 * coord_loss + measurement_loss_weight * measurement_loss
+                    task_weight = float(TASK_LOSS_WEIGHTS.get(current_task_id, 1.0))
+                    loss = base_loss * task_weight
 
                     optimizer.zero_grad()
                     loss.backward()
@@ -320,10 +361,30 @@ def main(
                 logger.info(f"  - {task_id}: {avg_loss:.6f}")
                 writer.add_scalar(f"train/task_loss/{task_id}", avg_loss, epoch + 1)
 
-            val_results_df = evaluate_keypoint(model, val_loader, device, task_id_to_name)
-            selected_val_score = float("inf")
+            val_results_df = evaluate_keypoint(
+                model,
+                val_loader,
+                device,
+                task_id_to_name,
+                normalization_stats=normalization_stats,
+            )
+            selected_val_score = compute_combined_score(val_results_df, normalization_stats=normalization_stats)
+            selected_val_mre = float("inf")
+            selected_val_measurement = float("inf")
+            selected_val_normalized_mre = float("inf")
+            selected_val_normalized_measurement = float("inf")
             if not val_results_df.empty and metric_column in val_results_df.columns:
-                selected_val_score = float(val_results_df[metric_column].mean())
+                selected_val_mre = float(val_results_df[metric_column].mean())
+            if not val_results_df.empty and "Normalized MRE" in val_results_df.columns:
+                selected_val_normalized_mre = float(val_results_df["Normalized MRE"].mean())
+            if not val_results_df.empty and "Measurement MAE (pixels)" in val_results_df.columns:
+                measurement_values = val_results_df["Measurement MAE (pixels)"].dropna()
+                if len(measurement_values) > 0:
+                    selected_val_measurement = float(measurement_values.mean())
+            if not val_results_df.empty and "Normalized Measurement MAE" in val_results_df.columns:
+                measurement_values = val_results_df["Normalized Measurement MAE"].dropna()
+                if len(measurement_values) > 0:
+                    selected_val_normalized_measurement = float(measurement_values.mean())
 
             logger.info(f"\n--- Epoch {epoch + 1} Validation Report ---")
             if not val_results_df.empty:
@@ -334,7 +395,47 @@ def main(
                         float(row[metric_column]),
                         epoch + 1,
                     )
-            writer.add_scalar("val/mre_pixels_mean", selected_val_score, epoch + 1)
+                    if "Normalized MRE" in row and not np.isnan(row["Normalized MRE"]):
+                        writer.add_scalar(
+                            f"val/normalized_mre/{row['Task ID']}",
+                            float(row["Normalized MRE"]),
+                            epoch + 1,
+                        )
+                    if "Measurement MAE (pixels)" in row and not np.isnan(row["Measurement MAE (pixels)"]):
+                        writer.add_scalar(
+                            f"val/measurement_mae_pixels/{row['Task ID']}",
+                            float(row["Measurement MAE (pixels)"]),
+                            epoch + 1,
+                        )
+                    if "Normalized Measurement MAE" in row and not np.isnan(row["Normalized Measurement MAE"]):
+                        writer.add_scalar(
+                            f"val/normalized_measurement_mae/{row['Task ID']}",
+                            float(row["Normalized Measurement MAE"]),
+                            epoch + 1,
+                        )
+            writer.add_scalar("val/mre_pixels_mean", selected_val_mre, epoch + 1)
+            writer.add_scalar("val/combined_score", selected_val_score, epoch + 1)
+            if np.isfinite(selected_val_normalized_mre):
+                writer.add_scalar("val/normalized_mre_mean", selected_val_normalized_mre, epoch + 1)
+            if np.isfinite(selected_val_normalized_measurement):
+                writer.add_scalar(
+                    "val/normalized_measurement_mae_mean",
+                    selected_val_normalized_measurement,
+                    epoch + 1,
+                )
+            if np.isfinite(selected_val_mre):
+                writer.add_scalar("val/mre_pixels_mean_only", selected_val_mre, epoch + 1)
+            if np.isfinite(selected_val_measurement):
+                writer.add_scalar("val/measurement_mae_pixels_mean", selected_val_measurement, epoch + 1)
+            logger.info(f"--- Average Val MRE (pixels): {selected_val_mre:.6f} ---")
+            if np.isfinite(selected_val_measurement):
+                logger.info(f"--- Average Val Measurement MAE (pixels): {selected_val_measurement:.6f} ---")
+            if np.isfinite(selected_val_normalized_mre):
+                logger.info(f"--- Average Val Normalized MRE: {selected_val_normalized_mre:.6f} ---")
+            if np.isfinite(selected_val_normalized_measurement):
+                logger.info(
+                    f"--- Average Val Normalized Measurement MAE: {selected_val_normalized_measurement:.6f} ---"
+                )
             logger.info(f"--- Average Val {metric_label} (Lower is better): {selected_val_score:.6f} ---")
 
             improved = selected_val_score < (best_val_score - early_stopping_min_delta)
@@ -344,14 +445,17 @@ def main(
                 best_val_results_df = val_results_df.copy()
                 checkpoint_payload = {
                     "state_dict": model.state_dict(),
-                    "meta": {
-                        "encoder_name": encoder_name,
-                        "use_fpn": use_fpn,
-                        "head_type": head_type,
-                        "input_size": input_size,
-                        "heatmap_size": list(HEATMAP_SIZE),
-                    },
-                }
+                        "meta": {
+                            "encoder_name": encoder_name,
+                            "use_fpn": use_fpn,
+                            "head_type": head_type,
+                            "input_size": input_size,
+                            "heatmap_size": list(HEATMAP_SIZE),
+                            "checkpoint_metric": metric_label,
+                            "measurement_loss_weight": measurement_loss_weight,
+                            "normalization_scheme": "train_iqr_proxy",
+                        },
+                    }
                 torch.save(checkpoint_payload, model_save_path)
                 logger.info(f"-> New best model saved! {metric_label} improved to: {best_val_score:.6f}")
             else:
@@ -465,6 +569,12 @@ if __name__ == "__main__":
         default=HEAD_TYPE,
         help=f"Decoder head type (default: {HEAD_TYPE}).",
     )
+    parser.add_argument(
+        "--measurement-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary measurement loss weight. Use 0.0 for the task-weighted baseline.",
+    )
     args = parser.parse_args()
 
     # --no-fpn takes precedence over --fpn
@@ -487,4 +597,5 @@ if __name__ == "__main__":
         encoder_name=str(args.encoder_name),
         input_size=int(args.input_size),
         head_type=str(args.head_type),
+        measurement_loss_weight=float(args.measurement_loss_weight),
     )

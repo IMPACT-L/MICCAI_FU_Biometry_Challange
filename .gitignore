@@ -6,7 +6,15 @@ __pycache__/
 log/
 logs/
 output/
-output_*/
+!output/
+output/runs/
+output/runs/**
+output/submissions/
+output/submissions/**
+!output/submissions/**/
+!output/submissions/**/codabench_result_*.txt
+output/misc/
+output/misc/**
 predictions/
 submission_output/
 submission_output_*/

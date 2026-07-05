@@ -215,10 +215,12 @@ class Model:
         self.encoder_name = checkpoint_meta.get("encoder_name", self.encoder_name)
         self.head_type = checkpoint_meta.get("head_type", self.head_type)
         self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
+        self.heatmap_size = tuple(checkpoint_meta.get("heatmap_size", list(self.heatmap_size)))
         print(
             "Checkpoint architecture: "
             f"encoder={self.encoder_name}, "
             f"head={self.head_type}, "
+            f"heatmap_size={self.heatmap_size}, "
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
         )

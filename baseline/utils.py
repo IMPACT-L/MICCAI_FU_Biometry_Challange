@@ -1,11 +1,27 @@
 import random
 from collections import defaultdict
+import json
 
 import cv2
 import numpy as np
 import pandas as pd
 import torch
 from tqdm import tqdm
+
+
+MEASUREMENT_PAIRS = {
+    "A4C": [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15)],
+    "AOP": [(0, 1), (2, 3)],
+    "FA": [(0, 1), (2, 3)],
+    "FUGC": [(0, 1)],
+    "HC": [(0, 1), (2, 3)],
+    "IVC": [(0, 1)],
+    "PLAX": [(0, 1), (2, 3), (4, 5), (6, 7), (8, 9), (10, 11), (12, 13), (14, 15), (16, 17), (18, 19), (20, 21)],
+    "PSAX": [(0, 1), (2, 3)],
+    "fetal_femur": [(0, 1)],
+}
+
+DEFAULT_NORMALIZER_EPS = 1.0
 
 
 def set_seed(seed: int) -> None:
@@ -149,7 +165,144 @@ def calculate_mre_per_sample(y_true: torch.Tensor, y_pred: torch.Tensor, meta: l
     return float(np.mean(scores))
 
 
-def evaluate_keypoint(model, val_loader, device, task_id_to_name):
+def _coords_to_pixel_points(coords: torch.Tensor, meta: list[dict]) -> np.ndarray:
+    coords_np = coords.detach().cpu().numpy().copy().reshape(coords.shape[0], -1, 2)
+    output = []
+    for idx, sample_meta in enumerate(meta):
+        width = max(float(sample_meta["original_width"]) - 1.0, 1.0)
+        height = max(float(sample_meta["original_height"]) - 1.0, 1.0)
+        pts = coords_np[idx].copy()
+        pts[:, 0] *= width
+        pts[:, 1] *= height
+        output.append(pts)
+    return np.stack(output, axis=0)
+
+
+def compute_measurements_from_points(points_px: np.ndarray, task_id: str) -> np.ndarray:
+    pairs = MEASUREMENT_PAIRS.get(task_id, [])
+    if not pairs:
+        return np.zeros((points_px.shape[0], 0), dtype=np.float32)
+    measures = []
+    for start_idx, end_idx in pairs:
+        start_pts = points_px[:, start_idx, :]
+        end_pts = points_px[:, end_idx, :]
+        dist = np.linalg.norm(end_pts - start_pts, axis=-1)
+        measures.append(dist.astype(np.float32))
+    return np.stack(measures, axis=1) if measures else np.zeros((points_px.shape[0], 0), dtype=np.float32)
+
+
+def compute_normalization_stats_from_dataframe(dataframe: pd.DataFrame) -> dict:
+    stats = {}
+    for task_id, task_df in dataframe.groupby("task_id", sort=True):
+        num_points = int(task_df["num_classes"].iloc[0])
+        pairs = MEASUREMENT_PAIRS.get(task_id, [])
+        measurement_values = []
+        mre_reference_values = []
+
+        for _, row in task_df.iterrows():
+            coords = []
+            for point_idx in range(1, num_points + 1):
+                col = f"point_{point_idx}_xy"
+                if col in row and pd.notna(row[col]):
+                    coords.extend(json.loads(row[col]))
+                else:
+                    coords.extend([0.0, 0.0])
+            points = np.array(coords, dtype=np.float32).reshape(-1, 2)
+            if pairs:
+                measures = compute_measurements_from_points(points[None, ...], task_id)[0]
+                measurement_values.append(measures)
+                mre_reference_values.extend(measures.tolist())
+
+        task_stats = {
+            "mre_iqr": DEFAULT_NORMALIZER_EPS,
+            "measurement_iqr": [],
+        }
+
+        if mre_reference_values:
+            q1, q3 = np.percentile(np.array(mre_reference_values, dtype=np.float32), [25, 75])
+            task_stats["mre_iqr"] = float(max(q3 - q1, DEFAULT_NORMALIZER_EPS))
+
+        if measurement_values:
+            measurement_array = np.stack(measurement_values, axis=0)
+            for measure_idx in range(measurement_array.shape[1]):
+                q1, q3 = np.percentile(measurement_array[:, measure_idx], [25, 75])
+                task_stats["measurement_iqr"].append(float(max(q3 - q1, DEFAULT_NORMALIZER_EPS)))
+
+        stats[task_id] = task_stats
+
+    return stats
+
+
+def calculate_measurement_mae_per_sample(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    meta: list[dict],
+    task_id: str,
+) -> float:
+    gt_points = _coords_to_pixel_points(y_true, meta)
+    pred_points = _coords_to_pixel_points(y_pred, meta)
+    gt_measures = compute_measurements_from_points(gt_points, task_id)
+    pred_measures = compute_measurements_from_points(pred_points, task_id)
+    if gt_measures.shape[1] == 0:
+        return 0.0
+    return float(np.mean(np.abs(pred_measures - gt_measures)))
+
+
+def compute_measurement_loss(
+    pred_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    meta: list[dict],
+    task_id: str,
+) -> torch.Tensor:
+    pairs = MEASUREMENT_PAIRS.get(task_id, [])
+    if not pairs:
+        return pred_coords.new_tensor(0.0)
+
+    pred = pred_coords.reshape(pred_coords.shape[0], -1, 2)
+    target = target_coords.reshape(target_coords.shape[0], -1, 2)
+    losses = []
+    for batch_idx, sample_meta in enumerate(meta):
+        width = pred_coords.new_tensor(max(float(sample_meta["original_width"]) - 1.0, 1.0))
+        height = pred_coords.new_tensor(max(float(sample_meta["original_height"]) - 1.0, 1.0))
+        scale = pred_coords.new_tensor([width, height])
+        pred_pts = pred[batch_idx] * scale
+        target_pts = target[batch_idx] * scale
+        for start_idx, end_idx in pairs:
+            pred_dist = torch.norm(pred_pts[end_idx] - pred_pts[start_idx], p=2)
+            target_dist = torch.norm(target_pts[end_idx] - target_pts[start_idx], p=2)
+            losses.append(torch.abs(pred_dist - target_dist))
+    if not losses:
+        return pred_coords.new_tensor(0.0)
+    return torch.stack(losses).mean()
+
+
+def compute_combined_score(results_df: pd.DataFrame, normalization_stats: dict | None = None) -> float:
+    if results_df.empty or "MRE (pixels)" not in results_df.columns:
+        return float("inf")
+
+    normalized_mre_values = []
+    normalized_measurement_values = []
+
+    for _, row in results_df.iterrows():
+        task_id = row["Task ID"]
+        task_stats = (normalization_stats or {}).get(task_id, {})
+        mre_norm = float(task_stats.get("mre_iqr", DEFAULT_NORMALIZER_EPS))
+        normalized_mre_values.append(float(row["MRE (pixels)"]) / max(mre_norm, DEFAULT_NORMALIZER_EPS))
+
+        measurement_value = row.get("Measurement MAE (pixels)")
+        if measurement_value is not None and np.isfinite(measurement_value):
+            measurement_norms = task_stats.get("measurement_iqr", [])
+            if measurement_norms:
+                normalized_measurement_values.append(float(measurement_value) / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS))
+
+    normalized_mre = float(np.mean(normalized_mre_values)) if normalized_mre_values else float("inf")
+    if not normalized_measurement_values:
+        return normalized_mre
+    normalized_measurement = float(np.mean(normalized_measurement_values))
+    return 0.5 * normalized_mre + 0.5 * normalized_measurement
+
+
+def evaluate_keypoint(model, val_loader, device, task_id_to_name, normalization_stats: dict | None = None):
     model.eval()
     task_metrics = defaultdict(lambda: defaultdict(list))
 
@@ -178,12 +331,27 @@ def evaluate_keypoint(model, val_loader, device, task_id_to_name):
                         task_meta,
                     )
                 )
+                if task_id in MEASUREMENT_PAIRS:
+                    task_metrics[task_id]["Measurement MAE (pixels)"].append(
+                        calculate_measurement_mae_per_sample(
+                            task_labels,
+                            pred_coords,
+                            task_meta,
+                            task_id,
+                        )
+                    )
 
     results = []
     for task_id in sorted(task_metrics.keys()):
         row = {"Task ID": task_id, "Task Name": task_id_to_name.get(task_id, "Regression")}
         for metric_name, values in task_metrics[task_id].items():
             row[metric_name] = float(np.mean(values)) if values else 0.0
+        task_stats = (normalization_stats or {}).get(task_id, {})
+        row["Normalized MRE"] = row["MRE (pixels)"] / max(float(task_stats.get("mre_iqr", DEFAULT_NORMALIZER_EPS)), DEFAULT_NORMALIZER_EPS)
+        if "Measurement MAE (pixels)" in row:
+            measurement_norms = task_stats.get("measurement_iqr", [])
+            if measurement_norms:
+                row["Normalized Measurement MAE"] = row["Measurement MAE (pixels)"] / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS)
         results.append(row)
 
     return pd.DataFrame(results)
