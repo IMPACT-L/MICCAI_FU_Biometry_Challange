@@ -55,6 +55,27 @@ class KeypointDataset(Dataset):
                 f"{sorted(EXTRA_REGRESSION_TASK_IDS)}."
             )
 
+        valid_indices = []
+        missing_paths = []
+        for idx, image_path in enumerate(self.dataframe["image_path"].astype(str).tolist()):
+            resolved = self._resolve_image_path(image_path)
+            if resolved is None:
+                missing_paths.append(image_path)
+            else:
+                valid_indices.append(idx)
+
+        if missing_paths:
+            self.dataframe = self.dataframe.iloc[valid_indices].reset_index(drop=True)
+            preview = ", ".join(missing_paths[:5])
+            print(
+                f"Filtered out {len(missing_paths)} samples with missing images. "
+                f"Examples: {preview}"
+            )
+            if self.dataframe.empty:
+                raise FileNotFoundError(
+                    "All dataset rows were filtered out because their images could not be resolved."
+                )
+
         print(f"Keypoint data loaded. Total samples: {len(self.dataframe)}")
 
     def __len__(self) -> int:
