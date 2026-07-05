@@ -23,15 +23,16 @@ BATCH_SIZE = 4
 NUM_EPOCHS =35
 DATA_ROOT_PATH = "data"
 OUTPUT_DIR = "output"
-ENCODER = "vit_base_patch14_dinov2.lvd142m"
+ENCODER = "vit_base_patch16_dinov3"
 ENCODER_WEIGHTS = "pretrained"
 RANDOM_SEED = 42
 VAL_SPLIT = 0.2
 HEATMAP_SIZE = (64, 64)
 HEATMAP_SIGMA = 1.8
-INPUT_SIZE = 518
+INPUT_SIZE = 512
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 USE_FPN = True  # ← 开关：设为 True 启用 FPN 特征金字塔
+HEAD_TYPE = "deep"
 
 
 def _build_task_configs(dataframe):
@@ -118,6 +119,9 @@ def main(
     early_stopping_patience: int | None = None,
     early_stopping_min_delta: float = 0.0,
     output_dir: str = OUTPUT_DIR,
+    encoder_name: str = ENCODER,
+    input_size: int = INPUT_SIZE,
+    head_type: str = HEAD_TYPE,
 ):
     metric_column = "MRE (pixels)"
     metric_label = "MRE (pixels)"
@@ -146,6 +150,9 @@ def main(
     set_seed(RANDOM_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Device used: {device}")
+    logger.info(f"Encoder: {encoder_name}")
+    logger.info(f"Input size: {input_size}")
+    logger.info(f"Head type: {head_type}")
 
     logger.info(f"FPN neck: {'ENABLED' if use_fpn else 'DISABLED'} (set USE_FPN={use_fpn} at top of train.py)")
 
@@ -170,7 +177,7 @@ def main(
         transforms=train_transforms,
         heatmap_size=HEATMAP_SIZE,
         sigma=HEATMAP_SIGMA,
-        input_size=INPUT_SIZE,
+        input_size=input_size,
     )
 
     task_configs = _build_task_configs(temp_dataset.dataframe)
@@ -189,7 +196,7 @@ def main(
         transforms=train_transforms,
         heatmap_size=HEATMAP_SIZE,
         sigma=HEATMAP_SIGMA,
-        input_size=INPUT_SIZE,
+        input_size=input_size,
     )
     train_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
 
@@ -198,7 +205,7 @@ def main(
         transforms=val_transforms,
         heatmap_size=HEATMAP_SIZE,
         sigma=HEATMAP_SIGMA,
-        input_size=INPUT_SIZE,
+        input_size=input_size,
     )
     val_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
 
@@ -206,7 +213,7 @@ def main(
     val_subset = torch.utils.data.Subset(val_dataset, val_indices)
 
     logger.info(
-        f"Dataset split (per-task stratified, val_split={val_split:.3f}): "
+        f"Dataset split (per-task stratified, val_split={val_split:.6f}): "
         f"{train_size} training samples, {val_size} validation samples"
     )
 
@@ -235,17 +242,17 @@ def main(
     )
 
     model = MultiTaskModelFactory(
-        encoder_name=ENCODER,
+        encoder_name=encoder_name,
         encoder_weights=ENCODER_WEIGHTS,
         task_configs=task_configs,
         heatmap_size=HEATMAP_SIZE,
         use_fpn=use_fpn,
+        head_type=head_type,
     ).to(device)
 
     param_groups = [{"params": model.encoder.parameters(), "lr": LEARNING_RATE * 0.2}]
     for task_id, head in model.heads.items():
         param_groups.append({"params": head.parameters(), "lr": LEARNING_RATE * 10.0})
-        logger.info(f"Task head {task_id} LR: {LEARNING_RATE * 10.0}")
 
     optimizer = optim.AdamW(param_groups)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -299,7 +306,10 @@ def main(
                     epoch_train_losses[current_task_id].append(loss_value)
 
                 mean_batch_loss = float(np.mean(batch_loss_values)) if batch_loss_values else 0.0
-                loop.set_postfix(loss=mean_batch_loss, groups=len(set(task_ids)), lr=scheduler.get_last_lr()[0])
+                loop.set_postfix(
+                    loss=f"{mean_batch_loss:.6f}",
+                    groups=len(set(task_ids)),
+                )
 
             logger.info(f"\n--- Epoch {epoch + 1} Average Train Loss ---")
             train_epoch_mean = float(np.mean([v for values in epoch_train_losses.values() for v in values]))
@@ -307,7 +317,7 @@ def main(
             writer.add_scalar("train/lr_encoder", float(optimizer.param_groups[0]["lr"]), epoch + 1)
             for task_id in sorted(epoch_train_losses.keys()):
                 avg_loss = float(np.mean(epoch_train_losses[task_id]))
-                logger.info(f"  - {task_id}: {avg_loss:.4f}")
+                logger.info(f"  - {task_id}: {avg_loss:.6f}")
                 writer.add_scalar(f"train/task_loss/{task_id}", avg_loss, epoch + 1)
 
             val_results_df = evaluate_keypoint(model, val_loader, device, task_id_to_name)
@@ -317,7 +327,7 @@ def main(
 
             logger.info(f"\n--- Epoch {epoch + 1} Validation Report ---")
             if not val_results_df.empty:
-                logger.info(val_results_df.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+                logger.info(val_results_df.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
                 for _, row in val_results_df.iterrows():
                     writer.add_scalar(
                         f"val/{metric_column}/{row['Task ID']}",
@@ -325,16 +335,25 @@ def main(
                         epoch + 1,
                     )
             writer.add_scalar("val/mre_pixels_mean", selected_val_score, epoch + 1)
-            logger.info(f"--- Average Val {metric_label} (Lower is better): {selected_val_score:.4f} ---")
+            logger.info(f"--- Average Val {metric_label} (Lower is better): {selected_val_score:.6f} ---")
 
             improved = selected_val_score < (best_val_score - early_stopping_min_delta)
             if improved:
                 best_val_score = selected_val_score
                 epochs_without_improvement = 0
                 best_val_results_df = val_results_df.copy()
-                state_dict = model.state_dict()
-                torch.save(state_dict, model_save_path)
-                logger.info(f"-> New best model saved! {metric_label} improved to: {best_val_score:.4f}")
+                checkpoint_payload = {
+                    "state_dict": model.state_dict(),
+                    "meta": {
+                        "encoder_name": encoder_name,
+                        "use_fpn": use_fpn,
+                        "head_type": head_type,
+                        "input_size": input_size,
+                        "heatmap_size": list(HEATMAP_SIZE),
+                    },
+                }
+                torch.save(checkpoint_payload, model_save_path)
+                logger.info(f"-> New best model saved! {metric_label} improved to: {best_val_score:.6f}")
             else:
                 epochs_without_improvement += 1
                 if early_stopping_patience is not None:
@@ -351,7 +370,7 @@ def main(
             ):
                 logger.info(
                     "Early stopping triggered after "
-                    f"{epoch + 1} epochs. Best {metric_label}: {best_val_score:.4f}"
+                    f"{epoch + 1} epochs. Best {metric_label}: {best_val_score:.6f}"
                 )
                 break
 
@@ -427,6 +446,25 @@ if __name__ == "__main__":
         default=OUTPUT_DIR,
         help=f"Directory to store logs, checkpoints, and metrics (default: {OUTPUT_DIR}).",
     )
+    parser.add_argument(
+        "--encoder-name",
+        type=str,
+        default=ENCODER,
+        help=f"Backbone model name (default: {ENCODER}).",
+    )
+    parser.add_argument(
+        "--input-size",
+        type=int,
+        default=INPUT_SIZE,
+        help=f"Square letterbox input size (default: {INPUT_SIZE}).",
+    )
+    parser.add_argument(
+        "--head-type",
+        type=str,
+        choices=("basic", "deep"),
+        default=HEAD_TYPE,
+        help=f"Decoder head type (default: {HEAD_TYPE}).",
+    )
     args = parser.parse_args()
 
     # --no-fpn takes precedence over --fpn
@@ -446,4 +484,7 @@ if __name__ == "__main__":
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=float(args.early_stopping_min_delta),
         output_dir=str(args.output_dir),
+        encoder_name=str(args.encoder_name),
+        input_size=int(args.input_size),
+        head_type=str(args.head_type),
     )

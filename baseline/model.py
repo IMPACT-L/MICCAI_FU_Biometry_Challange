@@ -19,6 +19,7 @@ from utils import decode_heatmaps_to_normalized_coords, letterbox_image_and_poin
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
+OUTPUT_DECIMALS = 6
 
 
 def normalize_submission_image_path(image_path: str, task_id: str) -> str:
@@ -31,6 +32,17 @@ def normalize_submission_image_path(image_path: str, task_id: str) -> str:
     return f"{task_id}/{os.path.basename(normalized)}"
 
 
+def round_float_list(values, decimals: int = OUTPUT_DECIMALS):
+    return [round(float(value), decimals) for value in values]
+
+
+def load_checkpoint_payload(checkpoint_path: str, device: torch.device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        return checkpoint["state_dict"], checkpoint.get("meta", {})
+    return checkpoint, {}
+
+
 class InferenceDataset(Dataset):
     """Inference dataset for keypoint tasks only."""
 
@@ -39,11 +51,12 @@ class InferenceDataset(Dataset):
         data_root: str,
         transforms: Optional[A.Compose] = None,
         split_csv: Optional[str] = None,
+        input_size: int = 518,
     ):
         super().__init__()
         self.data_root = data_root
         self.transforms = transforms
-        self.input_size = 518
+        self.input_size = input_size
         self.csv_path = os.path.join(self.data_root, "csv")
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
@@ -160,6 +173,7 @@ class Model:
         self.checkpoint_path = checkpoint_path
         self.encoder_name = encoder_name
         self.use_fpn = use_fpn
+        self.head_type = "basic"
         self.model = None
         self.task_configs = None
         self.task_id_to_name = None
@@ -195,11 +209,16 @@ class Model:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        checkpoint = torch.load(model_path, map_location=self.device)
+        checkpoint, checkpoint_meta = load_checkpoint_payload(model_path, self.device)
         checkpoint_has_fpn = any(key.startswith("fpn.") for key in checkpoint.keys())
-        use_fpn = checkpoint_has_fpn if self.use_fpn is None else self.use_fpn
+        use_fpn = checkpoint_meta.get("use_fpn", checkpoint_has_fpn) if self.use_fpn is None else self.use_fpn
+        self.encoder_name = checkpoint_meta.get("encoder_name", self.encoder_name)
+        self.head_type = checkpoint_meta.get("head_type", self.head_type)
+        self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
         print(
             "Checkpoint architecture: "
+            f"encoder={self.encoder_name}, "
+            f"head={self.head_type}, "
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
         )
@@ -210,6 +229,7 @@ class Model:
             task_configs=self.task_configs,
             heatmap_size=self.heatmap_size,
             use_fpn=use_fpn,
+            head_type=self.head_type,
         ).to(self.device)
 
         self.model.load_state_dict(checkpoint)
@@ -231,7 +251,16 @@ class Model:
         print("=" * 60)
 
         os.makedirs(output_dir, exist_ok=True)
-        dataset = InferenceDataset(data_root=data_root, transforms=self.transforms, split_csv=split_csv)
+        if not os.path.exists(self.checkpoint_path):
+            raise FileNotFoundError(f"Model file not found: {self.checkpoint_path}")
+        _, checkpoint_meta = load_checkpoint_payload(self.checkpoint_path, self.device)
+        self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
+        dataset = InferenceDataset(
+            data_root=data_root,
+            transforms=self.transforms,
+            split_csv=split_csv,
+            input_size=self.input_size,
+        )
 
         self.task_configs = self._build_task_configs(dataset.dataframe)
         self.task_id_to_name = {cfg["task_id"]: cfg["task_name"] for cfg in self.task_configs}
@@ -292,12 +321,13 @@ class Model:
         if isinstance(pred, torch.Tensor):
             pred = pred.cpu().numpy()
 
-        coords = pred.flatten().tolist()
+        coords = round_float_list(pred.flatten().tolist())
         h, w = original_size
         pixel_coords = []
         for i in range(0, len(coords), 2):
             x_norm, y_norm = coords[i], coords[i + 1]
             pixel_coords.extend([x_norm * w, y_norm * h])
+        pixel_coords = round_float_list(pixel_coords)
 
         return {
             "image_path": normalize_submission_image_path(image_path, task_id),

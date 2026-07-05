@@ -10,6 +10,7 @@ from tqdm import tqdm
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
+OUTPUT_DECIMALS = 6
 
 
 def normalize_eval_image_path(image_path: str, task_id: str) -> str:
@@ -96,7 +97,7 @@ class Evaluator:
 
             if mre_scores:
                 task_results[task_id] = {
-                    "MRE": float(np.mean(mre_scores)),
+                    "MRE": round(float(np.mean(mre_scores)), OUTPUT_DECIMALS),
                     "num_samples": len(mre_scores),
                 }
             else:
@@ -117,12 +118,12 @@ class Evaluator:
 
         lines = ["=" * 80, "Keypoint Evaluation Summary", "=" * 80]
         if all_mre:
-            lines.append(f"Average MRE: {np.mean(all_mre):.4f}")
+            lines.append(f"Average MRE: {np.mean(all_mre):.6f}")
             lines.append(f"Number of tasks: {len(all_mre)}")
             for task_id, task_result in reg_results.items():
                 if task_result["num_samples"] > 0:
                     lines.append(
-                        f"  {task_id}: MRE={task_result['MRE']:.4f}, samples={task_result['num_samples']}"
+                        f"  {task_id}: MRE={task_result['MRE']:.6f}, samples={task_result['num_samples']}"
                     )
         else:
             lines.append("No valid keypoint predictions found.")
@@ -136,6 +137,7 @@ class Evaluator:
 
     @staticmethod
     def save_results(results: Dict, output_path: str):
+        results = json.loads(json.dumps(results), parse_float=lambda x: round(float(x), OUTPUT_DECIMALS))
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
 

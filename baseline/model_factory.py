@@ -34,6 +34,42 @@ class HeatmapHead(nn.Module):
         return x
 
 
+class DeepHeatmapHead(nn.Module):
+    """Stronger decoder head for finer keypoint localization."""
+
+    def __init__(self, in_channels: int, num_points: int):
+        super().__init__()
+        hidden1 = max(in_channels // 2, 192)
+        hidden2 = max(hidden1 // 2, 128)
+        hidden3 = max(hidden2 // 2, 96)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size) -> torch.Tensor:
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
 class FPN(nn.Module):
     """Feature Pyramid Network (FPN) neck for multi-scale feature enrichment.
 
@@ -132,6 +168,7 @@ class DINOv2Backbone(nn.Module):
         if not hasattr(self.backbone, "patch_embed"):
             raise ValueError(f"Model '{model_name}' is not a ViT-style backbone with patch_embed.")
         self.out_channels = int(self.backbone.num_features)
+        self.num_prefix_tokens = int(getattr(self.backbone, "num_prefix_tokens", 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = self.backbone.forward_features(x)
@@ -141,12 +178,12 @@ class DINOv2Backbone(nn.Module):
                 patch_tokens = feats["x_norm_patchtokens"]
             elif "x_prenorm" in feats:
                 all_tokens = feats["x_prenorm"]
-                patch_tokens = all_tokens[:, 1:, :]
+                patch_tokens = all_tokens[:, self.num_prefix_tokens :, :]
             else:
                 raise RuntimeError("Unsupported forward_features output from DINOv2 backbone.")
         elif isinstance(feats, torch.Tensor):
             if feats.dim() == 3:
-                patch_tokens = feats[:, 1:, :]
+                patch_tokens = feats[:, self.num_prefix_tokens :, :]
             else:
                 raise RuntimeError("Unexpected tensor shape from forward_features.")
         else:
@@ -171,13 +208,15 @@ class MultiTaskModelFactory(nn.Module):
         task_configs: List[Dict],
         heatmap_size=(64, 64),
         use_fpn: bool = False,
+        head_type: str = "basic",
     ):
         super().__init__()
 
         self.heatmap_size = heatmap_size
         self.use_fpn = use_fpn
+        self.head_type = head_type
 
-        print(f"Initializing DINOv2 encoder: {encoder_name}")
+        print(f"Initializing encoder: {encoder_name}")
         self.encoder = DINOv2Backbone(model_name=encoder_name, pretrained=(encoder_weights is not None))
 
         # FPN neck (optional)
@@ -192,6 +231,13 @@ class MultiTaskModelFactory(nn.Module):
 
         self.heads = nn.ModuleDict()
         print(f"Creating keypoint heads for {len(task_configs)} tasks...")
+        if head_type == "basic":
+            head_cls = HeatmapHead
+        elif head_type == "deep":
+            head_cls = DeepHeatmapHead
+        else:
+            raise ValueError(f"Unsupported head_type: {head_type}")
+        print(f"Head type: {head_type}")
 
         for config in task_configs:
             task_id = config["task_id"]
@@ -200,7 +246,7 @@ class MultiTaskModelFactory(nn.Module):
                 continue
 
             num_points = int(config["num_classes"])
-            self.heads[task_id] = HeatmapHead(in_channels=head_channels, num_points=num_points)
+            self.heads[task_id] = head_cls(in_channels=head_channels, num_points=num_points)
 
         if not self.heads:
             raise ValueError("No keypoint heads were created. Check task_configs with task_name == 'Regression'.")
