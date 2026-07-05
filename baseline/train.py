@@ -41,6 +41,7 @@ INPUT_SIZE = 512
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 USE_FPN = True  # ← 开关：设为 True 启用 FPN 特征金字塔
 HEAD_TYPE = "deep"
+TASK_HEAD_PROFILE = "challenge_v1"
 HEATMAP_SIZE = (64, 64)
 HEATMAP_SIGMA = 1.8
 TASK_LOSS_WEIGHTS = {
@@ -143,6 +144,7 @@ def main(
     encoder_name: str = ENCODER,
     input_size: int = INPUT_SIZE,
     head_type: str = HEAD_TYPE,
+    task_head_profile: str = TASK_HEAD_PROFILE,
     measurement_loss_weight: float = 0.0,
 ):
     metric_column = "MRE (pixels)"
@@ -175,6 +177,7 @@ def main(
     logger.info(f"Encoder: {encoder_name}")
     logger.info(f"Input size: {input_size}")
     logger.info(f"Head type: {head_type}")
+    logger.info(f"Task head profile: {task_head_profile}")
     logger.info(f"Measurement loss weight: {measurement_loss_weight:.6f}")
     logger.info(f"Heatmap size: {HEATMAP_SIZE}")
     logger.info(f"Task loss weights: {TASK_LOSS_WEIGHTS}")
@@ -276,6 +279,7 @@ def main(
         heatmap_size=HEATMAP_SIZE,
         use_fpn=use_fpn,
         head_type=head_type,
+        task_head_profile=task_head_profile,
     ).to(device)
 
     param_groups = [{"params": model.encoder.parameters(), "lr": LEARNING_RATE * 0.2}]
@@ -449,6 +453,7 @@ def main(
                             "encoder_name": encoder_name,
                             "use_fpn": use_fpn,
                             "head_type": head_type,
+                            "task_head_profile": task_head_profile,
                             "input_size": input_size,
                             "heatmap_size": list(HEATMAP_SIZE),
                             "checkpoint_metric": metric_label,
@@ -570,6 +575,13 @@ if __name__ == "__main__":
         help=f"Decoder head type (default: {HEAD_TYPE}).",
     )
     parser.add_argument(
+        "--task-head-profile",
+        type=str,
+        choices=("uniform", "challenge_v1"),
+        default=TASK_HEAD_PROFILE,
+        help=f"Task-specific head sizing profile (default: {TASK_HEAD_PROFILE}).",
+    )
+    parser.add_argument(
         "--measurement-loss-weight",
         type=float,
         default=0.0,
@@ -597,5 +609,6 @@ if __name__ == "__main__":
         encoder_name=str(args.encoder_name),
         input_size=int(args.input_size),
         head_type=str(args.head_type),
+        task_head_profile=str(args.task_head_profile),
         measurement_loss_weight=float(args.measurement_loss_weight),
     )

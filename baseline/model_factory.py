@@ -7,24 +7,42 @@ import torch.nn.functional as F
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
+TASK_HEAD_PROFILE_PRESETS = {
+    "uniform": {},
+    "challenge_v1": {
+        "A4C": "heavy",
+        "HC": "heavy",
+        "PLAX": "heavy",
+        "AOP": "light",
+        "FUGC": "light",
+        "IVC": "light",
+        "fetal_femur": "light",
+    },
+}
+HEAD_WIDTH_MULTIPLIERS = {
+    "light": 0.75,
+    "medium": 1.0,
+    "heavy": 1.35,
+}
 
 
 class HeatmapHead(nn.Module):
     """Light decoder that maps DINOv2 feature maps to keypoint heatmaps."""
 
-    def __init__(self, in_channels: int, num_points: int):
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
         super().__init__()
-        hidden = max(in_channels // 2, 128)
+        hidden = max(int((in_channels // 2) * width_multiplier), 96)
+        hidden2 = max(hidden // 2, 64)
         self.decoder = nn.Sequential(
             nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(hidden),
             nn.GELU(),
             nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
-            nn.Conv2d(hidden, hidden // 2, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden // 2),
+            nn.Conv2d(hidden, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
             nn.GELU(),
             nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
-            nn.Conv2d(hidden // 2, num_points, kernel_size=1),
+            nn.Conv2d(hidden2, num_points, kernel_size=1),
         )
 
     def forward(self, x: torch.Tensor, out_size) -> torch.Tensor:
@@ -37,11 +55,11 @@ class HeatmapHead(nn.Module):
 class DeepHeatmapHead(nn.Module):
     """Stronger decoder head for finer keypoint localization."""
 
-    def __init__(self, in_channels: int, num_points: int):
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
         super().__init__()
-        hidden1 = max(in_channels // 2, 192)
-        hidden2 = max(hidden1 // 2, 128)
-        hidden3 = max(hidden2 // 2, 96)
+        hidden1 = max(int((in_channels // 2) * width_multiplier), 128)
+        hidden2 = max(int((hidden1 // 2) * width_multiplier), 96)
+        hidden3 = max(int((hidden2 // 2) * width_multiplier), 64)
         self.decoder = nn.Sequential(
             nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(hidden1),
@@ -209,12 +227,14 @@ class MultiTaskModelFactory(nn.Module):
         heatmap_size=(64, 64),
         use_fpn: bool = False,
         head_type: str = "basic",
+        task_head_profile: str = "uniform",
     ):
         super().__init__()
 
         self.heatmap_size = heatmap_size
         self.use_fpn = use_fpn
         self.head_type = head_type
+        self.task_head_profile = task_head_profile
 
         print(f"Initializing encoder: {encoder_name}")
         self.encoder = DINOv2Backbone(model_name=encoder_name, pretrained=(encoder_weights is not None))
@@ -237,7 +257,11 @@ class MultiTaskModelFactory(nn.Module):
             head_cls = DeepHeatmapHead
         else:
             raise ValueError(f"Unsupported head_type: {head_type}")
+        if task_head_profile not in TASK_HEAD_PROFILE_PRESETS:
+            raise ValueError(f"Unsupported task_head_profile: {task_head_profile}")
         print(f"Head type: {head_type}")
+        print(f"Task head profile: {task_head_profile}")
+        task_variant_map = TASK_HEAD_PROFILE_PRESETS[task_head_profile]
 
         for config in task_configs:
             task_id = config["task_id"]
@@ -246,7 +270,17 @@ class MultiTaskModelFactory(nn.Module):
                 continue
 
             num_points = int(config["num_classes"])
-            self.heads[task_id] = head_cls(in_channels=head_channels, num_points=num_points)
+            head_variant = task_variant_map.get(task_id, "medium")
+            width_multiplier = HEAD_WIDTH_MULTIPLIERS[head_variant]
+            print(
+                f"  - {task_id}: {head_variant} head "
+                f"(width_multiplier={width_multiplier:.2f}, num_points={num_points})"
+            )
+            self.heads[task_id] = head_cls(
+                in_channels=head_channels,
+                num_points=num_points,
+                width_multiplier=width_multiplier,
+            )
 
         if not self.heads:
             raise ValueError("No keypoint heads were created. Check task_configs with task_name == 'Regression'.")

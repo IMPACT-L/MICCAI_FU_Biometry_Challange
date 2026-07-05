@@ -174,6 +174,7 @@ class Model:
         self.encoder_name = encoder_name
         self.use_fpn = use_fpn
         self.head_type = "basic"
+        self.task_head_profile = "uniform"
         self.model = None
         self.task_configs = None
         self.task_id_to_name = None
@@ -214,12 +215,14 @@ class Model:
         use_fpn = checkpoint_meta.get("use_fpn", checkpoint_has_fpn) if self.use_fpn is None else self.use_fpn
         self.encoder_name = checkpoint_meta.get("encoder_name", self.encoder_name)
         self.head_type = checkpoint_meta.get("head_type", self.head_type)
+        self.task_head_profile = checkpoint_meta.get("task_head_profile", self.task_head_profile)
         self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
         self.heatmap_size = tuple(checkpoint_meta.get("heatmap_size", list(self.heatmap_size)))
         print(
             "Checkpoint architecture: "
             f"encoder={self.encoder_name}, "
             f"head={self.head_type}, "
+            f"task_head_profile={self.task_head_profile}, "
             f"heatmap_size={self.heatmap_size}, "
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
@@ -232,6 +235,7 @@ class Model:
             heatmap_size=self.heatmap_size,
             use_fpn=use_fpn,
             head_type=self.head_type,
+            task_head_profile=self.task_head_profile,
         ).to(self.device)
 
         self.model.load_state_dict(checkpoint)
