@@ -94,16 +94,32 @@ class KeypointDataset(Dataset):
         return heatmaps
 
     def __getitem__(self, idx: int) -> dict:
-        record = self.dataframe.iloc[idx]
-        task_id = record["task_id"]
+        total = len(self)
+        if total == 0:
+            raise IndexError("KeypointDataset is empty.")
 
-        image_abs_path = self._resolve_image_path(record["image_path"])
-        if image_abs_path is None:
-            return self.__getitem__((idx + 1) % len(self))
-        image = cv2.imread(image_abs_path)
-
-        if image is None:
-            return self.__getitem__((idx + 1) % len(self))
+        record = None
+        image = None
+        task_id = None
+        last_error = None
+        for offset in range(total):
+            current_idx = (idx + offset) % total
+            record = self.dataframe.iloc[current_idx]
+            task_id = record["task_id"]
+            image_abs_path = self._resolve_image_path(record["image_path"])
+            if image_abs_path is None:
+                last_error = f"Could not resolve image path: {record['image_path']}"
+                continue
+            image = cv2.imread(image_abs_path)
+            if image is None:
+                last_error = f"Failed to read image: {image_abs_path}"
+                continue
+            break
+        else:
+            raise FileNotFoundError(
+                "Unable to load any valid image from dataset sample search. "
+                f"Last error: {last_error}"
+            )
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         original_height, original_width = image.shape[:2]
