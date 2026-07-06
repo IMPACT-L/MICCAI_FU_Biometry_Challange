@@ -97,7 +97,10 @@ class ModelEma:
     def update(self, model: torch.nn.Module) -> None:
         state_dict = model.state_dict()
         for name, value in state_dict.items():
-            self.shadow[name].mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+            if torch.is_floating_point(value):
+                self.shadow[name].mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+            else:
+                self.shadow[name].copy_(value.detach())
 
     @torch.no_grad()
     def copy_to(self, model: torch.nn.Module) -> None:
