@@ -62,6 +62,22 @@ Code anchor:
 
 - decoder profile preset: [baseline/model_factory.py](baseline/model_factory.py)
 
+## Weak-Task Decoder Map
+
+The `weak_tasks_v1` decoder profile is the current targeted experiment preset. It only specializes the weak tasks and leaves the stronger tasks on the proven default path.
+
+| Task | Decoder | Reason |
+| --- | --- | --- |
+| `FUGC` | `fugc` | short 2-point structure that benefits from local refinement and segment evidence |
+| `IVC` | `ivc` | noisy vessel diameter with directional context and endpoint pairing |
+| `fetal_femur` | `femur` | long-bone endpoint task that benefits from shaft-aware evidence |
+
+Why this preset exists:
+
+- the full `dedicated_v1` profile changed too many tasks at once
+- it improved some weak tasks but often regressed already-stable tasks
+- `weak_tasks_v1` keeps the selective specialization where it is most likely to help leaderboard rank
+
 ## Why Each Head Was Chosen
 
 The dedicated heads were not chosen by landmark count alone. They were chosen from the actual image appearance, anatomical structure, and measurement geometry of each dataset.
@@ -263,6 +279,12 @@ The dataset-family profile currently available is `dataset_v1`:
 
 This is implemented in [baseline/utils.py](baseline/utils.py).
 
+Important:
+
+- the intended dedicated-head experiment must use `--task-loss-family-profile dataset_v1`
+- an earlier run named `dinov3_vitb_dedicated_head` used `dedicated_v1` but still had `task loss family profile: uniform`
+- the correct dataset-family-loss run should be stored separately as `dinov3_vitb_dedicated_head_datasetv1`
+
 ## Challenge Metric Alignment
 
 The official challenge ranking is based on:
@@ -308,15 +330,15 @@ python baseline/train.py \
   --early-stopping-patience 10 \
   --batch-size 4 \
   --num-workers 4 \
-  --fpn-mode shared \
+  --fpn-mode task_specific \
   --task-head-profile challenge_v1 \
-  --task-decoder-profile dedicated_v1 \
+  --task-decoder-profile weak_tasks_v1 \
   --task-loss-family-profile dataset_v1 \
   --measurement-loss-weight 0.0 \
   --dataset-loss-weight 0.02 \
   --femur-shaft-loss-weight 0.15 \
   --fugc-segment-loss-weight 0.08 \
-  --output-dir output/runs/dinov3_vitb_dedicated_head
+  --output-dir output/runs/dinov3_vitb_taskfpn_weaktasks_v1
 ```
 
 ## Local Inference
@@ -326,11 +348,9 @@ conda activate miccai_fu_biometry
 
 python baseline/model.py \
   --data-root data \
-  --checkpoint-path output/runs/dinov3_vitb_dedicated_head/checkpoints/best_model.pth \
-  --output-dir output/runs/dinov3_vitb_dedicated_head/predictions \
-  --fpn-mode shared \
-  --task-head-profile challenge_v1 \
-  --task-decoder-profile dedicated_v1
+  --checkpoint-path output/runs/dinov3_vitb_taskfpn_weaktasks_v1/checkpoints/best_model.pth \
+  --output-dir output/runs/dinov3_vitb_taskfpn_weaktasks_v1/predictions \
+  --fpn-mode task_specific
 ```
 
 ## Local Evaluation
@@ -340,9 +360,9 @@ conda activate miccai_fu_biometry
 
 python baseline/evaluate.py \
   --data-root data \
-  --pred-root output/runs/dinov3_vitb_dedicated_head/predictions \
-  --output-file output/runs/dinov3_vitb_dedicated_head/evaluation_results.json \
-  --summary-file output/runs/dinov3_vitb_dedicated_head/evaluation_summary.txt
+  --pred-root output/runs/dinov3_vitb_taskfpn_weaktasks_v1/predictions \
+  --output-file output/runs/dinov3_vitb_taskfpn_weaktasks_v1/evaluation_results.json \
+  --summary-file output/runs/dinov3_vitb_taskfpn_weaktasks_v1/evaluation_summary.txt
 ```
 
 ## Challenge Submission
@@ -353,8 +373,8 @@ python baseline/evaluate.py \
 conda activate miccai_fu_biometry
 
 python submit.py \
-  --checkpoint-path output/runs/dinov3_vitb_dedicated_head/checkpoints/best_model.pth \
-  --output-dir output/submissions/dinov3_vitb_dedicated_head \
+  --checkpoint-path output/runs/dinov3_vitb_dedicated_head_datasetv1/checkpoints/best_model.pth \
+  --output-dir output/submissions/dinov3_vitb_dedicated_head_datasetv1 \
   --batch-size 8 \
   --num-workers 4
 ```

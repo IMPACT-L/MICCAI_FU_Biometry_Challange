@@ -33,6 +33,11 @@ TASK_DECODER_PROFILE_PRESETS = {
         "IVC": "line",
         "fetal_femur": "femur",
     },
+    "weak_tasks_v1": {
+        "FUGC": "fugc",
+        "IVC": "ivc",
+        "fetal_femur": "femur",
+    },
     "dedicated_v1": {
         "A4C": "a4c",
         "PLAX": "plax",

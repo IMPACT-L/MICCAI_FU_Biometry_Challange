@@ -179,7 +179,7 @@ Current weak-task order from local evaluation of `dinov3_vitb_taskfpn`:
 The current baseline is improved and challenge-compliant, but it is still far from the top leaderboard cluster. We will follow this order for the next round of work:
 
 1. Use dataset-dedicated decoders on top of the shared DINOv3 backbone instead of one generic head family for all tasks.
-2. Strengthen the weakest tasks first, especially `fetal_femur`, `IVC`, `A4C`, `PSAX`, and `HC`.
+2. Strengthen the weakest tasks first, especially `fetal_femur`, `IVC`, and `FUGC`, without destabilizing already-strong tasks.
 3. Track per-task validation metrics and select checkpoints based on multi-task generalization, not only average local MRE.
 4. Add challenge-oriented inference improvements where allowed by the challenge packaging constraints.
 5. Add stronger measurement-aware training and validation so checkpoint selection is closer to the official ranking metric.
@@ -189,7 +189,7 @@ The current baseline is improved and challenge-compliant, but it is still far fr
 - Local `MRE` on the labeled training-side data is optimistic and does not predict CodaBench rank well.
 - The challenge ranking uses both landmark accuracy and derived biometric measurement accuracy.
 - Our current best single-checkpoint submission is already competitive enough to use as a fine-tuning base.
-- The current biggest local weaknesses are `fetal_femur`, `IVC`, `A4C`, `PSAX`, and `HC`, so their decoders should be specialized before touching already-strong tasks such as `FUGC` and `AOP`.
+- The current biggest leaderboard weaknesses are `fetal_femur`, `IVC`, and `FUGC`, while broad all-head specialization has repeatedly hurt stronger tasks.
 
 ## Dedicated-head status
 
@@ -201,9 +201,25 @@ Current `dedicated_v1` decoder coverage:
 - `FUGC`: local-refinement decoder with segment auxiliary branch
 - `HC`: ring-aware decoder
 - `IVC`: diameter-aware decoder with directional context branches
-- `PLAX`: dense relational decoder
-- `PSAX`: compact decoder
+- `PLAX`: long-axis dense decoder
+- `PSAX`: short-axis ring decoder
 - `fetal_femur`: shaft-aware decoder with auxiliary shaft branch
+
+Important:
+
+- the intended dedicated-head run must include `--task-loss-family-profile dataset_v1`
+- an earlier run named `dinov3_vitb_dedicated_head` used `dedicated_v1` but still had `task loss family profile: uniform`
+- use a separate output directory for the real dataset-family-loss experiment
+
+## Targeted weak-task status
+
+Current `weak_tasks_v1` decoder coverage:
+
+- `FUGC`: `fugc`
+- `IVC`: `ivc`
+- `fetal_femur`: `femur`
+
+All other tasks fall back to the stronger proven `geometry_v1` / baseline path. This is the current recommended direction because it isolates the weak tasks without rewriting the heads that were already stable.
 
 Recommended next full run:
 
@@ -215,12 +231,13 @@ python baseline/train.py \
   --early-stopping-patience 10 \
   --batch-size 4 \
   --num-workers 4 \
-  --fpn-mode shared \
+  --fpn-mode task_specific \
   --task-head-profile challenge_v1 \
-  --task-decoder-profile dedicated_v1 \
+  --task-decoder-profile weak_tasks_v1 \
+  --task-loss-family-profile dataset_v1 \
   --measurement-loss-weight 0.0 \
   --dataset-loss-weight 0.02 \
   --femur-shaft-loss-weight 0.15 \
   --fugc-segment-loss-weight 0.08 \
-  --output-dir output/runs/dinov3_vitb_dedicated_head
+  --output-dir output/runs/dinov3_vitb_taskfpn_weaktasks_v1
 ```
