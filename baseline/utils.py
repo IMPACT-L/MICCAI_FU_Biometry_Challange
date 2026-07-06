@@ -21,6 +21,16 @@ MEASUREMENT_PAIRS = {
     "fetal_femur": [(0, 1)],
 }
 
+TASK_PAIR_CANONICAL_RULES = {
+    "AOP": {0: "x_desc", 1: "x_asc"},
+    "FA": {0: "y_asc", 1: "x_desc"},
+    "FUGC": {0: "x_asc"},
+    "HC": {0: "y_asc", 1: "x_desc"},
+    "IVC": {0: "y_asc"},
+    "PSAX": {0: "y_asc", 1: "y_asc"},
+    "fetal_femur": {0: "x_asc"},
+}
+
 TASK_LOSS_FAMILY_PRESETS = {
     "uniform": {},
     "dataset_v1": {
@@ -34,9 +44,66 @@ TASK_LOSS_FAMILY_PRESETS = {
         "IVC": "line",
         "fetal_femur": "line",
     },
+    "weak_tasks_v1": {
+        "FUGC": "fugc",
+        "IVC": "ivc",
+        "fetal_femur": "femur",
+    },
 }
 
 DEFAULT_NORMALIZER_EPS = 1.0
+
+
+def _canonical_pair_swap_mask(p0, p1, rule: str):
+    if rule == "x_asc":
+        return (p0[:, 0] > p1[:, 0]) | ((p0[:, 0] == p1[:, 0]) & (p0[:, 1] > p1[:, 1]))
+    if rule == "x_desc":
+        return (p0[:, 0] < p1[:, 0]) | ((p0[:, 0] == p1[:, 0]) & (p0[:, 1] > p1[:, 1]))
+    if rule == "y_asc":
+        return (p0[:, 1] > p1[:, 1]) | ((p0[:, 1] == p1[:, 1]) & (p0[:, 0] > p1[:, 0]))
+    if rule == "y_desc":
+        return (p0[:, 1] < p1[:, 1]) | ((p0[:, 1] == p1[:, 1]) & (p0[:, 0] > p1[:, 0]))
+    raise ValueError(f"Unsupported canonical pair rule: {rule}")
+
+
+def canonicalize_task_coords(coords, task_id: str):
+    pair_rules = TASK_PAIR_CANONICAL_RULES.get(task_id)
+    if not pair_rules:
+        return coords
+
+    if isinstance(coords, torch.Tensor):
+        reshaped = coords.reshape(coords.shape[0], -1, 2).clone()
+        for pair_idx, rule in pair_rules.items():
+            start_idx = pair_idx * 2
+            end_idx = start_idx + 1
+            p0 = reshaped[:, start_idx, :]
+            p1 = reshaped[:, end_idx, :]
+            swap_mask = _canonical_pair_swap_mask(p0, p1, rule)
+            if swap_mask.any():
+                reordered = reshaped.clone()
+                reordered[swap_mask, start_idx, :] = reshaped[swap_mask, end_idx, :]
+                reordered[swap_mask, end_idx, :] = reshaped[swap_mask, start_idx, :]
+                reshaped = reordered
+        return reshaped.reshape(coords.shape[0], -1)
+
+    array = np.asarray(coords, dtype=np.float32)
+    original_shape = array.shape
+    if array.ndim == 1:
+        reshaped = array.reshape(1, -1, 2).copy()
+    else:
+        reshaped = array.reshape(array.shape[0], -1, 2).copy()
+    for pair_idx, rule in pair_rules.items():
+        start_idx = pair_idx * 2
+        end_idx = start_idx + 1
+        p0 = reshaped[:, start_idx, :].copy()
+        p1 = reshaped[:, end_idx, :].copy()
+        swap_mask = _canonical_pair_swap_mask(p0, p1, rule)
+        reshaped[swap_mask, start_idx, :] = p1[swap_mask]
+        reshaped[swap_mask, end_idx, :] = p0[swap_mask]
+    flat = reshaped.reshape(reshaped.shape[0], -1)
+    if len(original_shape) == 1:
+        return flat[0]
+    return flat
 
 
 def set_seed(seed: int) -> None:
@@ -416,6 +483,16 @@ def compute_dataset_specific_loss(
     if family == "dense":
         pairwise_loss = compute_pairwise_distance_loss(pred_coords, target_coords, meta)
         return 0.5 * measurement_loss + 0.5 * pairwise_loss
+    if family == "fugc":
+        direction_loss = compute_line_direction_loss(pred_coords, target_coords, meta, task_id)
+        return 0.55 * measurement_loss + 0.45 * direction_loss
+    if family == "ivc":
+        direction_loss = compute_line_direction_loss(pred_coords, target_coords, meta, task_id)
+        return 0.8 * measurement_loss + 0.2 * direction_loss
+    if family == "femur":
+        direction_loss = compute_line_direction_loss(pred_coords, target_coords, meta, task_id)
+        pairwise_loss = compute_pairwise_distance_loss(pred_coords, target_coords, meta)
+        return 0.5 * measurement_loss + 0.3 * direction_loss + 0.2 * pairwise_loss
     raise ValueError(f"Unsupported task loss family: {family}")
 
 

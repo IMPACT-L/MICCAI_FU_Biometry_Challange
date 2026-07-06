@@ -10,6 +10,15 @@ EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 FPN_MODES = {"shared", "task_specific"}
 TASK_HEAD_PROFILE_PRESETS = {
     "uniform": {},
+    "challenge_legacy_v1": {
+        "A4C": "heavy",
+        "HC": "heavy",
+        "PLAX": "heavy",
+        "AOP": "light",
+        "FUGC": "light",
+        "IVC": "light",
+        "fetal_femur": "light",
+    },
     "challenge_v1": {
         "A4C": "heavy",
         "HC": "heavy",

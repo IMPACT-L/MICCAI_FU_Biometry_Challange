@@ -15,7 +15,12 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from model_factory import MultiTaskModelFactory
-from utils import decode_heatmaps_to_normalized_coords, letterbox_image_and_points, transformed_coords_to_original_normalized
+from utils import (
+    canonicalize_task_coords,
+    decode_heatmaps_to_normalized_coords,
+    letterbox_image_and_points,
+    transformed_coords_to_original_normalized,
+)
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
@@ -167,6 +172,8 @@ class Model:
         encoder_name: str = "vit_base_patch14_dinov2.lvd142m",
         use_fpn: Optional[bool] = None,
         fpn_mode: Optional[str] = None,
+        task_head_profile: Optional[str] = None,
+        task_decoder_profile: Optional[str] = None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -176,8 +183,8 @@ class Model:
         self.use_fpn = use_fpn
         self.fpn_mode = fpn_mode
         self.head_type = "basic"
-        self.task_head_profile = "uniform"
-        self.task_decoder_profile = "uniform"
+        self.task_head_profile = task_head_profile
+        self.task_decoder_profile = task_decoder_profile
         self.model = None
         self.task_configs = None
         self.task_id_to_name = None
@@ -225,10 +232,15 @@ class Model:
         self.fpn_mode = inferred_fpn_mode if self.fpn_mode is None else self.fpn_mode
         self.encoder_name = checkpoint_meta.get("encoder_name", self.encoder_name)
         self.head_type = checkpoint_meta.get("head_type", self.head_type)
-        self.task_head_profile = checkpoint_meta.get("task_head_profile", self.task_head_profile)
-        self.task_decoder_profile = checkpoint_meta.get(
-            "task_decoder_profile",
-            self.task_decoder_profile,
+        self.task_head_profile = (
+            self.task_head_profile
+            if self.task_head_profile is not None
+            else checkpoint_meta.get("task_head_profile", "uniform")
+        )
+        self.task_decoder_profile = (
+            self.task_decoder_profile
+            if self.task_decoder_profile is not None
+            else checkpoint_meta.get("task_decoder_profile", "uniform")
         )
         self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
         self.heatmap_size = tuple(checkpoint_meta.get("heatmap_size", list(self.heatmap_size)))
@@ -321,6 +333,7 @@ class Model:
                         outputs_transformed,
                         [meta[i] for i in task_indices],
                     )
+                    outputs = canonicalize_task_coords(outputs, task_id)
 
                     for i, batch_idx in enumerate(task_indices):
                         pred = outputs[i]
@@ -391,6 +404,20 @@ if __name__ == "__main__":
         help="Backbone name used for model construction.",
     )
     parser.add_argument(
+        "--task-head-profile",
+        type=str,
+        choices=("uniform", "challenge_legacy_v1", "challenge_v1"),
+        default=None,
+        help="Optional task-specific head sizing override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
+        "--task-decoder-profile",
+        type=str,
+        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_v1"),
+        default=None,
+        help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
         "--fpn",
         dest="use_fpn",
         action="store_true",
@@ -417,6 +444,8 @@ if __name__ == "__main__":
         encoder_name=args.encoder_name,
         use_fpn=args.use_fpn,
         fpn_mode=args.fpn_mode,
+        task_head_profile=args.task_head_profile,
+        task_decoder_profile=args.task_decoder_profile,
     )
     json_path = model.predict(
         args.data_root,

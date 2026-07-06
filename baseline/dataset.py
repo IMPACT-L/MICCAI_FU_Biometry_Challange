@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
-from utils import letterbox_image_and_points
+from utils import canonicalize_task_coords, letterbox_image_and_points
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
@@ -154,6 +154,7 @@ class KeypointDataset(Dataset):
             else:
                 coords.extend([0.0, 0.0])
         label = np.array(coords, dtype=np.float32)
+        label = canonicalize_task_coords(label, task_id)
         label_original = label.copy()
         label_points = label.reshape(-1, 2)
 
@@ -193,10 +194,17 @@ class KeypointDataset(Dataset):
 class KeypointUniformSampler(Sampler[List[int]]):
     """Uniform task sampler for keypoint subtasks."""
 
-    def __init__(self, dataset: KeypointDataset, batch_size: int, steps_per_epoch: Optional[int] = None):
+    def __init__(
+        self,
+        dataset: KeypointDataset,
+        batch_size: int,
+        steps_per_epoch: Optional[int] = None,
+        task_sampling_weights: Optional[dict[str, float]] = None,
+    ):
         self.dataset = dataset
         self.batch_size = batch_size
         self.indices_by_task = {}
+        self.task_sampling_weights = task_sampling_weights or {}
 
         print("\n--- Initializing Keypoint Sampler ---")
         for idx, task_id in enumerate(tqdm(dataset.dataframe["task_id"], desc="Grouping indices")):
@@ -205,6 +213,9 @@ class KeypointUniformSampler(Sampler[List[int]]):
             self.indices_by_task[task_id].append(idx)
 
         self.task_ids = list(self.indices_by_task.keys())
+        self.task_probabilities = [
+            max(float(self.task_sampling_weights.get(task_id, 1.0)), 1e-8) for task_id in self.task_ids
+        ]
         for task_id in self.task_ids:
             random.shuffle(self.indices_by_task[task_id])
 
@@ -217,7 +228,7 @@ class KeypointUniformSampler(Sampler[List[int]]):
         task_cursors = {task_id: 0 for task_id in self.task_ids}
 
         for _ in range(self.steps_per_epoch):
-            task_id = random.choice(self.task_ids)
+            task_id = random.choices(self.task_ids, weights=self.task_probabilities, k=1)[0]
             indices = self.indices_by_task[task_id]
             cursor = task_cursors[task_id]
 

@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from baseline.model_factory import MultiTaskModelFactory
 from baseline.utils import (
+    canonicalize_task_coords,
     decode_heatmaps_to_normalized_coords,
     letterbox_image_and_points,
     transformed_coords_to_original_normalized,
@@ -216,7 +217,7 @@ def main():
     parser.add_argument(
         "--task-head-profile",
         default=None,
-        choices=("uniform", "challenge_v1"),
+        choices=("uniform", "challenge_legacy_v1", "challenge_v1"),
         help="Optional task-specific head sizing override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
@@ -348,6 +349,7 @@ def main():
                     outputs_transformed,
                     [meta[i] for i in task_indices],
                 )
+                outputs = canonicalize_task_coords(outputs, task_id)
 
                 for output_idx, batch_idx in enumerate(task_indices):
                     pred = round_float_list(outputs[output_idx].cpu().numpy().tolist())

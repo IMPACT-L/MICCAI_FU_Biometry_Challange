@@ -67,6 +67,43 @@ TASK_LOSS_WEIGHTS = {
 }
 
 
+def _parse_weight_csv(value: str | None) -> dict[str, float] | None:
+    if value is None:
+        return None
+    result: dict[str, float] = {}
+    for chunk in str(value).split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid weight override entry: {item}. Expected TASK=VALUE.")
+        key, raw_value = item.split("=", 1)
+        task_id = key.strip()
+        if not task_id:
+            raise ValueError(f"Invalid empty task ID in weight override: {item}")
+        result[task_id] = float(raw_value.strip())
+    return result or None
+
+
+class ModelEma:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {
+            name: value.detach().clone()
+            for name, value in model.state_dict().items()
+        }
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module) -> None:
+        state_dict = model.state_dict()
+        for name, value in state_dict.items():
+            self.shadow[name].mul_(self.decay).add_(value.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def copy_to(self, model: torch.nn.Module) -> None:
+        model.load_state_dict(self.shadow, strict=True)
+
+
 def _parse_task_id_csv(value: str | None) -> list[str] | None:
     if value is None:
         return None
@@ -189,6 +226,10 @@ def main(
     dataset_loss_weight: float = 0.0,
     femur_shaft_loss_weight: float = FEMUR_SHAFT_LOSS_WEIGHT,
     fugc_segment_loss_weight: float = FUGC_SEGMENT_LOSS_WEIGHT,
+    task_loss_weight_overrides: dict[str, float] | None = None,
+    sampler_task_weight_overrides: dict[str, float] | None = None,
+    use_ema: bool = True,
+    ema_decay: float = 0.999,
 ):
     metric_column = "MRE (pixels)"
     metric_label = CHECKPOINT_SCORE_NAME
@@ -262,8 +303,14 @@ def main(
     logger.info(f"Dataset-specific loss weight: {dataset_loss_weight:.6f}")
     logger.info(f"Femur shaft loss weight: {femur_shaft_loss_weight:.6f}")
     logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
+    logger.info(f"EMA: {'ENABLED' if use_ema else 'DISABLED'}")
+    logger.info(f"EMA decay: {ema_decay:.6f}")
     logger.info(f"Heatmap size: {HEATMAP_SIZE}")
-    logger.info(f"Task loss weights: {TASK_LOSS_WEIGHTS}")
+    effective_task_loss_weights = dict(TASK_LOSS_WEIGHTS)
+    if task_loss_weight_overrides:
+        effective_task_loss_weights.update(task_loss_weight_overrides)
+    logger.info(f"Task loss weights: {effective_task_loss_weights}")
+    logger.info(f"Sampler task weights override: {sampler_task_weight_overrides or {}}")
 
     logger.info(
         f"FPN neck: {'ENABLED' if use_fpn else 'DISABLED'} "
@@ -296,6 +343,9 @@ def main(
 
     task_configs = _build_task_configs(temp_dataset.dataframe)
     task_id_to_name = {cfg["task_id"]: cfg["task_name"] for cfg in task_configs}
+    effective_sampler_task_weights = {cfg["task_id"]: 1.0 for cfg in task_configs}
+    if sampler_task_weight_overrides:
+        effective_sampler_task_weights.update(sampler_task_weight_overrides)
 
     train_indices, val_indices = _stratified_split_indices(
         temp_dataset.dataframe,
@@ -351,6 +401,7 @@ def main(
         train_subset,
         batch_size=batch_size,
         steps_per_epoch=steps_per_epoch,
+        task_sampling_weights=effective_sampler_task_weights,
     )
     train_loader = torch.utils.data.DataLoader(
         train_subset,
@@ -398,6 +449,7 @@ def main(
 
     optimizer = optim.AdamW(param_groups)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    ema = ModelEma(model, decay=ema_decay) if use_ema else None
 
     best_val_score = float("inf")
     epochs_without_improvement = 0
@@ -482,12 +534,14 @@ def main(
                         + femur_shaft_loss_weight * femur_shaft_loss
                         + fugc_segment_loss_weight * fugc_segment_loss
                     )
-                    task_weight = float(TASK_LOSS_WEIGHTS.get(current_task_id, 1.0))
+                    task_weight = float(effective_task_loss_weights.get(current_task_id, 1.0))
                     loss = base_loss * task_weight
 
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
+                    if ema is not None:
+                        ema.update(model)
 
                     loss_value = float(loss.item())
                     batch_loss_values.append(loss_value)
@@ -508,6 +562,10 @@ def main(
                 logger.info(f"  - {task_id}: {avg_loss:.6f}")
                 writer.add_scalar(f"train/task_loss/{task_id}", avg_loss, epoch + 1)
 
+            restore_state = None
+            if ema is not None:
+                restore_state = {name: value.detach().clone() for name, value in model.state_dict().items()}
+                ema.copy_to(model)
             val_results_df = evaluate_keypoint(
                 model,
                 val_loader,
@@ -515,6 +573,8 @@ def main(
                 task_id_to_name,
                 normalization_stats=normalization_stats,
             )
+            if restore_state is not None:
+                model.load_state_dict(restore_state, strict=True)
             selected_val_score = compute_combined_score(val_results_df, normalization_stats=normalization_stats)
             selected_val_mre = float("inf")
             selected_val_measurement = float("inf")
@@ -591,7 +651,7 @@ def main(
                 epochs_without_improvement = 0
                 best_val_results_df = val_results_df.copy()
                 checkpoint_payload = {
-                    "state_dict": model.state_dict(),
+                    "state_dict": ema.shadow if ema is not None else model.state_dict(),
                         "meta": {
                             "encoder_name": encoder_name,
                             "use_fpn": use_fpn,
@@ -607,6 +667,10 @@ def main(
                             "dataset_loss_weight": dataset_loss_weight,
                             "femur_shaft_loss_weight": femur_shaft_loss_weight,
                             "fugc_segment_loss_weight": fugc_segment_loss_weight,
+                            "use_ema": use_ema,
+                            "ema_decay": ema_decay,
+                            "task_loss_weight_overrides": task_loss_weight_overrides or {},
+                            "sampler_task_weight_overrides": sampler_task_weight_overrides or {},
                             "normalization_scheme": "train_iqr_proxy",
                         },
                     }
@@ -765,7 +829,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-loss-family-profile",
         type=str,
-        choices=("uniform", "dataset_v1"),
+        choices=("uniform", "dataset_v1", "weak_tasks_v1"),
         default=TASK_LOSS_FAMILY_PROFILE,
         help=f"Dataset-family auxiliary loss profile (default: {TASK_LOSS_FAMILY_PROFILE}).",
     )
@@ -792,6 +856,29 @@ if __name__ == "__main__":
         type=float,
         default=FEMUR_SHAFT_LOSS_WEIGHT,
         help="Auxiliary shaft mask loss for fetal_femur. Use 0.0 to disable.",
+    )
+    parser.add_argument(
+        "--task-loss-weights",
+        type=str,
+        default=None,
+        help="Optional comma-separated TASK=VALUE loss-weight overrides.",
+    )
+    parser.add_argument(
+        "--sampler-task-weights",
+        type=str,
+        default=None,
+        help="Optional comma-separated TASK=VALUE sampler-weight overrides.",
+    )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="EMA decay for validation/checkpoint model.",
+    )
+    parser.add_argument(
+        "--no-ema",
+        action="store_true",
+        help="Disable EMA validation/checkpoint smoothing.",
     )
     args = parser.parse_args()
 
@@ -826,4 +913,8 @@ if __name__ == "__main__":
         dataset_loss_weight=float(args.dataset_loss_weight),
         femur_shaft_loss_weight=float(args.femur_shaft_loss_weight),
         fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),
+        task_loss_weight_overrides=_parse_weight_csv(args.task_loss_weights),
+        sampler_task_weight_overrides=_parse_weight_csv(args.sampler_task_weights),
+        use_ema=not bool(args.no_ema),
+        ema_decay=float(args.ema_decay),
     )

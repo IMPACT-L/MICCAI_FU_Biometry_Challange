@@ -8,6 +8,8 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from utils import canonicalize_task_coords
+
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 OUTPUT_DECIMALS = 6
@@ -93,6 +95,8 @@ class Evaluator:
 
                 if image_path in pred_dict.get(task_id, {}):
                     pred_coords = pred_dict[task_id][image_path]
+                    gt_coords = np.asarray(canonicalize_task_coords(gt_coords, task_id), dtype=np.float32).tolist()
+                    pred_coords = np.asarray(canonicalize_task_coords(pred_coords, task_id), dtype=np.float32).tolist()
                     mre_scores.append(self._compute_mre(pred_coords, gt_coords))
 
             if mre_scores:
