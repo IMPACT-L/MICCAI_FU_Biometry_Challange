@@ -144,13 +144,14 @@ def validate_predictions(predictions):
         seen.add(key)
 
 
-def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, bool, str, str, str, str, int]:
+def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, bool, str, str, str, str, str, int]:
     meta_encoder_name = checkpoint_meta.get("encoder_name")
     meta_use_fpn = checkpoint_meta.get("use_fpn")
     meta_fpn_mode = checkpoint_meta.get("fpn_mode", "shared")
     meta_head_type = checkpoint_meta.get("head_type", "basic")
     meta_task_head_profile = checkpoint_meta.get("task_head_profile", "uniform")
     meta_task_decoder_profile = checkpoint_meta.get("task_decoder_profile", "uniform")
+    meta_task_adapter_profile = checkpoint_meta.get("task_adapter_profile", "uniform")
     meta_input_size = int(checkpoint_meta.get("input_size", 518))
     meta_heatmap_size = tuple(checkpoint_meta.get("heatmap_size", [64, 64]))
     if meta_encoder_name is not None and meta_use_fpn is not None:
@@ -161,6 +162,7 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
             str(meta_head_type),
             str(meta_task_head_profile),
             str(meta_task_decoder_profile),
+            str(meta_task_adapter_profile),
             meta_input_size,
             meta_heatmap_size,
         )
@@ -176,11 +178,11 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
     if checkpoint_has_fpn:
         if in_channels != 256:
             raise ValueError(f"Unexpected FPN head width in checkpoint: {in_channels}")
-        return "vit_base_patch14_dinov2.lvd142m", True, inferred_fpn_mode, "basic", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", True, inferred_fpn_mode, "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 384:
-        return "vit_small_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_small_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 768:
-        return "vit_base_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     raise ValueError(f"Unsupported checkpoint head width: {in_channels}")
 
 
@@ -225,6 +227,12 @@ def main():
         default=None,
         choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
+        "--task-adapter-profile",
+        default=None,
+        choices=("uniform", "softsharing_v1"),
+        help="Optional task-specific soft-sharing adapter override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--fpn-mode",
@@ -272,6 +280,7 @@ def main():
         inferred_head_type,
         inferred_task_head_profile,
         inferred_task_decoder_profile,
+        inferred_task_adapter_profile,
         inferred_input_size,
         inferred_heatmap_size,
     ) = infer_model_config_from_checkpoint(
@@ -283,6 +292,7 @@ def main():
     head_type = args.head_type or inferred_head_type
     task_head_profile = args.task_head_profile or inferred_task_head_profile
     task_decoder_profile = args.task_decoder_profile or inferred_task_decoder_profile
+    task_adapter_profile = args.task_adapter_profile or inferred_task_adapter_profile
     use_fpn = inferred_use_fpn if args.use_fpn is None else args.use_fpn
     input_size = int(args.input_size or inferred_input_size)
 
@@ -302,6 +312,7 @@ def main():
         f"head={inferred_head_type}, "
         f"task_head_profile={inferred_task_head_profile}, "
         f"task_decoder_profile={inferred_task_decoder_profile}, "
+        f"task_adapter_profile={inferred_task_adapter_profile}, "
         f"input_size={inferred_input_size}, "
         f"heatmap_size={inferred_heatmap_size}, "
         f"FPN={'ENABLED' if inferred_use_fpn else 'DISABLED'}"
@@ -312,6 +323,7 @@ def main():
         f"head={head_type}, "
         f"task_head_profile={task_head_profile}, "
         f"task_decoder_profile={task_decoder_profile}, "
+        f"task_adapter_profile={task_adapter_profile}, "
         f"input_size={input_size}, "
         f"heatmap_size={inferred_heatmap_size}, "
         f"FPN={'ENABLED' if use_fpn else 'DISABLED'}"
@@ -327,6 +339,7 @@ def main():
         head_type=head_type,
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
+        task_adapter_profile=task_adapter_profile,
     ).to(device)
 
     model.load_state_dict(checkpoint)

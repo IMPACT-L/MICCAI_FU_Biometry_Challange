@@ -8,6 +8,25 @@ import torch.nn.functional as F
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 FPN_MODES = {"shared", "task_specific"}
+TASK_GROUPS = {
+    "pair": {"FUGC", "IVC", "fetal_femur"},
+    "ellipse": {"FA", "HC"},
+    "context": {"A4C", "AOP", "PLAX", "PSAX"},
+}
+TASK_ADAPTER_PROFILE_PRESETS = {
+    "uniform": {},
+    "softsharing_v1": {
+        "FUGC": "pair",
+        "IVC": "pair",
+        "fetal_femur": "pair",
+        "FA": "ellipse",
+        "HC": "ellipse",
+        "A4C": "context",
+        "AOP": "context",
+        "PLAX": "context",
+        "PSAX": "context",
+    },
+}
 TASK_HEAD_PROFILE_PRESETS = {
     "uniform": {},
     "challenge_legacy_v1": {
@@ -75,6 +94,47 @@ HEAD_WIDTH_MULTIPLIERS = {
     "medium": 1.0,
     "heavy": 1.35,
 }
+
+
+class SoftSharingAdapter(nn.Module):
+    """Shared adapter plus group-specific residual experts for soft parameter sharing."""
+
+    def __init__(self, channels: int, group_names: list[str]):
+        super().__init__()
+        hidden = max(channels // 2, 96)
+        self.shared = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.group_experts = nn.ModuleDict(
+            {
+                group_name: nn.Sequential(
+                    nn.Conv2d(channels, hidden, kernel_size=3, padding=1, groups=1, bias=False),
+                    nn.BatchNorm2d(hidden),
+                    nn.GELU(),
+                    nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                )
+                for group_name in group_names
+            }
+        )
+        self.shared_scale = nn.Parameter(torch.tensor(1.0))
+        self.group_scale = nn.ParameterDict(
+            {
+                group_name: nn.Parameter(torch.tensor(0.5))
+                for group_name in group_names
+            }
+        )
+
+    def forward(self, x: torch.Tensor, group_name: str) -> torch.Tensor:
+        shared_delta = self.shared(x)
+        if group_name not in self.group_experts:
+            return x + self.shared_scale * shared_delta
+        group_delta = self.group_experts[group_name](x)
+        return x + self.shared_scale * shared_delta + self.group_scale[group_name] * group_delta
 
 
 class HeatmapHead(nn.Module):
@@ -818,6 +878,7 @@ class MultiTaskModelFactory(nn.Module):
         head_type: str = "basic",
         task_head_profile: str = "uniform",
         task_decoder_profile: str = "uniform",
+        task_adapter_profile: str = "uniform",
     ):
         super().__init__()
 
@@ -827,6 +888,7 @@ class MultiTaskModelFactory(nn.Module):
         self.head_type = head_type
         self.task_head_profile = task_head_profile
         self.task_decoder_profile = task_decoder_profile
+        self.task_adapter_profile = task_adapter_profile
 
         print(f"Initializing encoder: {encoder_name}")
         self.encoder = DINOv2Backbone(model_name=encoder_name, pretrained=(encoder_weights is not None))
@@ -834,6 +896,7 @@ class MultiTaskModelFactory(nn.Module):
         # FPN neck (optional)
         self.fpn = None
         self.task_fpns = None
+        self.soft_adapters = None
         head_channels = self.encoder.out_channels
         if use_fpn:
             if fpn_mode not in FPN_MODES:
@@ -855,11 +918,19 @@ class MultiTaskModelFactory(nn.Module):
             raise ValueError(f"Unsupported task_head_profile: {task_head_profile}")
         if task_decoder_profile not in TASK_DECODER_PROFILE_PRESETS:
             raise ValueError(f"Unsupported task_decoder_profile: {task_decoder_profile}")
+        if task_adapter_profile not in TASK_ADAPTER_PROFILE_PRESETS:
+            raise ValueError(f"Unsupported task_adapter_profile: {task_adapter_profile}")
         print(f"Head type: {head_type}")
         print(f"Task head profile: {task_head_profile}")
         print(f"Task decoder profile: {task_decoder_profile}")
+        print(f"Task adapter profile: {task_adapter_profile}")
         task_variant_map = TASK_HEAD_PROFILE_PRESETS[task_head_profile]
         task_decoder_map = TASK_DECODER_PROFILE_PRESETS[task_decoder_profile]
+        task_adapter_map = TASK_ADAPTER_PROFILE_PRESETS[task_adapter_profile]
+        self.task_to_adapter_group = {task_id: task_adapter_map.get(task_id) for task_id in task_adapter_map}
+        active_groups = sorted({group for group in task_adapter_map.values() if group is not None})
+        if active_groups:
+            self.soft_adapters = SoftSharingAdapter(head_channels, active_groups)
         decoder_family_to_head = {
             "basic": HeatmapHead,
             "deep": DeepHeatmapHead,
@@ -916,6 +987,10 @@ class MultiTaskModelFactory(nn.Module):
             features = self.fpn(features)
         elif self.task_fpns is not None:
             features = self.task_fpns[task_id](features)
+        if self.soft_adapters is not None:
+            adapter_group = self.task_to_adapter_group.get(task_id)
+            if adapter_group is not None:
+                features = self.soft_adapters(features, adapter_group)
 
         head_output = self.heads[task_id](features, out_size=self.heatmap_size)
         aux_outputs = None

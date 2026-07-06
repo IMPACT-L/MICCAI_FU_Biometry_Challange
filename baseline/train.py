@@ -49,6 +49,7 @@ FPN_MODE = "shared"
 HEAD_TYPE = "deep"
 TASK_HEAD_PROFILE = "challenge_v1"
 TASK_DECODER_PROFILE = "uniform"
+TASK_ADAPTER_PROFILE = "uniform"
 TASK_LOSS_FAMILY_PROFILE = "uniform"
 HEATMAP_SIZE = (64, 64)
 HEATMAP_SIGMA = 1.8
@@ -221,6 +222,7 @@ def main(
     head_type: str = HEAD_TYPE,
     task_head_profile: str = TASK_HEAD_PROFILE,
     task_decoder_profile: str = TASK_DECODER_PROFILE,
+    task_adapter_profile: str = TASK_ADAPTER_PROFILE,
     task_loss_family_profile: str = TASK_LOSS_FAMILY_PROFILE,
     learning_rate: float = LEARNING_RATE,
     init_checkpoint: str | None = None,
@@ -279,6 +281,11 @@ def main(
             ):
                 task_decoder_profile = str(init_checkpoint_meta["task_decoder_profile"])
             if (
+                task_adapter_profile == TASK_ADAPTER_PROFILE
+                and init_checkpoint_meta.get("task_adapter_profile")
+            ):
+                task_adapter_profile = str(init_checkpoint_meta["task_adapter_profile"])
+            if (
                 task_loss_family_profile == TASK_LOSS_FAMILY_PROFILE
                 and init_checkpoint_meta.get("task_loss_family_profile")
             ):
@@ -297,6 +304,7 @@ def main(
     logger.info(f"Head type: {head_type}")
     logger.info(f"Task head profile: {task_head_profile}")
     logger.info(f"Task decoder profile: {task_decoder_profile}")
+    logger.info(f"Task adapter profile: {task_adapter_profile}")
     logger.info(f"Task loss family profile: {task_loss_family_profile}")
     logger.info(f"FPN mode: {fpn_mode}")
     logger.info(f"Learning rate: {learning_rate:.8f}")
@@ -433,6 +441,7 @@ def main(
         head_type=head_type,
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
+        task_adapter_profile=task_adapter_profile,
     ).to(device)
     if init_checkpoint is not None:
         state_dict, checkpoint_meta = _load_checkpoint_payload(init_checkpoint, device)
@@ -447,6 +456,8 @@ def main(
     if getattr(model, "task_fpns", None) is not None:
         for task_id, task_fpn in model.task_fpns.items():
             param_groups.append({"params": task_fpn.parameters(), "lr": learning_rate * 2.0})
+    if getattr(model, "soft_adapters", None) is not None:
+        param_groups.append({"params": model.soft_adapters.parameters(), "lr": learning_rate * 5.0})
     for task_id, head in model.heads.items():
         param_groups.append({"params": head.parameters(), "lr": learning_rate * 10.0})
 
@@ -662,6 +673,7 @@ def main(
                             "head_type": head_type,
                             "task_head_profile": task_head_profile,
                             "task_decoder_profile": task_decoder_profile,
+                            "task_adapter_profile": task_adapter_profile,
                             "task_loss_family_profile": task_loss_family_profile,
                             "input_size": input_size,
                             "heatmap_size": list(HEATMAP_SIZE),
@@ -818,7 +830,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-head-profile",
         type=str,
-        choices=("uniform", "challenge_v1"),
+        choices=("uniform", "challenge_legacy_v1", "challenge_v1"),
         default=TASK_HEAD_PROFILE,
         help=f"Task-specific head sizing profile (default: {TASK_HEAD_PROFILE}).",
     )
@@ -828,6 +840,13 @@ if __name__ == "__main__":
         choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
+    )
+    parser.add_argument(
+        "--task-adapter-profile",
+        type=str,
+        choices=("uniform", "softsharing_v1"),
+        default=TASK_ADAPTER_PROFILE,
+        help=f"Task-specific soft-sharing adapter profile (default: {TASK_ADAPTER_PROFILE}).",
     )
     parser.add_argument(
         "--task-loss-family-profile",
@@ -908,6 +927,7 @@ if __name__ == "__main__":
         head_type=str(args.head_type),
         task_head_profile=str(args.task_head_profile),
         task_decoder_profile=str(args.task_decoder_profile),
+        task_adapter_profile=str(args.task_adapter_profile),
         task_loss_family_profile=str(args.task_loss_family_profile),
         learning_rate=float(args.learning_rate),
         init_checkpoint=args.init_checkpoint,
