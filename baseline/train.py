@@ -3,6 +3,7 @@ import logging
 import os
 from collections import defaultdict
 from datetime import datetime
+from typing import Iterable
 
 import albumentations as A
 import numpy as np
@@ -16,7 +17,11 @@ from tqdm import tqdm
 from dataset import KeypointDataset, KeypointUniformSampler
 from model_factory import MultiTaskModelFactory
 from utils import (
+    build_line_mask_from_transformed_coords,
     compute_combined_score,
+    compute_dataset_specific_loss,
+    compute_femur_shaft_loss,
+    compute_fugc_segment_loss,
     compute_normalization_stats_from_dataframe,
     compute_measurement_loss,
     evaluate_keypoint,
@@ -40,10 +45,15 @@ CHECKPOINT_SCORE_NAME = "Combined score"
 INPUT_SIZE = 512
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 USE_FPN = True  # ← 开关：设为 True 启用 FPN 特征金字塔
+FPN_MODE = "shared"
 HEAD_TYPE = "deep"
 TASK_HEAD_PROFILE = "challenge_v1"
+TASK_DECODER_PROFILE = "uniform"
+TASK_LOSS_FAMILY_PROFILE = "uniform"
 HEATMAP_SIZE = (64, 64)
 HEATMAP_SIGMA = 1.8
+FEMUR_SHAFT_LOSS_WEIGHT = 0.15
+FUGC_SEGMENT_LOSS_WEIGHT = 0.08
 TASK_LOSS_WEIGHTS = {
     "A4C": 1.35,
     "AOP": 0.80,
@@ -55,6 +65,30 @@ TASK_LOSS_WEIGHTS = {
     "PSAX": 1.10,
     "fetal_femur": 1.25,
 }
+
+
+def _parse_task_id_csv(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    task_ids = [item.strip() for item in str(value).split(",") if item.strip()]
+    return task_ids or None
+
+
+def _filter_dataframe_by_task_ids(dataframe, task_ids: Iterable[str] | None):
+    if not task_ids:
+        return dataframe.reset_index(drop=True)
+    task_id_set = {str(task_id) for task_id in task_ids}
+    filtered = dataframe[dataframe["task_id"].astype(str).isin(task_id_set)].reset_index(drop=True)
+    if filtered.empty:
+        raise ValueError(f"No samples found for train task IDs: {sorted(task_id_set)}")
+    return filtered
+
+
+def _load_checkpoint_payload(checkpoint_path: str, device: torch.device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        return checkpoint["state_dict"], checkpoint.get("meta", {})
+    return checkpoint, {}
 
 
 def _build_task_configs(dataframe):
@@ -134,6 +168,7 @@ def setup_logger(log_path: str) -> logging.Logger:
 def main(
     val_split: float = VAL_SPLIT,
     use_fpn: bool = USE_FPN,
+    fpn_mode: str = FPN_MODE,
     num_epochs: int = NUM_EPOCHS,
     batch_size: int = BATCH_SIZE,
     num_workers: int = 4,
@@ -145,7 +180,15 @@ def main(
     input_size: int = INPUT_SIZE,
     head_type: str = HEAD_TYPE,
     task_head_profile: str = TASK_HEAD_PROFILE,
+    task_decoder_profile: str = TASK_DECODER_PROFILE,
+    task_loss_family_profile: str = TASK_LOSS_FAMILY_PROFILE,
+    learning_rate: float = LEARNING_RATE,
+    init_checkpoint: str | None = None,
+    train_task_ids: list[str] | None = None,
     measurement_loss_weight: float = 0.0,
+    dataset_loss_weight: float = 0.0,
+    femur_shaft_loss_weight: float = FEMUR_SHAFT_LOSS_WEIGHT,
+    fugc_segment_loss_weight: float = FUGC_SEGMENT_LOSS_WEIGHT,
 ):
     metric_column = "MRE (pixels)"
     metric_label = CHECKPOINT_SCORE_NAME
@@ -173,16 +216,59 @@ def main(
 
     set_seed(RANDOM_SEED)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    init_checkpoint_meta = {}
+    if init_checkpoint is not None:
+        init_checkpoint = os.path.abspath(init_checkpoint)
+        _, init_checkpoint_meta = _load_checkpoint_payload(init_checkpoint, device)
+        if init_checkpoint_meta:
+            if encoder_name == ENCODER and init_checkpoint_meta.get("encoder_name"):
+                encoder_name = str(init_checkpoint_meta["encoder_name"])
+            if head_type == HEAD_TYPE and init_checkpoint_meta.get("head_type"):
+                head_type = str(init_checkpoint_meta["head_type"])
+            if task_head_profile == TASK_HEAD_PROFILE and init_checkpoint_meta.get("task_head_profile"):
+                task_head_profile = str(init_checkpoint_meta["task_head_profile"])
+            elif task_head_profile == TASK_HEAD_PROFILE and "task_head_profile" not in init_checkpoint_meta:
+                task_head_profile = "uniform"
+            if (
+                task_decoder_profile == TASK_DECODER_PROFILE
+                and init_checkpoint_meta.get("task_decoder_profile")
+            ):
+                task_decoder_profile = str(init_checkpoint_meta["task_decoder_profile"])
+            if (
+                task_loss_family_profile == TASK_LOSS_FAMILY_PROFILE
+                and init_checkpoint_meta.get("task_loss_family_profile")
+            ):
+                task_loss_family_profile = str(init_checkpoint_meta["task_loss_family_profile"])
+            if input_size == INPUT_SIZE and init_checkpoint_meta.get("input_size"):
+                input_size = int(init_checkpoint_meta["input_size"])
+            if use_fpn == USE_FPN and "use_fpn" in init_checkpoint_meta:
+                use_fpn = bool(init_checkpoint_meta["use_fpn"])
+            if fpn_mode == FPN_MODE and init_checkpoint_meta.get("fpn_mode"):
+                fpn_mode = str(init_checkpoint_meta["fpn_mode"])
+        elif task_head_profile == TASK_HEAD_PROFILE:
+            task_head_profile = "uniform"
     logger.info(f"Device used: {device}")
     logger.info(f"Encoder: {encoder_name}")
     logger.info(f"Input size: {input_size}")
     logger.info(f"Head type: {head_type}")
     logger.info(f"Task head profile: {task_head_profile}")
+    logger.info(f"Task decoder profile: {task_decoder_profile}")
+    logger.info(f"Task loss family profile: {task_loss_family_profile}")
+    logger.info(f"FPN mode: {fpn_mode}")
+    logger.info(f"Learning rate: {learning_rate:.8f}")
+    logger.info(f"Init checkpoint: {init_checkpoint if init_checkpoint else 'none'}")
+    logger.info(f"Train task IDs: {train_task_ids if train_task_ids else 'all'}")
     logger.info(f"Measurement loss weight: {measurement_loss_weight:.6f}")
+    logger.info(f"Dataset-specific loss weight: {dataset_loss_weight:.6f}")
+    logger.info(f"Femur shaft loss weight: {femur_shaft_loss_weight:.6f}")
+    logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
     logger.info(f"Heatmap size: {HEATMAP_SIZE}")
     logger.info(f"Task loss weights: {TASK_LOSS_WEIGHTS}")
 
-    logger.info(f"FPN neck: {'ENABLED' if use_fpn else 'DISABLED'} (set USE_FPN={use_fpn} at top of train.py)")
+    logger.info(
+        f"FPN neck: {'ENABLED' if use_fpn else 'DISABLED'} "
+        f"(mode={fpn_mode}, set USE_FPN={use_fpn} at top of train.py)"
+    )
 
     train_transforms = A.Compose(
         [
@@ -230,6 +316,17 @@ def main(
         input_size=input_size,
     )
     train_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
+    if train_task_ids:
+        allowed_train_mask = train_dataset.dataframe["task_id"].astype(str).isin(set(train_task_ids))
+        allowed_train_indices = set(train_dataset.dataframe.index[allowed_train_mask].tolist())
+    else:
+        allowed_train_indices = set(train_dataset.dataframe.index.tolist())
+    train_indices = [idx for idx in train_indices if idx in allowed_train_indices]
+    if not train_indices:
+        raise ValueError(
+            "No training samples remain after applying train task filter. "
+            f"Requested task IDs: {train_task_ids}"
+        )
 
     val_dataset = KeypointDataset(
         data_root=DATA_ROOT_PATH,
@@ -278,13 +375,26 @@ def main(
         task_configs=task_configs,
         heatmap_size=HEATMAP_SIZE,
         use_fpn=use_fpn,
+        fpn_mode=fpn_mode,
         head_type=head_type,
         task_head_profile=task_head_profile,
+        task_decoder_profile=task_decoder_profile,
     ).to(device)
+    if init_checkpoint is not None:
+        state_dict, checkpoint_meta = _load_checkpoint_payload(init_checkpoint, device)
+        model.load_state_dict(state_dict, strict=True)
+        logger.info(f"Loaded initialization checkpoint: {init_checkpoint}")
+        if checkpoint_meta:
+            logger.info(f"Init checkpoint meta: {checkpoint_meta}")
 
-    param_groups = [{"params": model.encoder.parameters(), "lr": LEARNING_RATE * 0.2}]
+    param_groups = [{"params": model.encoder.parameters(), "lr": learning_rate * 0.2}]
+    if model.fpn is not None:
+        param_groups.append({"params": model.fpn.parameters(), "lr": learning_rate * 2.0})
+    if getattr(model, "task_fpns", None) is not None:
+        for task_id, task_fpn in model.task_fpns.items():
+            param_groups.append({"params": task_fpn.parameters(), "lr": learning_rate * 2.0})
     for task_id, head in model.heads.items():
-        param_groups.append({"params": head.parameters(), "lr": LEARNING_RATE * 10.0})
+        param_groups.append({"params": head.parameters(), "lr": learning_rate * 10.0})
 
     optimizer = optim.AdamW(param_groups)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -321,7 +431,12 @@ def main(
                     task_heatmaps = torch.stack([batch["heatmap"][i] for i in task_indices], 0).to(device)
 
                     # Forward pass (FPN applied inside model if enabled)
-                    pred_logits, pred_heatmaps = model(task_images, task_id=current_task_id, return_prior=True)
+                    model_output = model(task_images, task_id=current_task_id, return_prior=True)
+                    aux_outputs = {}
+                    if len(model_output) == 3:
+                        pred_logits, pred_heatmaps, aux_outputs = model_output
+                    else:
+                        pred_logits, pred_heatmaps = model_output
                     target_coords = torch.stack([batch["train_label"][i] for i in task_indices], 0).to(device)
                     pred_coords_transformed = softargmax_heatmaps_to_transformed_coords(pred_logits)
                     target_coords_transformed = target_coords.clone()
@@ -338,7 +453,35 @@ def main(
                         [batch["meta"][i] for i in task_indices],
                         current_task_id,
                     )
-                    base_loss = heatmap_loss + 0.2 * coord_loss + measurement_loss_weight * measurement_loss
+                    dataset_specific_loss = compute_dataset_specific_loss(
+                        pred_coords_original,
+                        target_coords_original,
+                        [batch["meta"][i] for i in task_indices],
+                        current_task_id,
+                        profile=task_loss_family_profile,
+                    )
+                    femur_shaft_loss = pred_logits.new_tensor(0.0)
+                    if current_task_id == "fetal_femur":
+                        femur_shaft_loss = compute_femur_shaft_loss(
+                            aux_outputs.get("shaft_logits"),
+                            target_coords_transformed,
+                            heatmap_size=HEATMAP_SIZE,
+                        )
+                    fugc_segment_loss = pred_logits.new_tensor(0.0)
+                    if current_task_id == "FUGC":
+                        fugc_segment_loss = compute_fugc_segment_loss(
+                            aux_outputs.get("segment_logits"),
+                            target_coords_transformed,
+                            heatmap_size=HEATMAP_SIZE,
+                        )
+                    base_loss = (
+                        heatmap_loss
+                        + 0.2 * coord_loss
+                        + measurement_loss_weight * measurement_loss
+                        + dataset_loss_weight * dataset_specific_loss
+                        + femur_shaft_loss_weight * femur_shaft_loss
+                        + fugc_segment_loss_weight * fugc_segment_loss
+                    )
                     task_weight = float(TASK_LOSS_WEIGHTS.get(current_task_id, 1.0))
                     loss = base_loss * task_weight
 
@@ -452,12 +595,18 @@ def main(
                         "meta": {
                             "encoder_name": encoder_name,
                             "use_fpn": use_fpn,
+                            "fpn_mode": fpn_mode,
                             "head_type": head_type,
                             "task_head_profile": task_head_profile,
+                            "task_decoder_profile": task_decoder_profile,
+                            "task_loss_family_profile": task_loss_family_profile,
                             "input_size": input_size,
                             "heatmap_size": list(HEATMAP_SIZE),
                             "checkpoint_metric": metric_label,
                             "measurement_loss_weight": measurement_loss_weight,
+                            "dataset_loss_weight": dataset_loss_weight,
+                            "femur_shaft_loss_weight": femur_shaft_loss_weight,
+                            "fugc_segment_loss_weight": fugc_segment_loss_weight,
                             "normalization_scheme": "train_iqr_proxy",
                         },
                     }
@@ -507,6 +656,13 @@ if __name__ == "__main__":
         action="store_true",
         default=USE_FPN,
         help=f"Enable FPN neck (default: {USE_FPN}).",
+    )
+    parser.add_argument(
+        "--fpn-mode",
+        type=str,
+        choices=("shared", "task_specific"),
+        default=FPN_MODE,
+        help=f"FPN layout when enabled (default: {FPN_MODE}).",
     )
     parser.add_argument(
         "--no-fpn",
@@ -575,6 +731,24 @@ if __name__ == "__main__":
         help=f"Decoder head type (default: {HEAD_TYPE}).",
     )
     parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=LEARNING_RATE,
+        help=f"Base learning rate (default: {LEARNING_RATE}).",
+    )
+    parser.add_argument(
+        "--init-checkpoint",
+        type=str,
+        default=None,
+        help="Optional checkpoint to load before training/fine-tuning.",
+    )
+    parser.add_argument(
+        "--train-task-ids",
+        type=str,
+        default=None,
+        help="Optional comma-separated task IDs to train on, e.g. HC,PLAX,A4C,fetal_femur.",
+    )
+    parser.add_argument(
         "--task-head-profile",
         type=str,
         choices=("uniform", "challenge_v1"),
@@ -582,10 +756,42 @@ if __name__ == "__main__":
         help=f"Task-specific head sizing profile (default: {TASK_HEAD_PROFILE}).",
     )
     parser.add_argument(
+        "--task-decoder-profile",
+        type=str,
+        choices=("uniform", "geometry_v1", "dedicated_v1"),
+        default=TASK_DECODER_PROFILE,
+        help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
+    )
+    parser.add_argument(
+        "--task-loss-family-profile",
+        type=str,
+        choices=("uniform", "dataset_v1"),
+        default=TASK_LOSS_FAMILY_PROFILE,
+        help=f"Dataset-family auxiliary loss profile (default: {TASK_LOSS_FAMILY_PROFILE}).",
+    )
+    parser.add_argument(
+        "--fugc-segment-loss-weight",
+        type=float,
+        default=FUGC_SEGMENT_LOSS_WEIGHT,
+        help="Auxiliary short-segment mask loss for FUGC. Use 0.0 to disable.",
+    )
+    parser.add_argument(
         "--measurement-loss-weight",
         type=float,
         default=0.0,
         help="Auxiliary measurement loss weight. Use 0.0 for the task-weighted baseline.",
+    )
+    parser.add_argument(
+        "--dataset-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary dataset-family loss weight. Use 0.0 to disable.",
+    )
+    parser.add_argument(
+        "--femur-shaft-loss-weight",
+        type=float,
+        default=FEMUR_SHAFT_LOSS_WEIGHT,
+        help="Auxiliary shaft mask loss for fetal_femur. Use 0.0 to disable.",
     )
     args = parser.parse_args()
 
@@ -599,6 +805,7 @@ if __name__ == "__main__":
     main(
         val_split=float(args.val_split),
         use_fpn=use_fpn,
+        fpn_mode=str(args.fpn_mode),
         num_epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         num_workers=int(args.num_workers),
@@ -610,5 +817,13 @@ if __name__ == "__main__":
         input_size=int(args.input_size),
         head_type=str(args.head_type),
         task_head_profile=str(args.task_head_profile),
+        task_decoder_profile=str(args.task_decoder_profile),
+        task_loss_family_profile=str(args.task_loss_family_profile),
+        learning_rate=float(args.learning_rate),
+        init_checkpoint=args.init_checkpoint,
+        train_task_ids=_parse_task_id_csv(args.train_task_ids),
         measurement_loss_weight=float(args.measurement_loss_weight),
+        dataset_loss_weight=float(args.dataset_loss_weight),
+        femur_shaft_loss_weight=float(args.femur_shaft_loss_weight),
+        fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),
     )

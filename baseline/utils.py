@@ -21,6 +21,21 @@ MEASUREMENT_PAIRS = {
     "fetal_femur": [(0, 1)],
 }
 
+TASK_LOSS_FAMILY_PRESETS = {
+    "uniform": {},
+    "dataset_v1": {
+        "A4C": "dense",
+        "PLAX": "dense",
+        "HC": "compact",
+        "AOP": "compact",
+        "FA": "compact",
+        "PSAX": "compact",
+        "FUGC": "line",
+        "IVC": "line",
+        "fetal_femur": "line",
+    },
+}
+
 DEFAULT_NORMALIZER_EPS = 1.0
 
 
@@ -274,6 +289,134 @@ def compute_measurement_loss(
     if not losses:
         return pred_coords.new_tensor(0.0)
     return torch.stack(losses).mean()
+
+
+def _coords_to_pixel_points_torch(coords: torch.Tensor, meta: list[dict]) -> torch.Tensor:
+    points = coords.reshape(coords.shape[0], -1, 2)
+    scales = []
+    for sample_meta in meta:
+        width = max(float(sample_meta["original_width"]) - 1.0, 1.0)
+        height = max(float(sample_meta["original_height"]) - 1.0, 1.0)
+        scales.append([width, height])
+    scale_tensor = coords.new_tensor(scales).unsqueeze(1)
+    return points * scale_tensor
+
+
+def compute_line_direction_loss(
+    pred_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    meta: list[dict],
+    task_id: str,
+) -> torch.Tensor:
+    pairs = MEASUREMENT_PAIRS.get(task_id, [])
+    if not pairs:
+        return pred_coords.new_tensor(0.0)
+    pred_pts = _coords_to_pixel_points_torch(pred_coords, meta)
+    target_pts = _coords_to_pixel_points_torch(target_coords, meta)
+    losses = []
+    for start_idx, end_idx in pairs:
+        pred_vec = pred_pts[:, end_idx] - pred_pts[:, start_idx]
+        target_vec = target_pts[:, end_idx] - target_pts[:, start_idx]
+        pred_unit = pred_vec / pred_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        target_unit = target_vec / target_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        losses.append((pred_unit - target_unit).abs().mean(dim=-1))
+    return torch.stack(losses, dim=0).mean()
+
+
+def compute_pairwise_distance_loss(
+    pred_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    meta: list[dict],
+) -> torch.Tensor:
+    pred_pts = _coords_to_pixel_points_torch(pred_coords, meta)
+    target_pts = _coords_to_pixel_points_torch(target_coords, meta)
+    num_points = pred_pts.shape[1]
+    if num_points < 2:
+        return pred_coords.new_tensor(0.0)
+    pred_dist = torch.cdist(pred_pts, pred_pts, p=2)
+    target_dist = torch.cdist(target_pts, target_pts, p=2)
+    mask = torch.triu(torch.ones(num_points, num_points, device=pred_coords.device, dtype=torch.bool), diagonal=1)
+    return (pred_dist[:, mask] - target_dist[:, mask]).abs().mean()
+
+
+def build_line_mask_from_transformed_coords(
+    coords: torch.Tensor,
+    heatmap_size: tuple[int, int],
+    thickness: int = 3,
+) -> torch.Tensor:
+    height, width = int(heatmap_size[0]), int(heatmap_size[1])
+    coords_np = coords.detach().cpu().numpy().reshape(coords.shape[0], -1, 2)
+    masks = []
+    for sample_points in coords_np:
+        canvas = np.zeros((height, width), dtype=np.float32)
+        if sample_points.shape[0] >= 2:
+            start = sample_points[0]
+            end = sample_points[1]
+            start_xy = (
+                int(round(float(start[0]) * max(width - 1, 1))),
+                int(round(float(start[1]) * max(height - 1, 1))),
+            )
+            end_xy = (
+                int(round(float(end[0]) * max(width - 1, 1))),
+                int(round(float(end[1]) * max(height - 1, 1))),
+            )
+            cv2.line(canvas, start_xy, end_xy, color=1.0, thickness=thickness)
+        masks.append(canvas)
+    return torch.from_numpy(np.stack(masks, axis=0)).unsqueeze(1).to(coords.device, dtype=coords.dtype)
+
+
+def compute_femur_shaft_loss(
+    shaft_logits: torch.Tensor | None,
+    target_coords_transformed: torch.Tensor,
+    heatmap_size: tuple[int, int],
+) -> torch.Tensor:
+    if shaft_logits is None:
+        return target_coords_transformed.new_tensor(0.0)
+    target_mask = build_line_mask_from_transformed_coords(
+        target_coords_transformed,
+        heatmap_size=heatmap_size,
+        thickness=3,
+    )
+    return torch.nn.functional.binary_cross_entropy_with_logits(shaft_logits, target_mask)
+
+
+def compute_fugc_segment_loss(
+    segment_logits: torch.Tensor | None,
+    target_coords_transformed: torch.Tensor,
+    heatmap_size: tuple[int, int],
+) -> torch.Tensor:
+    if segment_logits is None:
+        return target_coords_transformed.new_tensor(0.0)
+    target_mask = build_line_mask_from_transformed_coords(
+        target_coords_transformed,
+        heatmap_size=heatmap_size,
+        thickness=2,
+    )
+    return torch.nn.functional.binary_cross_entropy_with_logits(segment_logits, target_mask)
+
+
+def compute_dataset_specific_loss(
+    pred_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    meta: list[dict],
+    task_id: str,
+    profile: str = "uniform",
+) -> torch.Tensor:
+    if profile not in TASK_LOSS_FAMILY_PRESETS:
+        raise ValueError(f"Unsupported task loss family profile: {profile}")
+    family = TASK_LOSS_FAMILY_PRESETS[profile].get(task_id)
+    if family is None:
+        return pred_coords.new_tensor(0.0)
+    measurement_loss = compute_measurement_loss(pred_coords, target_coords, meta, task_id)
+    if family == "line":
+        direction_loss = compute_line_direction_loss(pred_coords, target_coords, meta, task_id)
+        return 0.7 * measurement_loss + 0.3 * direction_loss
+    if family == "compact":
+        return measurement_loss
+    if family == "dense":
+        pairwise_loss = compute_pairwise_distance_loss(pred_coords, target_coords, meta)
+        return 0.5 * measurement_loss + 0.5 * pairwise_loss
+    raise ValueError(f"Unsupported task loss family: {family}")
 
 
 def compute_combined_score(results_df: pd.DataFrame, normalization_stats: dict | None = None) -> float:

@@ -166,6 +166,7 @@ class Model:
         checkpoint_path: str = "best_model.pth",
         encoder_name: str = "vit_base_patch14_dinov2.lvd142m",
         use_fpn: Optional[bool] = None,
+        fpn_mode: Optional[str] = None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -173,8 +174,10 @@ class Model:
         self.checkpoint_path = checkpoint_path
         self.encoder_name = encoder_name
         self.use_fpn = use_fpn
+        self.fpn_mode = fpn_mode
         self.head_type = "basic"
         self.task_head_profile = "uniform"
+        self.task_decoder_profile = "uniform"
         self.model = None
         self.task_configs = None
         self.task_id_to_name = None
@@ -211,11 +214,22 @@ class Model:
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
         checkpoint, checkpoint_meta = load_checkpoint_payload(model_path, self.device)
-        checkpoint_has_fpn = any(key.startswith("fpn.") for key in checkpoint.keys())
+        checkpoint_has_shared_fpn = any(key.startswith("fpn.") for key in checkpoint.keys())
+        checkpoint_has_task_fpns = any(key.startswith("task_fpns.") for key in checkpoint.keys())
+        checkpoint_has_fpn = checkpoint_has_shared_fpn or checkpoint_has_task_fpns
         use_fpn = checkpoint_meta.get("use_fpn", checkpoint_has_fpn) if self.use_fpn is None else self.use_fpn
+        inferred_fpn_mode = checkpoint_meta.get(
+            "fpn_mode",
+            "task_specific" if checkpoint_has_task_fpns else "shared",
+        )
+        self.fpn_mode = inferred_fpn_mode if self.fpn_mode is None else self.fpn_mode
         self.encoder_name = checkpoint_meta.get("encoder_name", self.encoder_name)
         self.head_type = checkpoint_meta.get("head_type", self.head_type)
         self.task_head_profile = checkpoint_meta.get("task_head_profile", self.task_head_profile)
+        self.task_decoder_profile = checkpoint_meta.get(
+            "task_decoder_profile",
+            self.task_decoder_profile,
+        )
         self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
         self.heatmap_size = tuple(checkpoint_meta.get("heatmap_size", list(self.heatmap_size)))
         print(
@@ -223,6 +237,8 @@ class Model:
             f"encoder={self.encoder_name}, "
             f"head={self.head_type}, "
             f"task_head_profile={self.task_head_profile}, "
+            f"task_decoder_profile={self.task_decoder_profile}, "
+            f"fpn_mode={self.fpn_mode}, "
             f"heatmap_size={self.heatmap_size}, "
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
@@ -234,8 +250,10 @@ class Model:
             task_configs=self.task_configs,
             heatmap_size=self.heatmap_size,
             use_fpn=use_fpn,
+            fpn_mode=self.fpn_mode,
             head_type=self.head_type,
             task_head_profile=self.task_head_profile,
+            task_decoder_profile=self.task_decoder_profile,
         ).to(self.device)
 
         self.model.load_state_dict(checkpoint)
@@ -385,12 +403,20 @@ if __name__ == "__main__":
         help="Force no-FPN model construction.",
     )
     parser.set_defaults(use_fpn=None)
+    parser.add_argument(
+        "--fpn-mode",
+        type=str,
+        choices=("shared", "task_specific"),
+        default=None,
+        help="Optional FPN mode override. If omitted, inferred from checkpoint.",
+    )
     args = parser.parse_args()
 
     model = Model(
         checkpoint_path=args.checkpoint_path,
         encoder_name=args.encoder_name,
         use_fpn=args.use_fpn,
+        fpn_mode=args.fpn_mode,
     )
     json_path = model.predict(
         args.data_root,

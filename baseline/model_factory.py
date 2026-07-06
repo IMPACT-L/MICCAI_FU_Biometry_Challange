@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
+FPN_MODES = {"shared", "task_specific"}
 TASK_HEAD_PROFILE_PRESETS = {
     "uniform": {},
     "challenge_v1": {
@@ -16,7 +17,32 @@ TASK_HEAD_PROFILE_PRESETS = {
         "AOP": "light",
         "FUGC": "light",
         "IVC": "light",
-        "fetal_femur": "light",
+        "fetal_femur": "heavy",
+    },
+}
+TASK_DECODER_PROFILE_PRESETS = {
+    "uniform": {},
+    "geometry_v1": {
+        "A4C": "dense",
+        "PLAX": "dense",
+        "HC": "compact",
+        "AOP": "compact",
+        "FA": "compact",
+        "PSAX": "compact",
+        "FUGC": "line",
+        "IVC": "line",
+        "fetal_femur": "femur",
+    },
+    "dedicated_v1": {
+        "A4C": "a4c",
+        "PLAX": "plax",
+        "HC": "hc",
+        "AOP": "aop",
+        "FA": "fa",
+        "PSAX": "psax",
+        "FUGC": "fugc",
+        "IVC": "ivc",
+        "fetal_femur": "femur",
     },
 }
 HEAD_WIDTH_MULTIPLIERS = {
@@ -31,8 +57,10 @@ class HeatmapHead(nn.Module):
 
     def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
         super().__init__()
-        hidden = max(int((in_channels // 2) * width_multiplier), 96)
-        hidden2 = max(hidden // 2, 64)
+        base_hidden = max(in_channels // 2, 128)
+        base_hidden2 = max(base_hidden // 2, 64)
+        hidden = max(int(base_hidden * width_multiplier), 64)
+        hidden2 = max(int(base_hidden2 * width_multiplier), 64)
         self.decoder = nn.Sequential(
             nn.Conv2d(in_channels, hidden, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(hidden),
@@ -57,9 +85,12 @@ class DeepHeatmapHead(nn.Module):
 
     def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
         super().__init__()
-        hidden1 = max(int((in_channels // 2) * width_multiplier), 128)
-        hidden2 = max(int((hidden1 // 2) * width_multiplier), 96)
-        hidden3 = max(int((hidden2 // 2) * width_multiplier), 64)
+        base_hidden1 = max(in_channels // 2, 192)
+        base_hidden2 = max(base_hidden1 // 2, 128)
+        base_hidden3 = max(base_hidden2 // 2, 96)
+        hidden1 = max(int(base_hidden1 * width_multiplier), 96)
+        hidden2 = max(int(base_hidden2 * width_multiplier), 64)
+        hidden3 = max(int(base_hidden3 * width_multiplier), 64)
         self.decoder = nn.Sequential(
             nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(hidden1),
@@ -82,6 +113,538 @@ class DeepHeatmapHead(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, out_size) -> torch.Tensor:
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class LineHeatmapHead(nn.Module):
+    """Decoder biased toward elongated 2-point structures."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 160) * width_multiplier), 96)
+        hidden2 = max(int(max(hidden1 // 2, 96) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.axial_h = nn.Conv2d(hidden1, hidden1, kernel_size=(1, 5), padding=(0, 2), bias=False)
+        self.axial_v = nn.Conv2d(hidden1, hidden1, kernel_size=(5, 1), padding=(2, 0), bias=False)
+        self.bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.bn(self.axial_h(x) + self.axial_v(x))
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class CompactHeatmapHead(nn.Module):
+    """Balanced decoder for compact anatomical targets."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 160) * width_multiplier), 96)
+        hidden2 = max(int(max(hidden1 // 2, 96) * width_multiplier), 64)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size) -> torch.Tensor:
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class DenseRelationalHeatmapHead(nn.Module):
+    """Heavier decoder for dense multi-landmark relational structures."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 224) * width_multiplier), 128)
+        hidden2 = max(int(max(hidden1 // 2, 160) * width_multiplier), 96)
+        hidden3 = max(int(max(hidden2 // 2, 128) * width_multiplier), 64)
+        self.block1 = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+        )
+        self.proj = nn.Conv2d(in_channels, hidden1, kernel_size=1, bias=False)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size) -> torch.Tensor:
+        x = self.block1(x) + self.proj(x)
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class FemurHeatmapHead(nn.Module):
+    """Dedicated decoder for fetal femur endpoint localization plus shaft evidence."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 224) * width_multiplier), 128)
+        hidden2 = max(int(max(hidden1 // 2, 160) * width_multiplier), 96)
+        hidden3 = max(int(max(hidden2 // 2, 128) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.axial_h = nn.Conv2d(hidden1, hidden1, kernel_size=(1, 7), padding=(0, 3), bias=False)
+        self.axial_v = nn.Conv2d(hidden1, hidden1, kernel_size=(7, 1), padding=(3, 0), bias=False)
+        self.axial_bn = nn.BatchNorm2d(hidden1)
+        self.shared_decoder = nn.Sequential(
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+        )
+        self.point_head = nn.Conv2d(hidden3, num_points, kernel_size=1)
+        self.shaft_head = nn.Sequential(
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.axial_bn(self.axial_h(x) + self.axial_v(x))
+        x = self.shared_decoder(x)
+        point_logits = self.point_head(x)
+        shaft_logits = self.shaft_head(x)
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+        if shaft_logits.shape[-2:] != out_size:
+            shaft_logits = F.interpolate(shaft_logits, size=out_size, mode="bilinear", align_corners=False)
+        return point_logits, {"shaft_logits": shaft_logits}
+
+
+class FUGCHeatmapHead(nn.Module):
+    """Dedicated local-refinement decoder for short 2-point FUGC structures."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 192) * width_multiplier), 112)
+        hidden2 = max(int(max(hidden1 // 2, 128) * width_multiplier), 80)
+        hidden3 = max(int(max(hidden2 // 2, 96) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.refine = nn.Sequential(
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+        )
+        self.point_head = nn.Conv2d(hidden3, num_points, kernel_size=1)
+        self.segment_head = nn.Sequential(
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, 1, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.refine(x)
+        point_logits = self.point_head(x)
+        segment_logits = self.segment_head(x)
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+        if segment_logits.shape[-2:] != out_size:
+            segment_logits = F.interpolate(segment_logits, size=out_size, mode="bilinear", align_corners=False)
+        return point_logits, {"segment_logits": segment_logits}
+
+
+class A4CHeatmapHead(nn.Module):
+    """Dedicated chamber-aware decoder for four-chamber cardiac structure landmarks."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 224) * width_multiplier), 128)
+        hidden2 = max(int(max(hidden1 // 2, 160) * width_multiplier), 96)
+        hidden3 = max(int(max(hidden2 // 2, 128) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.context_d1 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, dilation=1, bias=False)
+        self.context_d2 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.context_d3 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=3, dilation=3, bias=False)
+        self.context_bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        context = self.context_d1(x) + self.context_d2(x) + self.context_d3(x)
+        x = self.context_bn(context)
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class AOPHeatmapHead(nn.Module):
+    """Dedicated arc-aware decoder for compact curved AOP anatomy."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 176) * width_multiplier), 96)
+        hidden2 = max(int(max(hidden1 // 2, 120) * width_multiplier), 72)
+        hidden3 = max(int(max(hidden2 // 2, 96) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.arc_h = nn.Conv2d(hidden1, hidden1, kernel_size=(1, 7), padding=(0, 3), bias=False)
+        self.arc_v = nn.Conv2d(hidden1, hidden1, kernel_size=(7, 1), padding=(3, 0), bias=False)
+        self.arc_d = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.arc_bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.arc_bn(self.arc_h(x) + self.arc_v(x) + self.arc_d(x))
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class FAHeatmapHead(nn.Module):
+    """Dedicated axis-aware decoder for fetal abdomen biometry landmarks."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 192) * width_multiplier), 112)
+        hidden2 = max(int(max(hidden1 // 2, 128) * width_multiplier), 80)
+        hidden3 = max(int(max(hidden2 // 2, 96) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.axis_h = nn.Conv2d(hidden1, hidden1, kernel_size=(1, 9), padding=(0, 4), bias=False)
+        self.axis_v = nn.Conv2d(hidden1, hidden1, kernel_size=(9, 1), padding=(4, 0), bias=False)
+        self.axis_bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.axis_bn(self.axis_h(x) + self.axis_v(x))
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class HCHeatmapHead(nn.Module):
+    """Dedicated ring-aware decoder for head circumference landmarks."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 192) * width_multiplier), 112)
+        hidden2 = max(int(max(hidden1 // 2, 128) * width_multiplier), 80)
+        hidden3 = max(int(max(hidden2 // 2, 96) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.ring_d1 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, dilation=1, bias=False)
+        self.ring_d2 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.ring_d4 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=4, dilation=4, bias=False)
+        self.ring_bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.ring_bn(self.ring_d1(x) + self.ring_d2(x) + self.ring_d4(x))
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class IVCHeatmapHead(nn.Module):
+    """Dedicated diameter-aware decoder for noisy 2-point IVC measurements."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 176) * width_multiplier), 96)
+        hidden2 = max(int(max(hidden1 // 2, 120) * width_multiplier), 72)
+        hidden3 = max(int(max(hidden2 // 2, 96) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.dir_h = nn.Conv2d(hidden1, hidden1, kernel_size=(1, 7), padding=(0, 3), bias=False)
+        self.dir_v = nn.Conv2d(hidden1, hidden1, kernel_size=(7, 1), padding=(3, 0), bias=False)
+        self.dir_d1 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.dir_d2 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=3, dilation=3, bias=False)
+        self.context_bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.context_bn(self.dir_h(x) + self.dir_v(x) + self.dir_d1(x) + self.dir_d2(x))
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class PLAXHeatmapHead(nn.Module):
+    """Dedicated long-axis cardiac decoder for dense PLAX landmark layouts."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 240) * width_multiplier), 144)
+        hidden2 = max(int(max(hidden1 // 2, 176) * width_multiplier), 96)
+        hidden3 = max(int(max(hidden2 // 2, 128) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.axis_h = nn.Conv2d(hidden1, hidden1, kernel_size=(1, 9), padding=(0, 4), bias=False)
+        self.axis_v = nn.Conv2d(hidden1, hidden1, kernel_size=(9, 1), padding=(4, 0), bias=False)
+        self.axis_d2 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.axis_d4 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=4, dilation=4, bias=False)
+        self.axis_bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.axis_bn(self.axis_h(x) + self.axis_v(x) + self.axis_d2(x) + self.axis_d4(x))
+        x = self.decoder(x)
+        if x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
+        return x
+
+
+class PSAXHeatmapHead(nn.Module):
+    """Dedicated short-axis ring decoder for localized PSAX paired diameters."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 184) * width_multiplier), 104)
+        hidden2 = max(int(max(hidden1 // 2, 128) * width_multiplier), 80)
+        hidden3 = max(int(max(hidden2 // 2, 96) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.ring_d1 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, dilation=1, bias=False)
+        self.ring_d2 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.ring_d3 = nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=3, dilation=3, bias=False)
+        self.diag_mix = nn.Conv2d(hidden1, hidden1, kernel_size=5, padding=2, bias=False)
+        self.context_bn = nn.BatchNorm2d(hidden1)
+        self.decoder = nn.Sequential(
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = self.context_bn(self.ring_d1(x) + self.ring_d2(x) + self.ring_d3(x) + self.diag_mix(x))
         x = self.decoder(x)
         if x.shape[-2:] != out_size:
             x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
@@ -226,42 +789,68 @@ class MultiTaskModelFactory(nn.Module):
         task_configs: List[Dict],
         heatmap_size=(64, 64),
         use_fpn: bool = False,
+        fpn_mode: str = "shared",
         head_type: str = "basic",
         task_head_profile: str = "uniform",
+        task_decoder_profile: str = "uniform",
     ):
         super().__init__()
 
         self.heatmap_size = heatmap_size
         self.use_fpn = use_fpn
+        self.fpn_mode = fpn_mode
         self.head_type = head_type
         self.task_head_profile = task_head_profile
+        self.task_decoder_profile = task_decoder_profile
 
         print(f"Initializing encoder: {encoder_name}")
         self.encoder = DINOv2Backbone(model_name=encoder_name, pretrained=(encoder_weights is not None))
 
         # FPN neck (optional)
         self.fpn = None
+        self.task_fpns = None
         head_channels = self.encoder.out_channels
         if use_fpn:
-            self.fpn = FPN(in_channels=self.encoder.out_channels, out_channels=256)
-            head_channels = self.fpn.out_channels
-            print("FPN neck: ENABLED")
+            if fpn_mode not in FPN_MODES:
+                raise ValueError(f"Unsupported fpn_mode: {fpn_mode}")
+            if fpn_mode == "shared":
+                self.fpn = FPN(in_channels=self.encoder.out_channels, out_channels=256)
+                head_channels = self.fpn.out_channels
+                print("FPN neck: ENABLED (shared)")
+            else:
+                self.task_fpns = nn.ModuleDict()
+                head_channels = 256
+                print("FPN neck: ENABLED (task-specific)")
         else:
             print("FPN neck: DISABLED")
 
         self.heads = nn.ModuleDict()
         print(f"Creating keypoint heads for {len(task_configs)} tasks...")
-        if head_type == "basic":
-            head_cls = HeatmapHead
-        elif head_type == "deep":
-            head_cls = DeepHeatmapHead
-        else:
-            raise ValueError(f"Unsupported head_type: {head_type}")
         if task_head_profile not in TASK_HEAD_PROFILE_PRESETS:
             raise ValueError(f"Unsupported task_head_profile: {task_head_profile}")
+        if task_decoder_profile not in TASK_DECODER_PROFILE_PRESETS:
+            raise ValueError(f"Unsupported task_decoder_profile: {task_decoder_profile}")
         print(f"Head type: {head_type}")
         print(f"Task head profile: {task_head_profile}")
+        print(f"Task decoder profile: {task_decoder_profile}")
         task_variant_map = TASK_HEAD_PROFILE_PRESETS[task_head_profile]
+        task_decoder_map = TASK_DECODER_PROFILE_PRESETS[task_decoder_profile]
+        decoder_family_to_head = {
+            "basic": HeatmapHead,
+            "deep": DeepHeatmapHead,
+            "line": LineHeatmapHead,
+            "compact": CompactHeatmapHead,
+            "dense": DenseRelationalHeatmapHead,
+            "femur": FemurHeatmapHead,
+            "fugc": FUGCHeatmapHead,
+            "a4c": A4CHeatmapHead,
+            "aop": AOPHeatmapHead,
+            "fa": FAHeatmapHead,
+            "hc": HCHeatmapHead,
+            "ivc": IVCHeatmapHead,
+            "plax": PLAXHeatmapHead,
+            "psax": PSAXHeatmapHead,
+        }
 
         for config in task_configs:
             task_id = config["task_id"]
@@ -272,10 +861,16 @@ class MultiTaskModelFactory(nn.Module):
             num_points = int(config["num_classes"])
             head_variant = task_variant_map.get(task_id, "medium")
             width_multiplier = HEAD_WIDTH_MULTIPLIERS[head_variant]
+            decoder_family = task_decoder_map.get(task_id, head_type)
+            if decoder_family not in decoder_family_to_head:
+                raise ValueError(f"Unsupported decoder family '{decoder_family}' for task '{task_id}'")
+            head_cls = decoder_family_to_head[decoder_family]
             print(
-                f"  - {task_id}: {head_variant} head "
+                f"  - {task_id}: {head_variant} width, decoder={decoder_family} "
                 f"(width_multiplier={width_multiplier:.2f}, num_points={num_points})"
             )
+            if self.task_fpns is not None:
+                self.task_fpns[task_id] = FPN(in_channels=self.encoder.out_channels, out_channels=256)
             self.heads[task_id] = head_cls(
                 in_channels=head_channels,
                 num_points=num_points,
@@ -294,10 +889,19 @@ class MultiTaskModelFactory(nn.Module):
         # Apply FPN neck if enabled
         if self.fpn is not None:
             features = self.fpn(features)
+        elif self.task_fpns is not None:
+            features = self.task_fpns[task_id](features)
 
-        pred_logits = self.heads[task_id](features, out_size=self.heatmap_size)
+        head_output = self.heads[task_id](features, out_size=self.heatmap_size)
+        aux_outputs = None
+        if isinstance(head_output, tuple):
+            pred_logits, aux_outputs = head_output
+        else:
+            pred_logits = head_output
 
         if return_prior:
             pred_heatmaps = torch.sigmoid(pred_logits)
+            if aux_outputs is not None:
+                return pred_logits, pred_heatmaps, aux_outputs
             return pred_logits, pred_heatmaps
         return pred_logits

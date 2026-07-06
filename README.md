@@ -86,16 +86,30 @@ output/
 
 ## Current workflow
 
-Train:
+Dedicated-head documentation:
+
+- [README_dedicated_heads.md](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/README_dedicated_heads.md)
+
+Current best public submission so far:
+
+- Run: `dinov3_vitb_taskfpn`
+- CodaBench rank: `21`
+- Submission ID: `829167`
+- Overall score: `29.2`
+
+Best full training run:
 
 ```bash
 conda activate miccai_fu_biometry
 
 python baseline/train.py \
-  --epochs 35 \
+  --epochs 2000 \
+  --early-stopping-patience 10 \
   --batch-size 4 \
   --num-workers 4 \
-  --output-dir output/runs/vitb_letterbox
+  --fpn-mode task_specific \
+  --measurement-loss-weight 0.0 \
+  --output-dir output/runs/dinov3_vitb_taskfpn
 ```
 
 Full local inference:
@@ -105,8 +119,8 @@ conda activate miccai_fu_biometry
 
 python baseline/model.py \
   --data-root data \
-  --checkpoint-path output/runs/vitb_letterbox/checkpoints/best_model.pth \
-  --output-dir output/runs/vitb_letterbox/predictions
+  --checkpoint-path output/runs/dinov3_vitb_taskfpn/checkpoints/best_model.pth \
+  --output-dir output/runs/dinov3_vitb_taskfpn/predictions
 ```
 
 Separate local evaluation:
@@ -116,9 +130,9 @@ conda activate miccai_fu_biometry
 
 python baseline/evaluate.py \
   --data-root data \
-  --pred-root output/runs/vitb_letterbox/predictions \
-  --output-file output/runs/vitb_letterbox/evaluation_results.json \
-  --summary-file output/runs/vitb_letterbox/evaluation_summary.txt
+  --pred-root output/runs/dinov3_vitb_taskfpn/predictions \
+  --output-file output/runs/dinov3_vitb_taskfpn/evaluation_results.json \
+  --summary-file output/runs/dinov3_vitb_taskfpn/evaluation_summary.txt
 ```
 
 Challenge submission package:
@@ -127,25 +141,86 @@ Challenge submission package:
 conda activate miccai_fu_biometry
 
 python submit.py \
-  --checkpoint-path output/runs/vitb_letterbox/checkpoints/best_model.pth \
-  --output-dir output/submissions/vitb_letterbox \
+  --checkpoint-path output/runs/dinov3_vitb_taskfpn/checkpoints/best_model.pth \
+  --output-dir output/submissions/dinov3_vitb_taskfpn \
   --batch-size 8 \
   --num-workers 4
 ```
+
+Weak-task fine-tuning from the current best checkpoint:
+
+```bash
+conda activate miccai_fu_biometry
+
+python baseline/train.py \
+  --epochs 200 \
+  --early-stopping-patience 10 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --learning-rate 1e-5 \
+  --init-checkpoint output/runs/dinov3_vitb_taskfpn/checkpoints/best_model.pth \
+  --train-task-ids fetal_femur,IVC,A4C,PSAX,HC \
+  --fpn-mode task_specific \
+  --measurement-loss-weight 0.0 \
+  --output-dir output/runs/dinov3_vitb_taskfpn_ft_weak5
+```
+
+Current weak-task order from local evaluation of `dinov3_vitb_taskfpn`:
+
+1. `fetal_femur`: `20.172528`
+2. `IVC`: `15.827585`
+3. `A4C`: `13.290328`
+4. `PSAX`: `12.665059`
+5. `HC`: `12.132840`
+6. `PLAX`: `11.697218`
 
 ## Improvement plan
 
 The current baseline is improved and challenge-compliant, but it is still far from the top leaderboard cluster. We will follow this order for the next round of work:
 
-1. Add a real held-out validation protocol that is stricter than the current local sanity check.
-2. Track per-task validation metrics and select checkpoints based on multi-task generalization, not only average local MRE.
-3. Add challenge-oriented inference improvements:
-   multi-checkpoint ensemble
-   flip-TTA
-4. Add measurement-aware validation so checkpoint selection is closer to the official ranking metric.
+1. Use dataset-dedicated decoders on top of the shared DINOv3 backbone instead of one generic head family for all tasks.
+2. Strengthen the weakest tasks first, especially `fetal_femur`, `IVC`, `A4C`, `PSAX`, and `HC`.
+3. Track per-task validation metrics and select checkpoints based on multi-task generalization, not only average local MRE.
+4. Add challenge-oriented inference improvements where allowed by the challenge packaging constraints.
+5. Add stronger measurement-aware training and validation so checkpoint selection is closer to the official ranking metric.
 
 ## Why this plan
 
 - Local `MRE` on the labeled training-side data is optimistic and does not predict CodaBench rank well.
 - The challenge ranking uses both landmark accuracy and derived biometric measurement accuracy.
-- Our current single-checkpoint submission leaves performance on the table, especially on weaker tasks such as `AOP`, `PLAX`, `fetal_femur`, `FA`, and `A4C`.
+- Our current best single-checkpoint submission is already competitive enough to use as a fine-tuning base.
+- The current biggest local weaknesses are `fetal_femur`, `IVC`, `A4C`, `PSAX`, and `HC`, so their decoders should be specialized before touching already-strong tasks such as `FUGC` and `AOP`.
+
+## Dedicated-head status
+
+Current `dedicated_v1` decoder coverage:
+
+- `A4C`: chamber-aware decoder
+- `AOP`: arc-aware decoder
+- `FA`: axis-aware decoder
+- `FUGC`: local-refinement decoder with segment auxiliary branch
+- `HC`: ring-aware decoder
+- `IVC`: diameter-aware decoder with directional context branches
+- `PLAX`: dense relational decoder
+- `PSAX`: compact decoder
+- `fetal_femur`: shaft-aware decoder with auxiliary shaft branch
+
+Recommended next full run:
+
+```bash
+conda activate miccai_fu_biometry
+
+python baseline/train.py \
+  --epochs 2000 \
+  --early-stopping-patience 10 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --fpn-mode shared \
+  --task-head-profile challenge_v1 \
+  --task-decoder-profile dedicated_v1 \
+  --measurement-loss-weight 0.0 \
+  --dataset-loss-weight 0.02 \
+  --femur-shaft-loss-weight 0.15 \
+  --fugc-segment-loss-weight 0.08 \
+  --output-dir output/runs/dinov3_vitb_dedicated_head
+```

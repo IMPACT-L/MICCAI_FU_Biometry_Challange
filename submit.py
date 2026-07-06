@@ -143,24 +143,31 @@ def validate_predictions(predictions):
         seen.add(key)
 
 
-def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, bool, str, str, int]:
+def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, bool, str, str, str, str, int]:
     meta_encoder_name = checkpoint_meta.get("encoder_name")
     meta_use_fpn = checkpoint_meta.get("use_fpn")
+    meta_fpn_mode = checkpoint_meta.get("fpn_mode", "shared")
     meta_head_type = checkpoint_meta.get("head_type", "basic")
     meta_task_head_profile = checkpoint_meta.get("task_head_profile", "uniform")
+    meta_task_decoder_profile = checkpoint_meta.get("task_decoder_profile", "uniform")
     meta_input_size = int(checkpoint_meta.get("input_size", 518))
     meta_heatmap_size = tuple(checkpoint_meta.get("heatmap_size", [64, 64]))
     if meta_encoder_name is not None and meta_use_fpn is not None:
         return (
             str(meta_encoder_name),
             bool(meta_use_fpn),
+            str(meta_fpn_mode),
             str(meta_head_type),
             str(meta_task_head_profile),
+            str(meta_task_decoder_profile),
             meta_input_size,
             meta_heatmap_size,
         )
 
-    checkpoint_has_fpn = any(key.startswith("fpn.") for key in checkpoint.keys())
+    checkpoint_has_shared_fpn = any(key.startswith("fpn.") for key in checkpoint.keys())
+    checkpoint_has_task_fpns = any(key.startswith("task_fpns.") for key in checkpoint.keys())
+    checkpoint_has_fpn = checkpoint_has_shared_fpn or checkpoint_has_task_fpns
+    inferred_fpn_mode = "task_specific" if checkpoint_has_task_fpns else "shared"
     head_key = next((key for key in checkpoint.keys() if key.endswith("decoder.0.weight")), None)
     if head_key is None:
         raise ValueError("Could not infer model config from checkpoint: missing head weights.")
@@ -168,11 +175,11 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
     if checkpoint_has_fpn:
         if in_channels != 256:
             raise ValueError(f"Unexpected FPN head width in checkpoint: {in_channels}")
-        return "vit_base_patch14_dinov2.lvd142m", True, "basic", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", True, inferred_fpn_mode, "basic", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 384:
-        return "vit_small_patch14_dinov2.lvd142m", False, "basic", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_small_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 768:
-        return "vit_base_patch14_dinov2.lvd142m", False, "basic", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", meta_input_size, meta_heatmap_size
     raise ValueError(f"Unsupported checkpoint head width: {in_channels}")
 
 
@@ -213,6 +220,18 @@ def main():
         help="Optional task-specific head sizing override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
+        "--task-decoder-profile",
+        default=None,
+        choices=("uniform", "geometry_v1", "dedicated_v1"),
+        help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
+        "--fpn-mode",
+        default=None,
+        choices=("shared", "task_specific"),
+        help="Optional FPN mode override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
         "--input-size",
         type=int,
         default=None,
@@ -248,8 +267,10 @@ def main():
     (
         inferred_encoder_name,
         inferred_use_fpn,
+        inferred_fpn_mode,
         inferred_head_type,
         inferred_task_head_profile,
+        inferred_task_decoder_profile,
         inferred_input_size,
         inferred_heatmap_size,
     ) = infer_model_config_from_checkpoint(
@@ -257,8 +278,10 @@ def main():
         checkpoint_meta,
     )
     encoder_name = args.encoder_name or inferred_encoder_name
+    fpn_mode = args.fpn_mode or inferred_fpn_mode
     head_type = args.head_type or inferred_head_type
     task_head_profile = args.task_head_profile or inferred_task_head_profile
+    task_decoder_profile = args.task_decoder_profile or inferred_task_decoder_profile
     use_fpn = inferred_use_fpn if args.use_fpn is None else args.use_fpn
     input_size = int(args.input_size or inferred_input_size)
 
@@ -274,15 +297,20 @@ def main():
 
     print(
         f"Checkpoint architecture: backbone={inferred_encoder_name}, "
+        f"fpn_mode={inferred_fpn_mode}, "
         f"head={inferred_head_type}, "
         f"task_head_profile={inferred_task_head_profile}, "
+        f"task_decoder_profile={inferred_task_decoder_profile}, "
         f"input_size={inferred_input_size}, "
         f"heatmap_size={inferred_heatmap_size}, "
         f"FPN={'ENABLED' if inferred_use_fpn else 'DISABLED'}"
     )
     print(
         f"Submission model config: backbone={encoder_name}, "
+        f"fpn_mode={fpn_mode}, "
         f"head={head_type}, "
+        f"task_head_profile={task_head_profile}, "
+        f"task_decoder_profile={task_decoder_profile}, "
         f"input_size={input_size}, "
         f"heatmap_size={inferred_heatmap_size}, "
         f"FPN={'ENABLED' if use_fpn else 'DISABLED'}"
@@ -294,8 +322,10 @@ def main():
         task_configs=task_configs,
         heatmap_size=inferred_heatmap_size,
         use_fpn=use_fpn,
+        fpn_mode=fpn_mode,
         head_type=head_type,
         task_head_profile=task_head_profile,
+        task_decoder_profile=task_decoder_profile,
     ).to(device)
 
     model.load_state_dict(checkpoint)
