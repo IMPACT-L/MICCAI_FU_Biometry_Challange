@@ -825,7 +825,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_v1"),
+        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
     )

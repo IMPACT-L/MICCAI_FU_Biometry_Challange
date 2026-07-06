@@ -223,7 +223,7 @@ def main():
     parser.add_argument(
         "--task-decoder-profile",
         default=None,
-        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_v1"),
+        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(

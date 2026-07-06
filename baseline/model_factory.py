@@ -47,6 +47,17 @@ TASK_DECODER_PROFILE_PRESETS = {
         "IVC": "ivc",
         "fetal_femur": "femur",
     },
+    "dedicated_legacy_v1": {
+        "A4C": "a4c",
+        "PLAX": "plax",
+        "HC": "hc",
+        "AOP": "aop",
+        "FA": "fa",
+        "PSAX": "psax",
+        "FUGC": "fugc",
+        "IVC": "ivc",
+        "fetal_femur": "line",
+    },
     "dedicated_v1": {
         "A4C": "a4c",
         "PLAX": "plax",
