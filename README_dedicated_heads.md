@@ -13,7 +13,7 @@ The goal of this branch is simple:
 
 ![Dedicated-head architecture](assets/fu_biometry_dedicated_heads_architecture.png)
 
-The figure is conceptual. The exact implementation is defined by the code in [baseline/model_factory.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/model_factory.py), [baseline/train.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/train.py), [baseline/utils.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/utils.py), and [submit.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/submit.py).
+The figure is conceptual. The exact implementation is defined by the code in [baseline/model_factory.py](baseline/model_factory.py), [baseline/train.py](baseline/train.py), [baseline/utils.py](baseline/utils.py), and [submit.py](submit.py).
 
 ## Why This Exists
 
@@ -60,7 +60,169 @@ The `dedicated_v1` decoder profile currently maps tasks like this:
 
 Code anchor:
 
-- decoder profile preset: [baseline/model_factory.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/model_factory.py)
+- decoder profile preset: [baseline/model_factory.py](baseline/model_factory.py)
+
+## Why Each Head Was Chosen
+
+The dedicated heads were not chosen by landmark count alone. They were chosen from the actual image appearance, anatomical structure, and measurement geometry of each dataset.
+
+### `A4C` -> `A4CHeatmapHead`
+
+Why:
+
+- `A4C` is a 16-point four-chamber cardiac view with landmarks spread across a large global structure.
+- The task depends on chamber layout, valve positions, and long boundaries, not just local point appearance.
+- A small generic decoder tends to underuse the global relationship between the chambers.
+
+Design choice:
+
+- a heavier decoder
+- multi-dilation context branches
+- stronger global chamber-aware refinement
+
+Intent:
+
+- preserve large-scale cardiac structure while still resolving local landmark peaks
+
+### `AOP` -> `AOPHeatmapHead`
+
+Why:
+
+- `AOP` is compact, but the anatomy is curved and arc-like rather than circular or rectangular.
+- The important structure is a bright curved contour with nearby shadow and lumen patterns.
+- A generic compact head does not explicitly bias toward arc geometry.
+
+Design choice:
+
+- lightweight custom decoder
+- horizontal, vertical, and dilated arc-sensitive branches
+
+Intent:
+
+- help the model lock onto curved compact anatomy without over-parameterizing a small task
+
+### `FA` -> `FAHeatmapHead`
+
+Why:
+
+- `FA` is a 4-point fetal abdomen task with strong axis structure.
+- The landmarks define measurement axes more than arbitrary contour points.
+- The anatomy is compact, but directional geometry matters.
+
+Design choice:
+
+- medium-width custom decoder
+- explicit horizontal and vertical axis-sensitive filters
+
+Intent:
+
+- improve axis consistency and pair geometry for abdomen measurements
+
+### `FUGC` -> `FUGCHeatmapHead`
+
+Why:
+
+- `FUGC` is only 2 points, but it is not a long line task.
+- It is a small local structure where short-range detail matters more than global shape.
+- The useful supervision is the short connecting segment, not a full elongated shaft.
+
+Design choice:
+
+- local-refinement decoder
+- auxiliary short-segment branch used during training
+
+Intent:
+
+- sharpen local endpoint placement and stabilize the short measured segment
+
+### `HC` -> `HCHeatmapHead`
+
+Why:
+
+- `HC` is a compact head view with a bright ring-like skull contour.
+- The landmarks are constrained by circular or elliptical boundary structure.
+- A generic compact head can find points, but it does not explicitly reinforce ring continuity.
+
+Design choice:
+
+- heavy custom decoder
+- multi-dilation ring-aware context branches
+
+Intent:
+
+- improve consistency around the skull boundary rather than treating each point independently
+
+### `IVC` -> `IVCHeatmapHead`
+
+Why:
+
+- `IVC` is a short 2-point vessel diameter task in noisy cardiac ultrasound.
+- The diameter segment is often short, oblique, low-contrast, and surrounded by clutter.
+- It is not a femur-like shaft and not a clean long segment.
+
+Design choice:
+
+- compact dedicated decoder
+- directional horizontal, vertical, and diagonal context branches
+- local diameter-aware refinement
+
+Intent:
+
+- make the model sensitive to short oblique vessel diameter geometry in noisy frames
+
+### `PLAX` -> `PLAXHeatmapHead`
+
+Why:
+
+- `PLAX` is a dense 22-point long-axis cardiac task with multiple vertically paired measurements.
+- The anatomy spans a large field of view and depends heavily on long-axis organization.
+- A generic dense decoder is not specific enough for this structured cardiac layout.
+
+Design choice:
+
+- heavy long-axis decoder
+- horizontal, vertical, and dilated context fusion
+- more capacity than the generic dense head
+
+Intent:
+
+- preserve global long-axis organization while keeping dense landmark prediction stable
+
+### `PSAX` -> `PSAXHeatmapHead`
+
+Why:
+
+- `PSAX` is a compact short-axis cardiac view with a ring-like central structure.
+- The four landmarks form paired diameters around a localized circular target.
+- It behaves more like a short-axis ring task than a generic compact point task.
+
+Design choice:
+
+- medium custom decoder
+- ring-aware multi-dilation context
+- extra local mixing to support diagonal paired diameters
+
+Intent:
+
+- improve localization on compact circular anatomy with short-axis pair structure
+
+### `fetal_femur` -> `FemurHeatmapHead`
+
+Why:
+
+- `fetal_femur` is a 2-point long bone task with strong shaft structure.
+- The main ambiguity is often endpoint placement along a bright elongated bone.
+- The shaft itself is useful supervision and should not be discarded during training.
+
+Design choice:
+
+- heavier dedicated decoder
+- axial context branches
+- auxiliary shaft branch used during training
+
+Intent:
+
+- teach the model the entire bone axis so endpoint prediction becomes more stable
 
 ## Head Sizing Profile
 
@@ -99,7 +261,7 @@ The dataset-family profile currently available is `dataset_v1`:
 - `compact`: `HC`, `AOP`, `FA`, `PSAX`
 - `line`: `FUGC`, `IVC`, `fetal_femur`
 
-This is implemented in [baseline/utils.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/utils.py).
+This is implemented in [baseline/utils.py](baseline/utils.py).
 
 ## Challenge Metric Alignment
 
@@ -134,7 +296,7 @@ The dedicated-head workflow depends mainly on these flags:
 - `--femur-shaft-loss-weight`
 - `--fugc-segment-loss-weight`
 
-See the parser in [baseline/train.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/train.py).
+See the parser in [baseline/train.py](baseline/train.py).
 
 ## Recommended Training Command
 
@@ -233,13 +395,12 @@ If this model still underperforms on the leaderboard, the next practical levers 
 
 ## Files To Read
 
-- architecture factory: [baseline/model_factory.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/model_factory.py)
-- training loop: [baseline/train.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/train.py)
-- losses and evaluation utilities: [baseline/utils.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/utils.py)
-- inference script: [baseline/model.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/baseline/model.py)
-- submission builder: [submit.py](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/submit.py)
+- architecture factory: [baseline/model_factory.py](baseline/model_factory.py)
+- training loop: [baseline/train.py](baseline/train.py)
+- losses and evaluation utilities: [baseline/utils.py](baseline/utils.py)
+- inference script: [baseline/model.py](baseline/model.py)
+- submission builder: [submit.py](submit.py)
 
 ## Asset Used In This Document
 
-- image: [assets/fu_biometry_dedicated_heads_architecture.png](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/assets/fu_biometry_dedicated_heads_architecture.png)
-
+- image: [assets/fu_biometry_dedicated_heads_architecture.png](assets/fu_biometry_dedicated_heads_architecture.png)

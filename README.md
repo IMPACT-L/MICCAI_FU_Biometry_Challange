@@ -88,7 +88,7 @@ output/
 
 Dedicated-head documentation:
 
-- [README_dedicated_heads.md](/home/hamze/Documents/MICCAI_FU_Biometry_Challange/README_dedicated_heads.md)
+- [README_dedicated_heads.md](README_dedicated_heads.md)
 
 Current best public submission so far:
 
