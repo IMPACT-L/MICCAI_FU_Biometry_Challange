@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
 from albumentations.pytorch import ToTensorV2
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -55,6 +56,8 @@ HEATMAP_SIZE = (64, 64)
 HEATMAP_SIGMA = 1.8
 FEMUR_SHAFT_LOSS_WEIGHT = 0.15
 FUGC_SEGMENT_LOSS_WEIGHT = 0.08
+ROI_CROP_TASKS = ("FUGC", "IVC", "fetal_femur")
+ROI_CONTEXT_RANGE = (1.2, 1.8)
 TASK_LOSS_WEIGHTS = {
     "A4C": 1.35,
     "AOP": 0.80,
@@ -113,6 +116,13 @@ def _parse_task_id_csv(value: str | None) -> list[str] | None:
         return None
     task_ids = [item.strip() for item in str(value).split(",") if item.strip()]
     return task_ids or None
+
+
+def _parse_task_id_set_csv(value: str | None) -> set[str] | None:
+    task_ids = _parse_task_id_csv(value)
+    if task_ids is None:
+        return None
+    return set(task_ids)
 
 
 def _filter_dataframe_by_task_ids(dataframe, task_ids: Iterable[str] | None):
@@ -235,6 +245,12 @@ def main(
     sampler_task_weight_overrides: dict[str, float] | None = None,
     use_ema: bool = True,
     ema_decay: float = 0.999,
+    train_roi_crop: bool = False,
+    roi_crop_tasks: set[str] | None = None,
+    roi_context_min: float = ROI_CONTEXT_RANGE[0],
+    roi_context_max: float = ROI_CONTEXT_RANGE[1],
+    grad_accum_steps: int = 1,
+    use_amp: bool = True,
 ):
     metric_column = "MRE (pixels)"
     metric_label = CHECKPOINT_SCORE_NAME
@@ -316,6 +332,11 @@ def main(
     logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
     logger.info(f"EMA: {'ENABLED' if use_ema else 'DISABLED'}")
     logger.info(f"EMA decay: {ema_decay:.6f}")
+    logger.info(f"Train ROI crop: {'ENABLED' if train_roi_crop else 'DISABLED'}")
+    logger.info(f"ROI crop tasks: {sorted(roi_crop_tasks) if roi_crop_tasks else 'all-enabled-tasks'}")
+    logger.info(f"ROI context range: ({roi_context_min:.3f}, {roi_context_max:.3f})")
+    logger.info(f"Grad accumulation steps: {grad_accum_steps}")
+    logger.info(f"AMP: {'ENABLED' if (use_amp and device.type == 'cuda') else 'DISABLED'}")
     logger.info(f"Heatmap size: {HEATMAP_SIZE}")
     effective_task_loss_weights = dict(TASK_LOSS_WEIGHTS)
     if task_loss_weight_overrides:
@@ -375,6 +396,9 @@ def main(
         heatmap_size=HEATMAP_SIZE,
         sigma=HEATMAP_SIGMA,
         input_size=input_size,
+        roi_crop=train_roi_crop,
+        roi_crop_tasks=roi_crop_tasks,
+        roi_context_range=(roi_context_min, roi_context_max),
     )
     train_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
     if train_task_ids:
@@ -395,6 +419,7 @@ def main(
         heatmap_size=HEATMAP_SIZE,
         sigma=HEATMAP_SIGMA,
         input_size=input_size,
+        roi_crop=False,
     )
     val_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
 
@@ -464,6 +489,7 @@ def main(
     optimizer = optim.AdamW(param_groups)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     ema = ModelEma(model, decay=ema_decay) if use_ema else None
+    scaler = GradScaler(enabled=bool(use_amp and device.type == "cuda"))
 
     best_val_score = float("inf")
     epochs_without_improvement = 0
@@ -484,6 +510,8 @@ def main(
             model.train()
             epoch_train_losses = defaultdict(list)
             loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
+            optimizer.zero_grad(set_to_none=True)
+            accumulation_counter = 0
 
             for batch in loop:
                 images = batch["image"].to(device)
@@ -497,75 +525,91 @@ def main(
                     task_heatmaps = torch.stack([batch["heatmap"][i] for i in task_indices], 0).to(device)
 
                     # Forward pass (FPN applied inside model if enabled)
-                    model_output = model(task_images, task_id=current_task_id, return_prior=True)
-                    aux_outputs = {}
-                    if len(model_output) == 3:
-                        pred_logits, pred_heatmaps, aux_outputs = model_output
-                    else:
-                        pred_logits, pred_heatmaps = model_output
-                    target_coords = torch.stack([batch["train_label"][i] for i in task_indices], 0).to(device)
-                    pred_coords_transformed = softargmax_heatmaps_to_transformed_coords(pred_logits)
-                    target_coords_transformed = target_coords.clone()
-                    coord_loss = F.l1_loss(pred_coords_transformed, target_coords_transformed)
-                    heatmap_loss = F.mse_loss(pred_heatmaps, task_heatmaps)
-                    pred_coords_original = transformed_coords_to_original_normalized(
-                        pred_coords_transformed,
-                        [batch["meta"][i] for i in task_indices],
-                    ).to(device)
-                    target_coords_original = torch.stack([batch["label"][i] for i in task_indices], 0).to(device)
-                    measurement_loss = compute_measurement_loss(
-                        pred_coords_original,
-                        target_coords_original,
-                        [batch["meta"][i] for i in task_indices],
-                        current_task_id,
-                    )
-                    dataset_specific_loss = compute_dataset_specific_loss(
-                        pred_coords_original,
-                        target_coords_original,
-                        [batch["meta"][i] for i in task_indices],
-                        current_task_id,
-                        profile=task_loss_family_profile,
-                    )
-                    femur_shaft_loss = pred_logits.new_tensor(0.0)
-                    if current_task_id == "fetal_femur":
-                        femur_shaft_loss = compute_femur_shaft_loss(
-                            aux_outputs.get("shaft_logits"),
-                            target_coords_transformed,
-                            heatmap_size=HEATMAP_SIZE,
+                    with autocast(enabled=bool(use_amp and device.type == "cuda")):
+                        model_output = model(task_images, task_id=current_task_id, return_prior=True)
+                        aux_outputs = {}
+                        if len(model_output) == 3:
+                            pred_logits, pred_heatmaps, aux_outputs = model_output
+                        else:
+                            pred_logits, pred_heatmaps = model_output
+                        target_coords = torch.stack([batch["train_label"][i] for i in task_indices], 0).to(device)
+                        pred_coords_transformed = softargmax_heatmaps_to_transformed_coords(pred_logits)
+                        target_coords_transformed = target_coords.clone()
+                        coord_loss = F.l1_loss(pred_coords_transformed, target_coords_transformed)
+                        heatmap_loss = F.mse_loss(pred_heatmaps, task_heatmaps)
+                        pred_coords_original = transformed_coords_to_original_normalized(
+                            pred_coords_transformed,
+                            [batch["meta"][i] for i in task_indices],
+                        ).to(device)
+                        target_coords_original = torch.stack([batch["label"][i] for i in task_indices], 0).to(device)
+                        measurement_loss = compute_measurement_loss(
+                            pred_coords_original,
+                            target_coords_original,
+                            [batch["meta"][i] for i in task_indices],
+                            current_task_id,
                         )
-                    fugc_segment_loss = pred_logits.new_tensor(0.0)
-                    if current_task_id == "FUGC":
-                        fugc_segment_loss = compute_fugc_segment_loss(
-                            aux_outputs.get("segment_logits"),
-                            target_coords_transformed,
-                            heatmap_size=HEATMAP_SIZE,
+                        dataset_specific_loss = compute_dataset_specific_loss(
+                            pred_coords_original,
+                            target_coords_original,
+                            [batch["meta"][i] for i in task_indices],
+                            current_task_id,
+                            profile=task_loss_family_profile,
                         )
-                    base_loss = (
-                        heatmap_loss
-                        + 0.2 * coord_loss
-                        + measurement_loss_weight * measurement_loss
-                        + dataset_loss_weight * dataset_specific_loss
-                        + femur_shaft_loss_weight * femur_shaft_loss
-                        + fugc_segment_loss_weight * fugc_segment_loss
-                    )
-                    task_weight = float(effective_task_loss_weights.get(current_task_id, 1.0))
-                    loss = base_loss * task_weight
+                        femur_shaft_loss = pred_logits.new_tensor(0.0)
+                        if current_task_id == "fetal_femur":
+                            femur_shaft_loss = compute_femur_shaft_loss(
+                                aux_outputs.get("shaft_logits"),
+                                target_coords_transformed,
+                                heatmap_size=HEATMAP_SIZE,
+                            )
+                        fugc_segment_loss = pred_logits.new_tensor(0.0)
+                        if current_task_id == "FUGC":
+                            fugc_segment_loss = compute_fugc_segment_loss(
+                                aux_outputs.get("segment_logits"),
+                                target_coords_transformed,
+                                heatmap_size=HEATMAP_SIZE,
+                            )
+                        base_loss = (
+                            heatmap_loss
+                            + 0.2 * coord_loss
+                            + measurement_loss_weight * measurement_loss
+                            + dataset_loss_weight * dataset_specific_loss
+                            + femur_shaft_loss_weight * femur_shaft_loss
+                            + fugc_segment_loss_weight * fugc_segment_loss
+                        )
+                        task_weight = float(effective_task_loss_weights.get(current_task_id, 1.0))
+                        loss = base_loss * task_weight
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-                    if ema is not None:
-                        ema.update(model)
+                    scaled_loss = loss / float(max(grad_accum_steps, 1))
+                    scaler.scale(scaled_loss).backward()
+                    accumulation_counter += 1
+                    if accumulation_counter >= max(grad_accum_steps, 1):
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        accumulation_counter = 0
+                        if ema is not None:
+                            ema.update(model)
 
                     loss_value = float(loss.item())
                     batch_loss_values.append(loss_value)
                     epoch_train_losses[current_task_id].append(loss_value)
+
+                if accumulation_counter >= max(grad_accum_steps, 1):
+                    accumulation_counter = 0
 
                 mean_batch_loss = float(np.mean(batch_loss_values)) if batch_loss_values else 0.0
                 loop.set_postfix(
                     loss=f"{mean_batch_loss:.6f}",
                     groups=len(set(task_ids)),
                 )
+
+            if accumulation_counter > 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                if ema is not None:
+                    ema.update(model)
 
             logger.info(f"\n--- Epoch {epoch + 1} Average Train Loss ---")
             train_epoch_mean = float(np.mean([v for values in epoch_train_losses.values() for v in values]))
@@ -687,6 +731,9 @@ def main(
                             "task_loss_weight_overrides": task_loss_weight_overrides or {},
                             "sampler_task_weight_overrides": sampler_task_weight_overrides or {},
                             "normalization_scheme": "train_iqr_proxy",
+                            "train_roi_crop": train_roi_crop,
+                            "roi_crop_tasks": sorted(roi_crop_tasks) if roi_crop_tasks else [],
+                            "roi_context_range": [roi_context_min, roi_context_max],
                         },
                     }
                 torch.save(checkpoint_payload, model_save_path)
@@ -902,6 +949,40 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable EMA validation/checkpoint smoothing.",
     )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=1,
+        help="Accumulate gradients over this many sampled batches before optimizer step.",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable AMP mixed-precision training.",
+    )
+    parser.add_argument(
+        "--train-roi-crop",
+        action="store_true",
+        help="Enable GT-centered ROI crop augmentation for selected training tasks.",
+    )
+    parser.add_argument(
+        "--roi-crop-tasks",
+        type=str,
+        default=",".join(ROI_CROP_TASKS),
+        help="Comma-separated task IDs for ROI crop training augmentation.",
+    )
+    parser.add_argument(
+        "--roi-context-min",
+        type=float,
+        default=ROI_CONTEXT_RANGE[0],
+        help="Minimum context multiplier for ROI crop box.",
+    )
+    parser.add_argument(
+        "--roi-context-max",
+        type=float,
+        default=ROI_CONTEXT_RANGE[1],
+        help="Maximum context multiplier for ROI crop box.",
+    )
     args = parser.parse_args()
 
     # --no-fpn takes precedence over --fpn
@@ -940,4 +1021,10 @@ if __name__ == "__main__":
         sampler_task_weight_overrides=_parse_weight_csv(args.sampler_task_weights),
         use_ema=not bool(args.no_ema),
         ema_decay=float(args.ema_decay),
+        grad_accum_steps=int(args.grad_accum_steps),
+        use_amp=not bool(args.no_amp),
+        train_roi_crop=bool(args.train_roi_crop),
+        roi_crop_tasks=_parse_task_id_set_csv(args.roi_crop_tasks),
+        roi_context_min=float(args.roi_context_min),
+        roi_context_max=float(args.roi_context_max),
     )

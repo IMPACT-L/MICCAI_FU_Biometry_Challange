@@ -9,9 +9,33 @@ This file records the main experiment conclusions and leaderboard outcomes from 
 - FPN: `task_specific`
 - Training focus: landmark losses with `--measurement-loss-weight 0.0`
 
+## Strongest local-only run
+
+- Run: `vitlarge_dinov3_taskfpn_v1`
+- Backbone: `vit_large_patch16_dinov3`
+- Local evaluation:
+  - Average `MRE`: `11.004783`
+  - `A4C`: `14.043523`
+  - `AOP`: `6.701760`
+  - `FA`: `8.719284`
+  - `FUGC`: `4.015719`
+  - `HC`: `13.374666`
+  - `IVC`: `16.709704`
+  - `PLAX`: `11.209807`
+  - `PSAX`: `13.906419`
+  - `fetal_femur`: `10.362164`
+- Public result:
+  - rank: `24`
+  - submission id: `831250`
+  - overall score: `29.88`
+
+This is important because it confirms the larger DINOv3 backbone is stronger on local validation, but public leaderboard generalization is still not better than the `rank 21` ViT-B submission.
+
 ## Main conclusions
 
 - `task_specific` FPN consistently performed better than shared FPN.
+- `vit_large_patch16_dinov3` is a valid stronger backbone path in this codebase.
+- AMP plus gradient accumulation were added to make the larger backbone trainable with small GPU memory budgets.
 - Adding measurement loss in the current implementation hurt validation MRE and did not improve the practical submission direction.
 - Replacing all task heads at once with `dedicated_v1` was too aggressive and often regressed already-strong tasks.
 - The most persistent weak tasks are:
@@ -30,6 +54,7 @@ This file records the main experiment conclusions and leaderboard outcomes from 
     - `output/submissions/dinov3_vitb_taskfpn/`
 
 - Additional saved results:
+  - `vitlarge_dinov3_taskfpn_v1`
   - `dinov3_vitb_taskfpn_geometryv1_datasetlossv1`
   - `dinov3_vitb_dedicated_head_datasetv1`
   - other older experiments under `output/runs/` and `output/submissions/`

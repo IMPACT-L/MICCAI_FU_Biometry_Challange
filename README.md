@@ -97,6 +97,22 @@ Current best public submission so far:
 - Submission ID: `829167`
 - Overall score: `29.2`
 
+Best local validation run so far:
+
+- Run: `vitlarge_dinov3_taskfpn_v1`
+- Backbone: `vit_large_patch16_dinov3`
+- Local average `MRE`: `11.004783`
+- Public CodaBench result:
+  - rank: `24`
+  - submission id: `831250`
+  - overall score: `29.88`
+
+Current read of the results:
+
+- `vit_large_patch16_dinov3` improves local validation substantially.
+- The older `dinov3_vitb_taskfpn` submission still generalizes better on the public board.
+- Future work should keep the stronger backbone path, but target leaderboard generalization instead of local MRE alone.
+
 Best full training run:
 
 ```bash
@@ -110,6 +126,28 @@ python baseline/train.py \
   --fpn-mode task_specific \
   --measurement-loss-weight 0.0 \
   --output-dir output/runs/dinov3_vitb_taskfpn
+```
+
+Best large-backbone training run:
+
+```bash
+conda activate miccai_fu_biometry
+
+python baseline/train.py \
+  --encoder-name vit_large_patch16_dinov3 \
+  --epochs 2000 \
+  --early-stopping-patience 10 \
+  --batch-size 1 \
+  --grad-accum-steps 4 \
+  --num-workers 4 \
+  --fpn-mode task_specific \
+  --task-head-profile challenge_v1 \
+  --task-decoder-profile uniform \
+  --task-loss-family-profile uniform \
+  --measurement-loss-weight 0.0 \
+  --dataset-loss-weight 0.0 \
+  --ema-decay 0.999 \
+  --output-dir output/runs/vitlarge_dinov3_taskfpn_v1
 ```
 
 Full local inference:
@@ -145,6 +183,22 @@ python submit.py \
   --output-dir output/submissions/dinov3_vitb_taskfpn \
   --batch-size 8 \
   --num-workers 4
+```
+
+Large-backbone submission package:
+
+```bash
+conda activate miccai_fu_biometry
+
+python submit.py \
+  --checkpoint-path output/runs/vitlarge_dinov3_taskfpn_v1/checkpoints/best_model.pth \
+  --output-dir output/submissions/vitlarge_dinov3_taskfpn_v1 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --encoder-name vit_large_patch16_dinov3 \
+  --fpn-mode task_specific \
+  --task-head-profile challenge_v1 \
+  --task-decoder-profile uniform
 ```
 
 Weak-task fine-tuning from the current best checkpoint:

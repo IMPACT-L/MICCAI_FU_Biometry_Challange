@@ -28,6 +28,9 @@ class KeypointDataset(Dataset):
         heatmap_size: Tuple[int, int] = (64, 64),
         sigma: float = 1.8,
         input_size: int = 518,
+        roi_crop: bool = False,
+        roi_crop_tasks: Optional[set[str]] = None,
+        roi_context_range: Tuple[float, float] = (1.4, 2.0),
     ):
         super().__init__()
         self.data_root = data_root
@@ -35,6 +38,9 @@ class KeypointDataset(Dataset):
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.input_size = input_size
+        self.roi_crop = roi_crop
+        self.roi_crop_tasks = roi_crop_tasks
+        self.roi_context_range = roi_context_range
         self.csv_path = os.path.join(self.data_root, "csv")
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
@@ -114,6 +120,45 @@ class KeypointDataset(Dataset):
 
         return heatmaps
 
+    def _should_apply_roi_crop(self, task_id: str) -> bool:
+        if not self.roi_crop:
+            return False
+        if self.roi_crop_tasks is None:
+            return True
+        return str(task_id) in self.roi_crop_tasks
+
+    def _apply_roi_crop(self, image: np.ndarray, coords_px: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        valid_coords = coords_px[np.isfinite(coords_px).all(axis=1)]
+        if len(valid_coords) == 0:
+            return image, coords_px
+
+        image_h, image_w = image.shape[:2]
+        x_min = float(valid_coords[:, 0].min())
+        y_min = float(valid_coords[:, 1].min())
+        x_max = float(valid_coords[:, 0].max())
+        y_max = float(valid_coords[:, 1].max())
+
+        box_w = max(x_max - x_min, 8.0)
+        box_h = max(y_max - y_min, 8.0)
+        center_x = 0.5 * (x_min + x_max)
+        center_y = 0.5 * (y_min + y_max)
+
+        context_min, context_max = self.roi_context_range
+        context = float(np.random.uniform(context_min, context_max))
+        crop_w = min(float(image_w), max(box_w * context, box_w + 32.0))
+        crop_h = min(float(image_h), max(box_h * context, box_h + 32.0))
+
+        x0 = int(np.floor(np.clip(center_x - crop_w * 0.5, 0.0, max(image_w - crop_w, 0.0))))
+        y0 = int(np.floor(np.clip(center_y - crop_h * 0.5, 0.0, max(image_h - crop_h, 0.0))))
+        x1 = int(np.ceil(min(float(image_w), x0 + crop_w)))
+        y1 = int(np.ceil(min(float(image_h), y0 + crop_h)))
+
+        cropped_image = image[y0:y1, x0:x1]
+        cropped_coords = coords_px.copy()
+        cropped_coords[:, 0] -= float(x0)
+        cropped_coords[:, 1] -= float(y0)
+        return cropped_image, cropped_coords
+
     def __getitem__(self, idx: int) -> dict:
         total = len(self)
         if total == 0:
@@ -143,8 +188,6 @@ class KeypointDataset(Dataset):
             )
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        original_height, original_width = image.shape[:2]
-
         num_points = int(record["num_classes"])
         coords = []
         for i in range(1, num_points + 1):
@@ -155,8 +198,13 @@ class KeypointDataset(Dataset):
                 coords.extend([0.0, 0.0])
         label = np.array(coords, dtype=np.float32)
         label = canonicalize_task_coords(label, task_id)
-        label_original = label.copy()
         label_points = label.reshape(-1, 2)
+
+        if self._should_apply_roi_crop(task_id):
+            image, label_points = self._apply_roi_crop(image, label_points)
+
+        original_height, original_width = image.shape[:2]
+        label_original = label_points.reshape(-1).astype(np.float32)
 
         image, transformed_points, meta = letterbox_image_and_points(
             image=image,
