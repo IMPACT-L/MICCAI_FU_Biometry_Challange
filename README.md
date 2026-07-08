@@ -97,6 +97,13 @@ Current best public submission so far:
 - Submission ID: `832817`
 - Overall score: `27.36`
 
+Current second-best public submission so far:
+
+- Run: `dinov3_vitb_taskfpn_grouped_serverproxy_v2_a4c`
+- CodaBench rank: `18`
+- Submission ID: `834123`
+- Overall score: `27.47`
+
 Best local validation run so far:
 
 - Run: `vitlarge_dinov3_taskfpn_v1`
@@ -121,11 +128,14 @@ Comparable saved runs:
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
 | `dinov3_vitb_taskfpn_grouped_serverproxy_v1` | `11.349361` | `27.36` |
+| `dinov3_vitb_taskfpn_grouped_serverproxy_v2_a4c` | `NA` | `27.47` |
+| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_balanced_ft` | `NA` | `28.31` |
 | `dinov3_vitb_taskfpn_localrefine_v1_robustdomain_v1` | `6.869928` | `28.86` |
+| `dinov3_vitb_taskfpn_pseudodomain_robust_uniform_v1` | `NA` | `34.69` |
 | `vitlarge_dinov3_taskfpn_v1` | `11.004783` | `29.88` |
 | `vitlarge_dinov3_taskfpn_grouped_strongaug_v1` | `11.019315` | `35.68` |
 
-The current comparison shows the exact gap we care about: the best hidden-validation result still did not come from the lowest local `MRE`, and even the very strong `localrefine_v1_robustdomain_v1` local run did not beat the best public score. Future runs should therefore be judged with grouped validation and server-proxy style checkpointing rather than local mean `MRE` alone.
+The current comparison shows the exact gap we care about: the best hidden-validation result still did not come from the lowest local `MRE`, and even the more aggressive pseudo-domain robustness branch regressed badly on the public server. Future runs should therefore be judged with grouped validation and server-proxy style checkpointing rather than local mean `MRE` alone.
 
 Best full training run:
 

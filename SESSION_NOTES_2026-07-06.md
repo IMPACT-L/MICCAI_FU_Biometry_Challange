@@ -67,6 +67,27 @@ This is important because it confirms the larger DINOv3 backbone is stronger on 
   - local average `MRE`: `6.869928`
   - note: much stronger local validation still did not surpass the best hidden-server result
 
+- New second-best public result:
+  - run: `dinov3_vitb_taskfpn_grouped_serverproxy_v2_a4c`
+  - rank: `18`
+  - submission id: `834123`
+  - overall score: `27.47`
+  - note: stronger A4C-focused checkpoint weighting helped relative to most recent robust-domain runs, but still did not beat `dinov3_vitb_taskfpn_grouped_serverproxy_v1`
+
+- Pseudo-domain robust branch result:
+  - run: `dinov3_vitb_taskfpn_pseudodomain_robust_uniform_v1`
+  - rank: `41`
+  - submission id: `834135`
+  - overall score: `34.69`
+  - note: pseudo-domain grouping plus robust augmentation severely regressed hidden-server performance and should not be used as the main submission branch
+
+- Balanced fine-tune result:
+  - run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1_balanced_ft`
+  - rank: `22`
+  - submission id: `834497`
+  - overall score: `28.31`
+  - note: mild balanced hard-task fine-tuning preserved reasonable performance but still underperformed both `grouped_serverproxy_v1` and `grouped_serverproxy_v2_a4c`
+
 ## Why `weak_tasks_v1` was added
 
 `weak_tasks_v1` keeps the stable proven path for stronger tasks and specializes only:

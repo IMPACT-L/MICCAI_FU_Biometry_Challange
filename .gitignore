@@ -15,6 +15,15 @@ output/submissions/**
 !output/submissions/**/codabench_result_*.txt
 output/misc/
 output/misc/**
+output/analysis/**/A4C/
+output/analysis/**/AOP/
+output/analysis/**/FA/
+output/analysis/**/FUGC/
+output/analysis/**/HC/
+output/analysis/**/IVC/
+output/analysis/**/PLAX/
+output/analysis/**/PSAX/
+output/analysis/**/fetal_femur/
 predictions/
 submission_output/
 submission_output_*/
@@ -22,3 +31,10 @@ evaluation_results.json
 evaluation_summary.txt
 best_model.pth
 .DS_Store
+paper/**/*.aux
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.log
+paper/**/*.out
+paper/**/*.pdf
+paper/*_overleaf.zip
