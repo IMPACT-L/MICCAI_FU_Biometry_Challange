@@ -35,10 +35,18 @@ EXPECTED_VALIDATION_COUNTS = {
     "fetal_femur": 62,
 }
 OUTPUT_DECIMALS = 6
+DEFAULT_TTA_TASK_IDS = {"AOP", "FA", "FUGC", "HC", "IVC", "PSAX", "fetal_femur"}
 
 
 def round_float_list(values, decimals: int = OUTPUT_DECIMALS):
     return [round(float(value), decimals) for value in values]
+
+
+def parse_task_id_csv(value: str | None) -> set[str] | None:
+    if value is None:
+        return None
+    task_ids = {item.strip() for item in str(value).split(",") if item.strip()}
+    return task_ids or None
 
 
 def load_checkpoint_payload(checkpoint_path: str, device: torch.device):
@@ -144,10 +152,11 @@ def validate_predictions(predictions):
         seen.add(key)
 
 
-def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, bool, str, str, str, str, str, int]:
+def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, bool, str, str, str, str, str, str, int]:
     meta_encoder_name = checkpoint_meta.get("encoder_name")
     meta_use_fpn = checkpoint_meta.get("use_fpn")
     meta_fpn_mode = checkpoint_meta.get("fpn_mode", "shared")
+    meta_fpn_type = checkpoint_meta.get("fpn_type", "fpn")
     meta_head_type = checkpoint_meta.get("head_type", "basic")
     meta_task_head_profile = checkpoint_meta.get("task_head_profile", "uniform")
     meta_task_decoder_profile = checkpoint_meta.get("task_decoder_profile", "uniform")
@@ -159,6 +168,7 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
             str(meta_encoder_name),
             bool(meta_use_fpn),
             str(meta_fpn_mode),
+            str(meta_fpn_type),
             str(meta_head_type),
             str(meta_task_head_profile),
             str(meta_task_decoder_profile),
@@ -178,12 +188,47 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
     if checkpoint_has_fpn:
         if in_channels != 256:
             raise ValueError(f"Unexpected FPN head width in checkpoint: {in_channels}")
-        return "vit_base_patch14_dinov2.lvd142m", True, inferred_fpn_mode, "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", True, inferred_fpn_mode, "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 384:
-        return "vit_small_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_small_patch14_dinov2.lvd142m", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 768:
-        return "vit_base_patch14_dinov2.lvd142m", False, "shared", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     raise ValueError(f"Unsupported checkpoint head width: {in_channels}")
+
+
+def predict_task_transformed_coords(model, task_images, task_id: str, tta_mode: str, tta_task_ids: set[str] | None):
+    model_output = model(task_images, task_id=task_id, return_prior=True)
+    aux_outputs = {}
+    if len(model_output) == 3:
+        _, pred_heatmaps, aux_outputs = model_output
+    else:
+        _, pred_heatmaps = model_output
+
+    refined_coords = aux_outputs.get("refined_coords_transformed")
+    if tta_mode != "hflip" or (tta_task_ids is not None and task_id not in tta_task_ids):
+        return refined_coords if refined_coords is not None else decode_heatmaps_to_normalized_coords(pred_heatmaps)
+
+    flipped_images = torch.flip(task_images, dims=[-1])
+    flipped_output = model(flipped_images, task_id=task_id, return_prior=True)
+    flipped_aux = {}
+    if len(flipped_output) == 3:
+        _, flipped_heatmaps, flipped_aux = flipped_output
+    else:
+        _, flipped_heatmaps = flipped_output
+
+    flipped_refined = flipped_aux.get("refined_coords_transformed")
+    if refined_coords is not None or flipped_refined is not None:
+        base_coords = refined_coords if refined_coords is not None else decode_heatmaps_to_normalized_coords(pred_heatmaps)
+        flip_coords = (
+            flipped_refined
+            if flipped_refined is not None
+            else decode_heatmaps_to_normalized_coords(flipped_heatmaps)
+        ).clone()
+        flip_coords[:, 0::2] = 1.0 - flip_coords[:, 0::2]
+        return 0.5 * (base_coords + flip_coords)
+
+    merged_heatmaps = 0.5 * (pred_heatmaps + torch.flip(flipped_heatmaps, dims=[-1]))
+    return decode_heatmaps_to_normalized_coords(merged_heatmaps)
 
 
 def main():
@@ -225,14 +270,14 @@ def main():
     parser.add_argument(
         "--task-decoder-profile",
         default=None,
-        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "coarse_refine_v1", "fugc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--task-adapter-profile",
         default=None,
-        choices=("uniform", "softsharing_v1"),
-        help="Optional task-specific soft-sharing adapter override. If omitted, inferred from checkpoint.",
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1"),
+        help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--fpn-mode",
@@ -241,10 +286,27 @@ def main():
         help="Optional FPN mode override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
+        "--fpn-type",
+        default=None,
+        choices=("fpn", "bifpn"),
+        help="Optional FPN neck type override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
         "--input-size",
         type=int,
         default=None,
         help="Optional square letterbox input size override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
+        "--tta-mode",
+        default="none",
+        choices=("none", "hflip"),
+        help="Submission-time test-time augmentation mode.",
+    )
+    parser.add_argument(
+        "--tta-task-ids",
+        default="AOP,FA,FUGC,HC,IVC,PSAX,fetal_femur",
+        help="Comma-separated task IDs to apply TTA to. Ignored when --tta-mode none.",
     )
     parser.add_argument(
         "--fpn",
@@ -277,6 +339,7 @@ def main():
         inferred_encoder_name,
         inferred_use_fpn,
         inferred_fpn_mode,
+        inferred_fpn_type,
         inferred_head_type,
         inferred_task_head_profile,
         inferred_task_decoder_profile,
@@ -289,12 +352,18 @@ def main():
     )
     encoder_name = args.encoder_name or inferred_encoder_name
     fpn_mode = args.fpn_mode or inferred_fpn_mode
+    fpn_type = args.fpn_type or inferred_fpn_type
     head_type = args.head_type or inferred_head_type
     task_head_profile = args.task_head_profile or inferred_task_head_profile
     task_decoder_profile = args.task_decoder_profile or inferred_task_decoder_profile
     task_adapter_profile = args.task_adapter_profile or inferred_task_adapter_profile
     use_fpn = inferred_use_fpn if args.use_fpn is None else args.use_fpn
     input_size = int(args.input_size or inferred_input_size)
+    tta_task_ids = (
+        DEFAULT_TTA_TASK_IDS
+        if args.tta_mode == "hflip" and args.tta_task_ids == "AOP,FA,FUGC,HC,IVC,PSAX,fetal_femur"
+        else parse_task_id_csv(args.tta_task_ids)
+    )
 
     dataset = ValidationManifestDataset(manifest_path=manifest_path, input_size=input_size)
     loader = DataLoader(
@@ -309,6 +378,7 @@ def main():
     print(
         f"Checkpoint architecture: backbone={inferred_encoder_name}, "
         f"fpn_mode={inferred_fpn_mode}, "
+        f"fpn_type={inferred_fpn_type}, "
         f"head={inferred_head_type}, "
         f"task_head_profile={inferred_task_head_profile}, "
         f"task_decoder_profile={inferred_task_decoder_profile}, "
@@ -320,6 +390,7 @@ def main():
     print(
         f"Submission model config: backbone={encoder_name}, "
         f"fpn_mode={fpn_mode}, "
+        f"fpn_type={fpn_type}, "
         f"head={head_type}, "
         f"task_head_profile={task_head_profile}, "
         f"task_decoder_profile={task_decoder_profile}, "
@@ -328,6 +399,8 @@ def main():
         f"heatmap_size={inferred_heatmap_size}, "
         f"FPN={'ENABLED' if use_fpn else 'DISABLED'}"
     )
+    if args.tta_mode == "hflip":
+        print(f"Submission TTA: hflip (tasks={sorted(tta_task_ids) if tta_task_ids is not None else 'all'})")
 
     model = MultiTaskModelFactory(
         encoder_name=encoder_name,
@@ -336,6 +409,7 @@ def main():
         heatmap_size=inferred_heatmap_size,
         use_fpn=use_fpn,
         fpn_mode=fpn_mode,
+        fpn_type=fpn_type,
         head_type=head_type,
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
@@ -355,9 +429,13 @@ def main():
             for task_id in sorted(set(task_ids)):
                 task_indices = [i for i, value in enumerate(task_ids) if value == task_id]
                 task_images = images[task_indices]
-                pred_logits = model(task_images, task_id=task_id)
-                pred_heatmaps = torch.sigmoid(pred_logits)
-                outputs_transformed = decode_heatmaps_to_normalized_coords(pred_heatmaps)
+                outputs_transformed = predict_task_transformed_coords(
+                    model,
+                    task_images,
+                    task_id,
+                    args.tta_mode,
+                    tta_task_ids,
+                )
                 outputs = transformed_coords_to_original_normalized(
                     outputs_transformed,
                     [meta[i] for i in task_indices],

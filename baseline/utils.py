@@ -123,6 +123,8 @@ def keypoint_collate_fn(batch):
     heatmaps = [item["heatmap"] for item in batch]
     task_ids = [item["task_id"] for item in batch]
     meta = [item["meta"] for item in batch]
+    image_paths = [item.get("image_path", "") for item in batch]
+    pseudo_domains = [item.get("pseudo_domain", "unknown") for item in batch]
     return {
         "image": images,
         "label": labels,
@@ -130,6 +132,8 @@ def keypoint_collate_fn(batch):
         "heatmap": heatmaps,
         "task_id": task_ids,
         "meta": meta,
+        "image_path": image_paths,
+        "pseudo_domain": pseudo_domains,
     }
 
 
@@ -247,6 +251,24 @@ def calculate_mre_per_sample(y_true: torch.Tensor, y_pred: torch.Tensor, meta: l
     return float(np.mean(scores))
 
 
+def calculate_mre_case_values(y_true: torch.Tensor, y_pred: torch.Tensor, meta: list[dict]) -> np.ndarray:
+    y_true_np = y_true.detach().cpu().numpy().copy().reshape(y_true.shape[0], -1, 2)
+    y_pred_np = y_pred.detach().cpu().numpy().copy().reshape(y_pred.shape[0], -1, 2)
+    scores = []
+    for idx, sample_meta in enumerate(meta):
+        width = max(float(sample_meta["original_width"]) - 1.0, 1.0)
+        height = max(float(sample_meta["original_height"]) - 1.0, 1.0)
+        gt_pts = y_true_np[idx].copy()
+        pred_pts = y_pred_np[idx].copy()
+        gt_pts[:, 0] *= width
+        gt_pts[:, 1] *= height
+        pred_pts[:, 0] *= width
+        pred_pts[:, 1] *= height
+        distances = np.sqrt(np.sum((pred_pts - gt_pts) ** 2, axis=-1))
+        scores.append(float(np.mean(distances)))
+    return np.asarray(scores, dtype=np.float32)
+
+
 def _coords_to_pixel_points(coords: torch.Tensor, meta: list[dict]) -> np.ndarray:
     coords_np = coords.detach().cpu().numpy().copy().reshape(coords.shape[0], -1, 2)
     output = []
@@ -328,6 +350,21 @@ def calculate_measurement_mae_per_sample(
     if gt_measures.shape[1] == 0:
         return 0.0
     return float(np.mean(np.abs(pred_measures - gt_measures)))
+
+
+def calculate_measurement_mae_case_values(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    meta: list[dict],
+    task_id: str,
+) -> np.ndarray:
+    gt_points = _coords_to_pixel_points(y_true, meta)
+    pred_points = _coords_to_pixel_points(y_pred, meta)
+    gt_measures = compute_measurements_from_points(gt_points, task_id)
+    pred_measures = compute_measurements_from_points(pred_points, task_id)
+    if gt_measures.shape[1] == 0:
+        return np.zeros((gt_points.shape[0],), dtype=np.float32)
+    return np.mean(np.abs(pred_measures - gt_measures), axis=1).astype(np.float32)
 
 
 def compute_measurement_loss(
@@ -496,35 +533,265 @@ def compute_dataset_specific_loss(
     raise ValueError(f"Unsupported task loss family: {family}")
 
 
-def compute_combined_score(results_df: pd.DataFrame, normalization_stats: dict | None = None) -> float:
+def _weighted_mean(values: list[float], weights: list[float]) -> float:
+    if not values:
+        return float("inf")
+    weights_np = np.array(weights, dtype=np.float32)
+    if np.any(~np.isfinite(weights_np)) or float(weights_np.sum()) <= 0.0:
+        weights_np = np.ones_like(weights_np, dtype=np.float32)
+    values_np = np.array(values, dtype=np.float32)
+    return float(np.sum(values_np * weights_np) / np.sum(weights_np))
+
+
+def compute_combined_score(
+    results_df: pd.DataFrame,
+    normalization_stats: dict | None = None,
+    task_weights: dict[str, float] | None = None,
+) -> float:
     if results_df.empty or "MRE (pixels)" not in results_df.columns:
         return float("inf")
 
     normalized_mre_values = []
     normalized_measurement_values = []
+    normalized_mre_weights = []
+    normalized_measurement_weights = []
 
     for _, row in results_df.iterrows():
         task_id = row["Task ID"]
+        task_weight = max(float((task_weights or {}).get(task_id, 1.0)), 1e-8)
         task_stats = (normalization_stats or {}).get(task_id, {})
         mre_norm = float(task_stats.get("mre_iqr", DEFAULT_NORMALIZER_EPS))
         normalized_mre_values.append(float(row["MRE (pixels)"]) / max(mre_norm, DEFAULT_NORMALIZER_EPS))
+        normalized_mre_weights.append(task_weight)
 
         measurement_value = row.get("Measurement MAE (pixels)")
         if measurement_value is not None and np.isfinite(measurement_value):
             measurement_norms = task_stats.get("measurement_iqr", [])
             if measurement_norms:
-                normalized_measurement_values.append(float(measurement_value) / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS))
+                normalized_measurement_values.append(
+                    float(measurement_value) / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS)
+                )
+                normalized_measurement_weights.append(task_weight)
 
-    normalized_mre = float(np.mean(normalized_mre_values)) if normalized_mre_values else float("inf")
+    normalized_mre = _weighted_mean(normalized_mre_values, normalized_mre_weights)
     if not normalized_measurement_values:
         return normalized_mre
-    normalized_measurement = float(np.mean(normalized_measurement_values))
+    normalized_measurement = _weighted_mean(normalized_measurement_values, normalized_measurement_weights)
     return 0.5 * normalized_mre + 0.5 * normalized_measurement
 
 
-def evaluate_keypoint(model, val_loader, device, task_id_to_name, normalization_stats: dict | None = None):
+def _collect_task_combined_scores(
+    results_df: pd.DataFrame,
+    normalization_stats: dict | None = None,
+    task_weights: dict[str, float] | None = None,
+) -> list[dict]:
+    task_rows = []
+    for _, row in results_df.iterrows():
+        task_id = str(row["Task ID"])
+        task_weight = max(float((task_weights or {}).get(task_id, 1.0)), 1e-8)
+        task_stats = (normalization_stats or {}).get(task_id, {})
+        mre_norm = float(task_stats.get("mre_iqr", DEFAULT_NORMALIZER_EPS))
+        normalized_mre = float(row["MRE (pixels)"]) / max(mre_norm, DEFAULT_NORMALIZER_EPS)
+
+        measurement_value = row.get("Measurement MAE (pixels)")
+        normalized_measurement = None
+        if measurement_value is not None and np.isfinite(measurement_value):
+            measurement_norms = task_stats.get("measurement_iqr", [])
+            if measurement_norms:
+                normalized_measurement = float(measurement_value) / max(
+                    float(np.mean(measurement_norms)),
+                    DEFAULT_NORMALIZER_EPS,
+                )
+
+        combined = (
+            0.5 * normalized_mre + 0.5 * float(normalized_measurement)
+            if normalized_measurement is not None
+            else normalized_mre
+        )
+        task_rows.append(
+            {
+                "task_id": task_id,
+                "weight": task_weight,
+                "normalized_mre": normalized_mre,
+                "normalized_measurement": normalized_measurement,
+                "combined": combined,
+            }
+        )
+    return task_rows
+
+
+def compute_server_proxy_breakdown(
+    results_df: pd.DataFrame,
+    normalization_stats: dict | None = None,
+    task_weights: dict[str, float] | None = None,
+    hard_task_ids: tuple[str, ...] | list[str] | None = None,
+    hard_task_weight_overrides: dict[str, float] | None = None,
+    base_weight: float = 0.5,
+    hard_task_weight: float = 0.3,
+    worst_task_weight: float = 0.2,
+    worst_k: int = 3,
+) -> dict[str, float]:
+    if results_df.empty or "MRE (pixels)" not in results_df.columns:
+        return {
+            "proxy_score": float("inf"),
+            "base_score": float("inf"),
+            "hard_task_score": float("inf"),
+            "worst_task_score": float("inf"),
+        }
+
+    task_rows = _collect_task_combined_scores(
+        results_df,
+        normalization_stats=normalization_stats,
+        task_weights=task_weights,
+    )
+    if not task_rows:
+        return {
+            "proxy_score": float("inf"),
+            "base_score": float("inf"),
+            "hard_task_score": float("inf"),
+            "worst_task_score": float("inf"),
+        }
+
+    base_score = _weighted_mean(
+        [row["combined"] for row in task_rows],
+        [row["weight"] for row in task_rows],
+    )
+
+    hard_task_id_set = {str(task_id) for task_id in (hard_task_ids or [])}
+    hard_rows = [row for row in task_rows if row["task_id"] in hard_task_id_set]
+    if hard_rows:
+        hard_weights = []
+        for row in hard_rows:
+            extra_weight = float((hard_task_weight_overrides or {}).get(row["task_id"], 1.0))
+            hard_weights.append(row["weight"] * max(extra_weight, 1e-8))
+        hard_task_score = _weighted_mean(
+            [row["combined"] for row in hard_rows],
+            hard_weights,
+        )
+    else:
+        hard_task_score = base_score
+
+    worst_rows = sorted(task_rows, key=lambda row: row["combined"], reverse=True)[: max(int(worst_k), 1)]
+    worst_task_score = float(np.mean([row["combined"] for row in worst_rows])) if worst_rows else base_score
+
+    proxy_score = (
+        float(base_weight) * base_score
+        + float(hard_task_weight) * hard_task_score
+        + float(worst_task_weight) * worst_task_score
+    )
+    return {
+        "proxy_score": float(proxy_score),
+        "base_score": float(base_score),
+        "hard_task_score": float(hard_task_score),
+        "worst_task_score": float(worst_task_score),
+    }
+
+
+def compute_server_proxy_score(
+    results_df: pd.DataFrame,
+    normalization_stats: dict | None = None,
+    task_weights: dict[str, float] | None = None,
+    hard_task_ids: tuple[str, ...] | list[str] | None = None,
+    hard_task_weight_overrides: dict[str, float] | None = None,
+    base_weight: float = 0.5,
+    hard_task_weight: float = 0.3,
+    worst_task_weight: float = 0.2,
+    worst_k: int = 3,
+) -> float:
+    breakdown = compute_server_proxy_breakdown(
+        results_df,
+        normalization_stats=normalization_stats,
+        task_weights=task_weights,
+        hard_task_ids=hard_task_ids,
+        hard_task_weight_overrides=hard_task_weight_overrides,
+        base_weight=base_weight,
+        hard_task_weight=hard_task_weight,
+        worst_task_weight=worst_task_weight,
+        worst_k=worst_k,
+    )
+    return float(breakdown["proxy_score"])
+
+
+def compute_robust_domain_breakdown(
+    results_df: pd.DataFrame,
+    case_df: pd.DataFrame,
+    normalization_stats: dict | None = None,
+    task_weights: dict[str, float] | None = None,
+    base_weight: float = 0.40,
+    mean_domain_weight: float = 0.25,
+    worst_domain_weight: float = 0.35,
+) -> dict[str, float]:
+    if results_df.empty or case_df.empty:
+        return {
+            "robust_score": float("inf"),
+            "base_score": float("inf"),
+            "mean_domain_score": float("inf"),
+            "worst_domain_score": float("inf"),
+        }
+
+    base_score = compute_combined_score(
+        results_df,
+        normalization_stats=normalization_stats,
+        task_weights=task_weights,
+    )
+
+    domain_scores = []
+    for domain_name, domain_group in case_df.groupby("Pseudo Domain", sort=True):
+        domain_rows = []
+        for task_id, task_group in domain_group.groupby("Task ID", sort=True):
+            row = {
+                "Task ID": task_id,
+                "Task Name": str(task_group["Task Name"].iloc[0]),
+                "MRE (pixels)": float(task_group["MRE (pixels)"].mean()),
+            }
+            measurement_values = task_group["Measurement MAE (pixels)"].dropna()
+            if len(measurement_values) > 0:
+                row["Measurement MAE (pixels)"] = float(measurement_values.mean())
+            domain_rows.append(row)
+        if not domain_rows:
+            continue
+        domain_df = pd.DataFrame(domain_rows)
+        domain_score = compute_combined_score(
+            domain_df,
+            normalization_stats=normalization_stats,
+            task_weights=task_weights,
+        )
+        domain_scores.append({"domain": str(domain_name), "score": float(domain_score)})
+
+    if not domain_scores:
+        return {
+            "robust_score": float(base_score),
+            "base_score": float(base_score),
+            "mean_domain_score": float(base_score),
+            "worst_domain_score": float(base_score),
+        }
+
+    mean_domain_score = float(np.mean([item["score"] for item in domain_scores]))
+    worst_domain_score = float(max(item["score"] for item in domain_scores))
+    robust_score = (
+        float(base_weight) * float(base_score)
+        + float(mean_domain_weight) * mean_domain_score
+        + float(worst_domain_weight) * worst_domain_score
+    )
+    return {
+        "robust_score": float(robust_score),
+        "base_score": float(base_score),
+        "mean_domain_score": float(mean_domain_score),
+        "worst_domain_score": float(worst_domain_score),
+    }
+
+
+def evaluate_keypoint(
+    model,
+    val_loader,
+    device,
+    task_id_to_name,
+    normalization_stats: dict | None = None,
+    return_case_df: bool = False,
+):
     model.eval()
     task_metrics = defaultdict(lambda: defaultdict(list))
+    case_rows = []
 
     with torch.no_grad():
         loop = tqdm(val_loader, desc="[Validation]")
@@ -533,6 +800,8 @@ def evaluate_keypoint(model, val_loader, device, task_id_to_name, normalization_
             labels = batch["label"]
             task_ids = batch["task_id"]
             meta = batch["meta"]
+            image_paths = batch.get("image_path", [""] * len(task_ids))
+            pseudo_domains = batch.get("pseudo_domain", ["unknown"] * len(task_ids))
 
             unique_tasks = set(task_ids)
             for task_id in unique_tasks:
@@ -541,31 +810,55 @@ def evaluate_keypoint(model, val_loader, device, task_id_to_name, normalization_
                 task_labels = torch.stack([labels[i] for i in task_indices], 0).to(device)
                 task_meta = [meta[i] for i in task_indices]
 
-                pred_logits = model(task_images, task_id=task_id)
-                pred_coords_transformed = softargmax_heatmaps_to_transformed_coords(pred_logits)
+                model_output = model(task_images, task_id=task_id, return_prior=True)
+                aux_outputs = {}
+                if len(model_output) == 3:
+                    pred_logits, _, aux_outputs = model_output
+                else:
+                    pred_logits, _ = model_output
+                pred_coords_transformed = aux_outputs.get(
+                    "refined_coords_transformed",
+                    softargmax_heatmaps_to_transformed_coords(pred_logits),
+                )
                 pred_coords = transformed_coords_to_original_normalized(pred_coords_transformed, task_meta).to(device)
-                task_metrics[task_id]["MRE (pixels)"].append(
-                    calculate_mre_per_sample(
+                mre_per_sample = calculate_mre_case_values(
+                    task_labels,
+                    pred_coords,
+                    task_meta,
+                )
+                task_metrics[task_id]["MRE (pixels)"].append(mre_per_sample)
+                measurement_per_sample = None
+                if task_id in MEASUREMENT_PAIRS:
+                    measurement_per_sample = calculate_measurement_mae_case_values(
                         task_labels,
                         pred_coords,
                         task_meta,
+                        task_id,
                     )
-                )
-                if task_id in MEASUREMENT_PAIRS:
-                    task_metrics[task_id]["Measurement MAE (pixels)"].append(
-                        calculate_measurement_mae_per_sample(
-                            task_labels,
-                            pred_coords,
-                            task_meta,
-                            task_id,
-                        )
-                    )
+                    task_metrics[task_id]["Measurement MAE (pixels)"].append(measurement_per_sample)
+
+                if return_case_df:
+                    for local_idx, batch_idx in enumerate(task_indices):
+                        case_row = {
+                            "Task ID": task_id,
+                            "Task Name": task_id_to_name.get(task_id, "Regression"),
+                            "Image Path": image_paths[batch_idx],
+                            "Pseudo Domain": pseudo_domains[batch_idx],
+                            "MRE (pixels)": float(mre_per_sample[local_idx]),
+                        }
+                        if measurement_per_sample is not None:
+                            case_row["Measurement MAE (pixels)"] = float(measurement_per_sample[local_idx])
+                        case_rows.append(case_row)
 
     results = []
     for task_id in sorted(task_metrics.keys()):
         row = {"Task ID": task_id, "Task Name": task_id_to_name.get(task_id, "Regression")}
         for metric_name, values in task_metrics[task_id].items():
-            row[metric_name] = float(np.mean(values)) if values else 0.0
+            if values:
+                flat_values = np.concatenate([np.atleast_1d(np.asarray(v, dtype=np.float32)) for v in values], axis=0)
+                row[metric_name] = float(np.mean(flat_values))
+            else:
+                row[metric_name] = 0.0
         task_stats = (normalization_stats or {}).get(task_id, {})
         row["Normalized MRE"] = row["MRE (pixels)"] / max(float(task_stats.get("mre_iqr", DEFAULT_NORMALIZER_EPS)), DEFAULT_NORMALIZER_EPS)
         if "Measurement MAE (pixels)" in row:
@@ -574,4 +867,7 @@ def evaluate_keypoint(model, val_loader, device, task_id_to_name, normalization_
                 row["Normalized Measurement MAE"] = row["Measurement MAE (pixels)"] / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS)
         results.append(row)
 
-    return pd.DataFrame(results)
+    results_df = pd.DataFrame(results)
+    if return_case_df:
+        return results_df, pd.DataFrame(case_rows)
+    return results_df

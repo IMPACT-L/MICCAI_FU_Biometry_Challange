@@ -236,6 +236,8 @@ class KeypointDataset(Dataset):
             "heatmap": final_heatmaps,
             "task_id": task_id,
             "meta": meta,
+            "image_path": str(record["image_path"]),
+            "pseudo_domain": str(record["pseudo_domain"]) if "pseudo_domain" in record else "unknown",
         }
 
 

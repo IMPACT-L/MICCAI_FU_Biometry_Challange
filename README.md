@@ -92,26 +92,40 @@ Dedicated-head documentation:
 
 Current best public submission so far:
 
-- Run: `dinov3_vitb_taskfpn`
-- CodaBench rank: `21`
-- Submission ID: `829167`
-- Overall score: `29.2`
+- Run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1`
+- CodaBench rank: `17`
+- Submission ID: `832817`
+- Overall score: `27.36`
 
 Best local validation run so far:
 
 - Run: `vitlarge_dinov3_taskfpn_v1`
 - Backbone: `vit_large_patch16_dinov3`
 - Local average `MRE`: `11.004783`
-- Public CodaBench result:
-  - rank: `24`
-  - submission id: `831250`
-  - overall score: `29.88`
+- Best known server-oriented run:
+  - run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1`
+  - local average `MRE`: `11.349361`
+  - CodaBench rank: `17`
+  - overall score: `27.36`
 
 Current read of the results:
 
-- `vit_large_patch16_dinov3` improves local validation substantially.
-- The older `dinov3_vitb_taskfpn` submission still generalizes better on the public board.
-- Future work should keep the stronger backbone path, but target leaderboard generalization instead of local MRE alone.
+- The best local model is not the best server model.
+- Grouped validation and proxy-based checkpoint selection improved server behavior more than simply pushing local MRE lower.
+- Pure local average `MRE` is not enough for model selection; the hidden server distribution is different enough that lower local error can still submit worse.
+- The current evidence supports a server-oriented proxy score more than any single-task rule.
+- The current best direction is `vit_base_patch16_dinov3` with task-specific FPN, grouped split, baseline augmentation, and server-oriented checkpoint selection.
+
+Comparable saved runs:
+
+| Run | Local avg MRE | CodaBench overall |
+| --- | ---: | ---: |
+| `dinov3_vitb_taskfpn_grouped_serverproxy_v1` | `11.349361` | `27.36` |
+| `dinov3_vitb_taskfpn_localrefine_v1_robustdomain_v1` | `6.869928` | `28.86` |
+| `vitlarge_dinov3_taskfpn_v1` | `11.004783` | `29.88` |
+| `vitlarge_dinov3_taskfpn_grouped_strongaug_v1` | `11.019315` | `35.68` |
+
+The current comparison shows the exact gap we care about: the best hidden-validation result still did not come from the lowest local `MRE`, and even the very strong `localrefine_v1_robustdomain_v1` local run did not beat the best public score. Future runs should therefore be judged with grouped validation and server-proxy style checkpointing rather than local mean `MRE` alone.
 
 Best full training run:
 
@@ -126,6 +140,27 @@ python baseline/train.py \
   --fpn-mode task_specific \
   --measurement-loss-weight 0.0 \
   --output-dir output/runs/dinov3_vitb_taskfpn
+```
+
+Current best server-oriented training run:
+
+```bash
+conda activate miccai_fu_biometry
+
+python baseline/train.py \
+  --epochs 2000 \
+  --early-stopping-patience 10 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --encoder-name vit_base_patch16_dinov3 \
+  --fpn-mode task_specific \
+  --task-head-profile challenge_v1 \
+  --task-decoder-profile uniform \
+  --task-adapter-profile uniform \
+  --split-mode grouped \
+  --augmentation-profile baseline \
+  --checkpoint-score-mode server_proxy_v1 \
+  --output-dir output/runs/dinov3_vitb_taskfpn_grouped_serverproxy_v1
 ```
 
 Best large-backbone training run:
@@ -185,6 +220,25 @@ python submit.py \
   --num-workers 4
 ```
 
+Current best server submission package:
+
+```bash
+conda activate miccai_fu_biometry
+
+python submit.py \
+  --manifest data/manifests/validation_manifest.csv \
+  --checkpoint-path output/runs/dinov3_vitb_taskfpn_grouped_serverproxy_v1/checkpoints/best_model.pth \
+  --output-dir output/submissions/dinov3_vitb_taskfpn_grouped_serverproxy_v1 \
+  --batch-size 8 \
+  --num-workers 4 \
+  --encoder-name vit_base_patch16_dinov3 \
+  --head-type deep \
+  --task-head-profile challenge_v1 \
+  --task-decoder-profile uniform \
+  --task-adapter-profile uniform \
+  --fpn-mode task_specific
+```
+
 Large-backbone submission package:
 
 ```bash
@@ -232,18 +286,29 @@ Current weak-task order from local evaluation of `dinov3_vitb_taskfpn`:
 
 The current baseline is improved and challenge-compliant, but it is still far from the top leaderboard cluster. We will follow this order for the next round of work:
 
-1. Use dataset-dedicated decoders on top of the shared DINOv3 backbone instead of one generic head family for all tasks.
-2. Strengthen the weakest tasks first, especially `fetal_femur`, `IVC`, and `FUGC`, without destabilizing already-strong tasks.
-3. Track per-task validation metrics and select checkpoints based on multi-task generalization, not only average local MRE.
-4. Add challenge-oriented inference improvements where allowed by the challenge packaging constraints.
-5. Add stronger measurement-aware training and validation so checkpoint selection is closer to the official ranking metric.
+1. Keep server-oriented checkpoint selection and grouped validation as the default path for new runs.
+2. Prioritize the hard tasks that still show unstable hidden-set transfer, especially `A4C`, `IVC`, and `HC`.
+3. Improve `IVC` and `AOP` without sacrificing current strengths in `FUGC`, `fetal_femur`, and `PLAX`.
+4. Continue testing ViT-B variants before returning to larger backbones, since ViT-L improved local MRE but did not yet beat the best server result.
+5. Add stronger local audit tooling so model selection is based on server-predictive task behavior, not mean local MRE alone.
 
 ## Why this plan
 
 - Local `MRE` on the labeled training-side data is optimistic and does not predict CodaBench rank well.
-- The challenge ranking uses both landmark accuracy and derived biometric measurement accuracy.
-- Our current best single-checkpoint submission is already competitive enough to use as a fine-tuning base.
-- The current biggest leaderboard weaknesses are `fetal_femur`, `IVC`, and `FUGC`, while broad all-head specialization has repeatedly hurt stronger tasks.
+- The best server result so far came from a model chosen with grouped validation and proxy-based checkpoint selection, not from the best local average MRE.
+- The current saved comparisons are still too small to justify a strict single-task rule; the safer conclusion is that validation split design and checkpoint score policy matter more than raw local leaderboard position.
+- Broad all-head specialization has repeatedly hurt server generalization, while cleaner shared decoding with task-specific FPN has been more reliable.
+
+## Audit scripts
+
+Use these scripts to compare local evaluation with saved CodaBench outcomes:
+
+```bash
+python scripts/audit_local_server_gap.py
+python scripts/audit_local_server_tasks.py
+```
+
+They summarize which runs generalized better on the server and which local tasks were the clearest warning signs for poor hidden performance.
 
 ## Dedicated-head status
 

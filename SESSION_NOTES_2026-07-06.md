@@ -59,6 +59,14 @@ This is important because it confirms the larger DINOv3 backbone is stronger on 
   - `dinov3_vitb_dedicated_head_datasetv1`
   - other older experiments under `output/runs/` and `output/submissions/`
 
+- Latest robust-domain local-best submission:
+  - run: `dinov3_vitb_taskfpn_localrefine_v1_robustdomain_v1`
+  - rank: `22`
+  - submission id: `833256`
+  - overall score: `28.86`
+  - local average `MRE`: `6.869928`
+  - note: much stronger local validation still did not surpass the best hidden-server result
+
 ## Why `weak_tasks_v1` was added
 
 `weak_tasks_v1` keeps the stable proven path for stronger tasks and specializes only:

@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 FPN_MODES = {"shared", "task_specific"}
+FPN_TYPES = {"fpn", "bifpn"}
 TASK_GROUPS = {
     "pair": {"FUGC", "IVC", "fetal_femur"},
     "ellipse": {"FA", "HC"},
@@ -25,6 +26,28 @@ TASK_ADAPTER_PROFILE_PRESETS = {
         "AOP": "context",
         "PLAX": "context",
         "PSAX": "context",
+    },
+    "localrefine_v1": {
+        "A4C": "A4C",
+        "AOP": "AOP",
+        "FA": "FA",
+        "FUGC": "FUGC",
+        "HC": "HC",
+        "IVC": "IVC",
+        "PLAX": "PLAX",
+        "PSAX": "PSAX",
+        "fetal_femur": "fetal_femur",
+    },
+    "coarse_refine_v1": {
+        "A4C": "A4C",
+        "AOP": "AOP",
+        "FA": "FA",
+        "FUGC": "FUGC",
+        "HC": "HC",
+        "IVC": "IVC",
+        "PLAX": "PLAX",
+        "PSAX": "PSAX",
+        "fetal_femur": "fetal_femur",
     },
 }
 TASK_HEAD_PROFILE_PRESETS = {
@@ -50,6 +73,15 @@ TASK_HEAD_PROFILE_PRESETS = {
 }
 TASK_DECODER_PROFILE_PRESETS = {
     "uniform": {},
+    "coarse_refine_v1": {
+        "A4C": "refine",
+        "FUGC": "refine",
+        "IVC": "refine",
+        "fetal_femur": "refine",
+    },
+    "fugc_refine_v1": {
+        "FUGC": "fugc",
+    },
     "geometry_v1": {
         "A4C": "dense",
         "PLAX": "dense",
@@ -135,6 +167,127 @@ class SoftSharingAdapter(nn.Module):
             return x + self.shared_scale * shared_delta
         group_delta = self.group_experts[group_name](x)
         return x + self.shared_scale * shared_delta + self.group_scale[group_name] * group_delta
+
+
+class LocalRefineAdapter(nn.Module):
+    """Fuse high-resolution image evidence back into task features."""
+
+    def __init__(self, feature_channels: int, group_names: list[str], image_channels: int = 128):
+        super().__init__()
+        self.detail_stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, 96, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.GELU(),
+            nn.Conv2d(96, image_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(image_channels),
+            nn.GELU(),
+        )
+        hidden = max(feature_channels // 2, 128)
+        self.group_fusions = nn.ModuleDict(
+            {
+                group_name: nn.ModuleDict(
+                    {
+                        "pre": nn.Sequential(
+                            nn.Conv2d(feature_channels + image_channels, hidden, kernel_size=3, padding=1, bias=False),
+                            nn.BatchNorm2d(hidden),
+                            nn.GELU(),
+                            nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, bias=False),
+                            nn.BatchNorm2d(hidden),
+                            nn.GELU(),
+                        ),
+                        "gate": nn.Sequential(
+                            nn.Conv2d(hidden, feature_channels, kernel_size=1, bias=True),
+                            nn.Sigmoid(),
+                        ),
+                        "delta": nn.Sequential(
+                            nn.Conv2d(hidden, feature_channels, kernel_size=3, padding=1, bias=False),
+                            nn.BatchNorm2d(feature_channels),
+                        ),
+                    }
+                )
+                for group_name in group_names
+            }
+        )
+        self.fallback = nn.ModuleDict(
+            {
+                "pre": nn.Sequential(
+                    nn.Conv2d(feature_channels + image_channels, hidden, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(hidden),
+                    nn.GELU(),
+                    nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(hidden),
+                    nn.GELU(),
+                ),
+                "gate": nn.Sequential(
+                    nn.Conv2d(hidden, feature_channels, kernel_size=1, bias=True),
+                    nn.Sigmoid(),
+                ),
+                "delta": nn.Sequential(
+                    nn.Conv2d(hidden, feature_channels, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(feature_channels),
+                ),
+            }
+        )
+        self.residual_scale = nn.Parameter(torch.tensor(0.5))
+
+    def _fuse(self, features: torch.Tensor, detail: torch.Tensor, block: nn.ModuleDict) -> torch.Tensor:
+        fused = torch.cat([features, detail], dim=1)
+        hidden = block["pre"](fused)
+        gate = block["gate"](hidden)
+        delta = block["delta"](hidden)
+        return features + self.residual_scale * gate * delta
+
+    def forward(self, features: torch.Tensor, image: torch.Tensor, group_name: str | None) -> torch.Tensor:
+        detail = self.detail_stem(image)
+        if detail.shape[-2:] != features.shape[-2:]:
+            detail = F.interpolate(detail, size=features.shape[-2:], mode="bilinear", align_corners=False)
+        if group_name is None or group_name not in self.group_fusions:
+            return self._fuse(features, detail, self.fallback)
+        return self._fuse(features, detail, self.group_fusions[group_name])
+
+
+class ResidualContextAdapter(nn.Module):
+    """Post-neck residual context mixing with shared and task-specific branches."""
+
+    def __init__(self, channels: int, group_names: list[str]):
+        super().__init__()
+        hidden = max(channels, 192)
+        self.shared = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.group_blocks = nn.ModuleDict(
+            {
+                group_name: nn.Sequential(
+                    nn.Conv2d(channels, channels, kernel_size=5, padding=2, groups=channels, bias=False),
+                    nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                )
+                for group_name in group_names
+            }
+        )
+        self.shared_scale = nn.Parameter(torch.tensor(0.75))
+        self.group_scale = nn.ParameterDict(
+            {group_name: nn.Parameter(torch.tensor(0.35)) for group_name in group_names}
+        )
+
+    def forward(self, x: torch.Tensor, group_name: str | None) -> torch.Tensor:
+        shared_delta = self.shared(x)
+        if group_name is None or group_name not in self.group_blocks:
+            return x + self.shared_scale * shared_delta
+        return x + self.shared_scale * shared_delta + self.group_scale[group_name] * self.group_blocks[group_name](x)
 
 
 class HeatmapHead(nn.Module):
@@ -399,17 +552,198 @@ class FUGCHeatmapHead(nn.Module):
             nn.GELU(),
             nn.Conv2d(hidden3, 1, kernel_size=1),
         )
+        self.refine_patch_size = 14
+        refine_in_channels = hidden3 + num_points + 1
+        refine_hidden = max(hidden3, 64)
+        self.refine_head = nn.Sequential(
+            nn.Conv2d(refine_in_channels, refine_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(refine_hidden),
+            nn.GELU(),
+            nn.Conv2d(refine_hidden, refine_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(refine_hidden),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(refine_hidden, refine_hidden),
+            nn.GELU(),
+            nn.Linear(refine_hidden, num_points * 2),
+            nn.Tanh(),
+        )
+        self.refine_max_offset = 0.075
+
+    @staticmethod
+    def _softargmax_coords(logits: torch.Tensor) -> torch.Tensor:
+        bsz, num_points, h, w = logits.shape
+        probs = torch.softmax(logits.view(bsz, num_points, -1), dim=-1).view(bsz, num_points, h, w)
+        xs = torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype)
+        ys = torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype)
+        grid_x = xs.view(1, 1, 1, w)
+        grid_y = ys.view(1, 1, h, 1)
+        expected_x = (probs * grid_x).sum(dim=(-2, -1))
+        expected_y = (probs * grid_y).sum(dim=(-2, -1))
+        return torch.stack([expected_x, expected_y], dim=-1).reshape(bsz, num_points * 2)
+
+    def _sample_refine_roi(self, feat: torch.Tensor, coarse_coords: torch.Tensor) -> torch.Tensor:
+        bsz = feat.shape[0]
+        patch_size = self.refine_patch_size
+        point_pairs = coarse_coords.reshape(bsz, -1, 2)
+        midpoint = point_pairs.mean(dim=1)
+        segment_length = torch.norm(point_pairs[:, 1] - point_pairs[:, 0], dim=-1)
+        half_span = (segment_length * 1.75).clamp(0.10, 0.28)
+
+        grid_lin = torch.linspace(-1.0, 1.0, patch_size, device=feat.device, dtype=feat.dtype)
+        grid_y, grid_x = torch.meshgrid(grid_lin, grid_lin, indexing="ij")
+        base_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).repeat(bsz, 1, 1, 1)
+
+        center = midpoint.view(bsz, 1, 1, 2)
+        span = half_span.view(bsz, 1, 1, 1)
+        sample_grid = center + base_grid * span
+        sample_grid = sample_grid.clamp(0.0, 1.0)
+        sample_grid = sample_grid * 2.0 - 1.0
+        return F.grid_sample(feat, sample_grid, mode="bilinear", padding_mode="border", align_corners=False)
 
     def forward(self, x: torch.Tensor, out_size):
         x = self.stem(x)
         x = self.refine(x)
         point_logits = self.point_head(x)
         segment_logits = self.segment_head(x)
+        feat_for_refine = x
         if point_logits.shape[-2:] != out_size:
             point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
         if segment_logits.shape[-2:] != out_size:
             segment_logits = F.interpolate(segment_logits, size=out_size, mode="bilinear", align_corners=False)
-        return point_logits, {"segment_logits": segment_logits}
+        if feat_for_refine.shape[-2:] != out_size:
+            feat_for_refine = F.interpolate(feat_for_refine, size=out_size, mode="bilinear", align_corners=False)
+
+        coarse_coords = self._softargmax_coords(point_logits)
+        refine_input = torch.cat(
+            [
+                feat_for_refine,
+                torch.sigmoid(point_logits),
+                torch.sigmoid(segment_logits),
+            ],
+            dim=1,
+        )
+        roi_patch = self._sample_refine_roi(refine_input, coarse_coords)
+        offsets = self.refine_head(roi_patch) * self.refine_max_offset
+        refined_coords = (coarse_coords + offsets).clamp(0.0, 1.0)
+
+        return point_logits, {
+            "segment_logits": segment_logits,
+            "coarse_coords_transformed": coarse_coords,
+            "refined_coords_transformed": refined_coords,
+        }
+
+
+class ROIRefineHeatmapHead(nn.Module):
+    """Generic coarse-to-fine head for tasks that benefit from local refinement."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 192) * width_multiplier), 112)
+        hidden2 = max(int(max(hidden1 // 2, 144) * width_multiplier), 80)
+        hidden3 = max(int(max(hidden2 // 2, 112) * width_multiplier), 64)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.context = nn.Sequential(
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+        )
+        self.point_head = nn.Conv2d(hidden3, num_points, kernel_size=1)
+        self.refine_patch_size = 18
+        refine_in_channels = hidden3 + num_points
+        refine_hidden = max(hidden3, 80)
+        self.refine_head = nn.Sequential(
+            nn.Conv2d(refine_in_channels, refine_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(refine_hidden),
+            nn.GELU(),
+            nn.Conv2d(refine_hidden, refine_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(refine_hidden),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(refine_hidden, refine_hidden),
+            nn.GELU(),
+            nn.Linear(refine_hidden, num_points * 2),
+            nn.Tanh(),
+        )
+        self.refine_max_offset = 0.060
+
+    @staticmethod
+    def _softargmax_coords(logits: torch.Tensor) -> torch.Tensor:
+        bsz, num_points, h, w = logits.shape
+        probs = torch.softmax(logits.view(bsz, num_points, -1), dim=-1).view(bsz, num_points, h, w)
+        xs = torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype)
+        ys = torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype)
+        grid_x = xs.view(1, 1, 1, w)
+        grid_y = ys.view(1, 1, h, 1)
+        expected_x = (probs * grid_x).sum(dim=(-2, -1))
+        expected_y = (probs * grid_y).sum(dim=(-2, -1))
+        return torch.stack([expected_x, expected_y], dim=-1).reshape(bsz, num_points * 2)
+
+    def _sample_refine_roi(self, feat: torch.Tensor, coarse_coords: torch.Tensor) -> torch.Tensor:
+        bsz = feat.shape[0]
+        patch_size = self.refine_patch_size
+        point_pairs = coarse_coords.reshape(bsz, -1, 2)
+        min_xy = point_pairs.min(dim=1).values
+        max_xy = point_pairs.max(dim=1).values
+        midpoint = 0.5 * (min_xy + max_xy)
+        span = (max_xy - min_xy).amax(dim=-1).clamp(0.10, 0.45) * 0.90
+        span = span.clamp(0.12, 0.32)
+
+        grid_lin = torch.linspace(-1.0, 1.0, patch_size, device=feat.device, dtype=feat.dtype)
+        grid_y, grid_x = torch.meshgrid(grid_lin, grid_lin, indexing="ij")
+        base_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).repeat(bsz, 1, 1, 1)
+
+        center = midpoint.view(bsz, 1, 1, 2)
+        sample_grid = center + base_grid * span.view(bsz, 1, 1, 1)
+        sample_grid = sample_grid.clamp(0.0, 1.0)
+        sample_grid = sample_grid * 2.0 - 1.0
+        return F.grid_sample(feat, sample_grid, mode="bilinear", padding_mode="border", align_corners=False)
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = x + self.context(x)
+        x = self.decoder(x)
+        point_logits = self.point_head(x)
+        feat_for_refine = x
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+        if feat_for_refine.shape[-2:] != out_size:
+            feat_for_refine = F.interpolate(feat_for_refine, size=out_size, mode="bilinear", align_corners=False)
+
+        coarse_coords = self._softargmax_coords(point_logits)
+        refine_input = torch.cat([feat_for_refine, torch.sigmoid(point_logits)], dim=1)
+        roi_patch = self._sample_refine_roi(refine_input, coarse_coords)
+        offsets = self.refine_head(roi_patch) * self.refine_max_offset
+        refined_coords = (coarse_coords + offsets).clamp(0.0, 1.0)
+        return point_logits, {
+            "coarse_coords_transformed": coarse_coords,
+            "refined_coords_transformed": refined_coords,
+        }
 
 
 class A4CHeatmapHead(nn.Module):
@@ -791,6 +1125,129 @@ class FPN(nn.Module):
         return self.smooth(out)
 
 
+class BiFPNBlock(nn.Module):
+    """Single bidirectional fusion block over a 3-level feature pyramid."""
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.w_td_2 = nn.Parameter(torch.ones(2))
+        self.w_td_1 = nn.Parameter(torch.ones(2))
+        self.w_out_2 = nn.Parameter(torch.ones(3))
+        self.w_out_3 = nn.Parameter(torch.ones(2))
+
+        self.refine_td2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.refine_td1 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.refine_out2 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+        self.refine_out3 = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, groups=channels, bias=False),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+
+    @staticmethod
+    def _normalize(weights: torch.Tensor) -> torch.Tensor:
+        weights = F.relu(weights)
+        return weights / (weights.sum() + 1e-4)
+
+    def forward(self, p1: torch.Tensor, p2: torch.Tensor, p3: torch.Tensor):
+        w_td_2 = self._normalize(self.w_td_2)
+        td2 = self.refine_td2(
+            w_td_2[0] * p2
+            + w_td_2[1] * F.interpolate(p3, size=p2.shape[-2:], mode="bilinear", align_corners=False)
+        )
+
+        w_td_1 = self._normalize(self.w_td_1)
+        td1 = self.refine_td1(
+            w_td_1[0] * p1
+            + w_td_1[1] * F.interpolate(td2, size=p1.shape[-2:], mode="bilinear", align_corners=False)
+        )
+
+        w_out_2 = self._normalize(self.w_out_2)
+        out2 = self.refine_out2(
+            w_out_2[0] * p2
+            + w_out_2[1] * td2
+            + w_out_2[2] * F.max_pool2d(td1, kernel_size=2)
+        )
+
+        w_out_3 = self._normalize(self.w_out_3)
+        out3 = self.refine_out3(
+            w_out_3[0] * p3
+            + w_out_3[1] * F.max_pool2d(out2, kernel_size=2)
+        )
+        return td1, out2, out3
+
+
+class BiFPN(nn.Module):
+    """Bidirectional feature pyramid neck for stronger multi-scale fusion."""
+
+    def __init__(self, in_channels: int, out_channels: int = 256, num_blocks: int = 2):
+        super().__init__()
+        self.out_channels = out_channels
+        self.reduce = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+
+        self.p1_conv = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        self.p2_conv = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        self.p3_conv = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList(BiFPNBlock(out_channels) for _ in range(num_blocks))
+        self.smooth = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.reduce(x)
+        p1 = self.p1_conv(x)
+        p2 = self.p2_conv(F.max_pool2d(p1, kernel_size=2))
+        p3 = self.p3_conv(F.max_pool2d(p2, kernel_size=2))
+
+        for block in self.blocks:
+            p1, p2, p3 = block(p1, p2, p3)
+
+        out = (
+            p1
+            + F.interpolate(p2, size=p1.shape[-2:], mode="bilinear", align_corners=False)
+            + F.interpolate(p3, size=p1.shape[-2:], mode="bilinear", align_corners=False)
+        )
+        return self.smooth(out)
+
+
+def build_neck(fpn_type: str, in_channels: int, out_channels: int = 256) -> nn.Module:
+    if fpn_type == "fpn":
+        return FPN(in_channels=in_channels, out_channels=out_channels)
+    if fpn_type == "bifpn":
+        return BiFPN(in_channels=in_channels, out_channels=out_channels)
+    raise ValueError(f"Unsupported fpn_type: {fpn_type}")
+
+
 class MLPRegressionHead(nn.Module):
     """Simple MLP regression head that directly predicts keypoint coordinates.
     
@@ -875,6 +1332,7 @@ class MultiTaskModelFactory(nn.Module):
         heatmap_size=(64, 64),
         use_fpn: bool = False,
         fpn_mode: str = "shared",
+        fpn_type: str = "fpn",
         head_type: str = "basic",
         task_head_profile: str = "uniform",
         task_decoder_profile: str = "uniform",
@@ -885,6 +1343,7 @@ class MultiTaskModelFactory(nn.Module):
         self.heatmap_size = heatmap_size
         self.use_fpn = use_fpn
         self.fpn_mode = fpn_mode
+        self.fpn_type = fpn_type
         self.head_type = head_type
         self.task_head_profile = task_head_profile
         self.task_decoder_profile = task_decoder_profile
@@ -897,18 +1356,22 @@ class MultiTaskModelFactory(nn.Module):
         self.fpn = None
         self.task_fpns = None
         self.soft_adapters = None
+        self.local_refine_adapters = None
+        self.context_adapters = None
         head_channels = self.encoder.out_channels
         if use_fpn:
             if fpn_mode not in FPN_MODES:
                 raise ValueError(f"Unsupported fpn_mode: {fpn_mode}")
+            if fpn_type not in FPN_TYPES:
+                raise ValueError(f"Unsupported fpn_type: {fpn_type}")
             if fpn_mode == "shared":
-                self.fpn = FPN(in_channels=self.encoder.out_channels, out_channels=256)
+                self.fpn = build_neck(fpn_type=fpn_type, in_channels=self.encoder.out_channels, out_channels=256)
                 head_channels = self.fpn.out_channels
-                print("FPN neck: ENABLED (shared)")
+                print(f"FPN neck: ENABLED (shared, type={fpn_type})")
             else:
                 self.task_fpns = nn.ModuleDict()
                 head_channels = 256
-                print("FPN neck: ENABLED (task-specific)")
+                print(f"FPN neck: ENABLED (task-specific, type={fpn_type})")
         else:
             print("FPN neck: DISABLED")
 
@@ -929,11 +1392,16 @@ class MultiTaskModelFactory(nn.Module):
         task_adapter_map = TASK_ADAPTER_PROFILE_PRESETS[task_adapter_profile]
         self.task_to_adapter_group = {task_id: task_adapter_map.get(task_id) for task_id in task_adapter_map}
         active_groups = sorted({group for group in task_adapter_map.values() if group is not None})
-        if active_groups:
+        if task_adapter_profile == "softsharing_v1" and active_groups:
             self.soft_adapters = SoftSharingAdapter(head_channels, active_groups)
+        elif task_adapter_profile == "localrefine_v1" and active_groups:
+            self.local_refine_adapters = LocalRefineAdapter(head_channels, active_groups)
+        elif task_adapter_profile == "coarse_refine_v1" and active_groups:
+            self.context_adapters = ResidualContextAdapter(head_channels, active_groups)
         decoder_family_to_head = {
             "basic": HeatmapHead,
             "deep": DeepHeatmapHead,
+            "refine": ROIRefineHeatmapHead,
             "line": LineHeatmapHead,
             "compact": CompactHeatmapHead,
             "dense": DenseRelationalHeatmapHead,
@@ -966,7 +1434,11 @@ class MultiTaskModelFactory(nn.Module):
                 f"(width_multiplier={width_multiplier:.2f}, num_points={num_points})"
             )
             if self.task_fpns is not None:
-                self.task_fpns[task_id] = FPN(in_channels=self.encoder.out_channels, out_channels=256)
+                self.task_fpns[task_id] = build_neck(
+                    fpn_type=fpn_type,
+                    in_channels=self.encoder.out_channels,
+                    out_channels=256,
+                )
             self.heads[task_id] = head_cls(
                 in_channels=head_channels,
                 num_points=num_points,
@@ -980,6 +1452,7 @@ class MultiTaskModelFactory(nn.Module):
         if task_id not in self.heads:
             raise ValueError(f"Task ID '{task_id}' not found in keypoint heads.")
 
+        input_image = x
         features = self.encoder(x)
 
         # Apply FPN neck if enabled
@@ -991,6 +1464,12 @@ class MultiTaskModelFactory(nn.Module):
             adapter_group = self.task_to_adapter_group.get(task_id)
             if adapter_group is not None:
                 features = self.soft_adapters(features, adapter_group)
+        if self.local_refine_adapters is not None:
+            adapter_group = self.task_to_adapter_group.get(task_id)
+            features = self.local_refine_adapters(features, input_image, adapter_group)
+        if self.context_adapters is not None:
+            adapter_group = self.task_to_adapter_group.get(task_id)
+            features = self.context_adapters(features, adapter_group)
 
         head_output = self.heads[task_id](features, out_size=self.heatmap_size)
         aux_outputs = None

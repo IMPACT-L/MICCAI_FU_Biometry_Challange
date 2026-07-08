@@ -1,11 +1,13 @@
 import argparse
 import logging
 import os
+import re
 from collections import defaultdict
 from datetime import datetime
 from typing import Iterable
 
 import albumentations as A
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -25,6 +27,8 @@ from utils import (
     compute_fugc_segment_loss,
     compute_normalization_stats_from_dataframe,
     compute_measurement_loss,
+    compute_robust_domain_breakdown,
+    compute_server_proxy_breakdown,
     evaluate_keypoint,
     keypoint_collate_fn,
     set_seed,
@@ -43,15 +47,29 @@ ENCODER_WEIGHTS = "pretrained"
 RANDOM_SEED = 42
 VAL_SPLIT = 0.2
 CHECKPOINT_SCORE_NAME = "Combined score"
+CHECKPOINT_SCORE_MODE = "combined"
+SERVER_PROXY_HARD_TASK_IDS = ("A4C", "IVC", "PSAX", "fetal_femur", "HC")
+SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES = {
+    "A4C": 3.0,
+    "IVC": 1.4,
+    "AOP": 1.3,
+    "FA": 1.2,
+    "PSAX": 1.2,
+    "HC": 1.1,
+    "fetal_femur": 1.0,
+}
 INPUT_SIZE = 512
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 USE_FPN = True  # ← 开关：设为 True 启用 FPN 特征金字塔
 FPN_MODE = "shared"
+FPN_TYPE = "fpn"
 HEAD_TYPE = "deep"
 TASK_HEAD_PROFILE = "challenge_v1"
 TASK_DECODER_PROFILE = "uniform"
 TASK_ADAPTER_PROFILE = "uniform"
 TASK_LOSS_FAMILY_PROFILE = "uniform"
+SPLIT_MODE = "row"
+AUGMENTATION_PROFILE = "baseline"
 HEATMAP_SIZE = (64, 64)
 HEATMAP_SIGMA = 1.8
 FEMUR_SHAFT_LOSS_WEIGHT = 0.15
@@ -69,6 +87,68 @@ TASK_LOSS_WEIGHTS = {
     "PSAX": 1.10,
     "fetal_femur": 1.25,
 }
+CHECKPOINT_TASK_WEIGHTS = {
+    "A4C": 1.35,
+    "AOP": 0.90,
+    "FA": 0.90,
+    "FUGC": 1.10,
+    "HC": 1.25,
+    "IVC": 1.50,
+    "PLAX": 1.00,
+    "PSAX": 1.20,
+    "fetal_femur": 1.20,
+}
+
+
+def _resolve_image_path_for_split(data_root: str, rel_path: str) -> str | None:
+    rel_norm = os.path.normpath(str(rel_path))
+    cleaned_rel = rel_norm
+    while cleaned_rel.startswith(".." + os.sep):
+        cleaned_rel = cleaned_rel[3:]
+    for root in [os.path.join(data_root, "images"), data_root]:
+        direct = os.path.normpath(os.path.join(root, cleaned_rel))
+        if os.path.isfile(direct):
+            return direct
+    return None
+
+
+def _assign_pseudo_domains(dataframe, data_root: str):
+    feature_rows = []
+    for idx, row in dataframe.iterrows():
+        image_path = _resolve_image_path_for_split(data_root, row["image_path"])
+        if image_path is None:
+            continue
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            continue
+        mean_val = float(image.mean())
+        std_val = float(image.std())
+        sharpness = float(cv2.Laplacian(image, cv2.CV_32F).var())
+        height, width = image.shape[:2]
+        feature_rows.append((idx, mean_val, std_val, sharpness, float(width) / max(float(height), 1.0)))
+
+    if not feature_rows:
+        dataframe = dataframe.copy()
+        dataframe["pseudo_domain"] = "unknown"
+        return dataframe
+
+    feature_array = np.array([[row[1], row[2], row[3], row[4]] for row in feature_rows], dtype=np.float32)
+    medians = np.median(feature_array, axis=0)
+
+    domain_labels = {}
+    for idx, mean_val, std_val, sharpness, aspect_ratio in feature_rows:
+        brightness_bin = int(mean_val > medians[0])
+        contrast_bin = int(std_val > medians[1])
+        sharpness_bin = int(sharpness > medians[2])
+        aspect_bin = int(aspect_ratio > medians[3])
+        domain_labels[idx] = f"b{brightness_bin}_c{contrast_bin}_s{sharpness_bin}_a{aspect_bin}"
+
+    dataframe = dataframe.copy()
+    dataframe["pseudo_domain"] = [
+        domain_labels.get(idx, "unknown")
+        for idx in dataframe.index
+    ]
+    return dataframe
 
 
 def _parse_weight_csv(value: str | None) -> dict[str, float] | None:
@@ -125,6 +205,19 @@ def _parse_task_id_set_csv(value: str | None) -> set[str] | None:
     return set(task_ids)
 
 
+def _build_group_key(task_id: str, image_path: str) -> str:
+    stem = os.path.splitext(os.path.basename(str(image_path)))[0]
+    if task_id in {"A4C", "PLAX", "PSAX", "IVC"}:
+        stem = re.sub(r"_frame\d+$", "", stem)
+    if task_id == "fetal_femur":
+        match = re.match(r"(Patient\d+)", stem)
+        if match:
+            return match.group(1)
+    if task_id == "HC":
+        stem = re.sub(r"_HC$", "", stem)
+    return stem
+
+
 def _filter_dataframe_by_task_ids(dataframe, task_ids: Iterable[str] | None):
     if not task_ids:
         return dataframe.reset_index(drop=True)
@@ -140,6 +233,24 @@ def _load_checkpoint_payload(checkpoint_path: str, device: torch.device):
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         return checkpoint["state_dict"], checkpoint.get("meta", {})
     return checkpoint, {}
+
+
+def _load_matching_state_dict(model: torch.nn.Module, checkpoint_state_dict: dict[str, torch.Tensor]):
+    model_state = model.state_dict()
+    matched_state = {}
+    skipped = []
+    for name, value in checkpoint_state_dict.items():
+        if name not in model_state:
+            skipped.append((name, "missing_in_model"))
+            continue
+        if model_state[name].shape != value.shape:
+            skipped.append((name, f"shape_mismatch:{tuple(value.shape)}->{tuple(model_state[name].shape)}"))
+            continue
+        matched_state[name] = value
+
+    missing_after_match = sorted(set(model_state.keys()) - set(matched_state.keys()))
+    load_result = model.load_state_dict(matched_state, strict=False)
+    return load_result, skipped, missing_after_match
 
 
 def _build_task_configs(dataframe):
@@ -193,6 +304,143 @@ def _stratified_split_indices(dataframe, val_split: float, seed: int):
     return train_indices, val_indices
 
 
+def _grouped_stratified_split_indices(dataframe, val_split: float, seed: int):
+    if not (0.0 < float(val_split) < 1.0):
+        raise ValueError("val_split must be in (0, 1).")
+
+    rng = np.random.RandomState(seed)
+    train_indices = []
+    val_indices = []
+
+    for task_id, group in dataframe.groupby("task_id", sort=True):
+        group = group.copy()
+        group["__split_group_key"] = group["image_path"].astype(str).map(
+            lambda path: _build_group_key(str(task_id), path)
+        )
+        unique_group_keys = group["__split_group_key"].drop_duplicates().tolist()
+        rng.shuffle(unique_group_keys)
+
+        total_groups = len(unique_group_keys)
+        val_group_count = int(round(total_groups * float(val_split)))
+        if total_groups >= 2:
+            val_group_count = max(1, min(total_groups - 1, val_group_count))
+        else:
+            val_group_count = 0
+
+        val_group_keys = set(unique_group_keys[:val_group_count])
+        val_mask = group["__split_group_key"].isin(val_group_keys)
+        val_indices.extend(group.index[val_mask].tolist())
+        train_indices.extend(group.index[~val_mask].tolist())
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    return train_indices, val_indices
+
+
+def _pseudo_domain_grouped_split_indices(dataframe, val_split: float, seed: int):
+    if not (0.0 < float(val_split) < 1.0):
+        raise ValueError("val_split must be in (0, 1).")
+
+    if "pseudo_domain" not in dataframe.columns:
+        raise ValueError("pseudo_domain column is required for pseudo_domain_grouped split.")
+
+    rng = np.random.RandomState(seed)
+    train_indices = []
+    val_indices = []
+
+    for task_id, task_group in dataframe.groupby("task_id", sort=True):
+        task_group = task_group.copy()
+        task_group["__split_group_key"] = task_group["image_path"].astype(str).map(
+            lambda path: _build_group_key(str(task_id), path)
+        )
+        for _, domain_group in task_group.groupby("pseudo_domain", sort=True):
+            unique_group_keys = domain_group["__split_group_key"].drop_duplicates().tolist()
+            rng.shuffle(unique_group_keys)
+
+            total_groups = len(unique_group_keys)
+            val_group_count = int(round(total_groups * float(val_split)))
+            if total_groups >= 2:
+                val_group_count = max(1, min(total_groups - 1, val_group_count))
+            else:
+                val_group_count = 0
+
+            val_group_keys = set(unique_group_keys[:val_group_count])
+            val_mask = domain_group["__split_group_key"].isin(val_group_keys)
+            val_indices.extend(domain_group.index[val_mask].tolist())
+            train_indices.extend(domain_group.index[~val_mask].tolist())
+
+    rng.shuffle(train_indices)
+    rng.shuffle(val_indices)
+    return train_indices, val_indices
+
+
+def _build_train_transforms(profile: str):
+    if profile == "baseline":
+        return A.Compose(
+            [
+                A.RandomBrightnessContrast(p=0.2),
+                A.GaussNoise(p=0.1),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+    if profile == "strong_ultrasound_v1":
+        return A.Compose(
+            [
+                A.OneOf(
+                    [
+                        A.GaussNoise(p=1.0),
+                        A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                        A.MotionBlur(blur_limit=5, p=1.0),
+                    ],
+                    p=0.30,
+                ),
+                A.OneOf(
+                    [
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.20,
+                            contrast_limit=0.20,
+                            p=1.0,
+                        ),
+                        A.RandomGamma(gamma_limit=(80, 120), p=1.0),
+                        A.CLAHE(clip_limit=4.0, tile_grid_size=(8, 8), p=1.0),
+                    ],
+                    p=0.40,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+    if profile == "ultrasound_robust_v1":
+        return A.Compose(
+            [
+                A.OneOf(
+                    [
+                        A.RandomGamma(gamma_limit=(88, 112), p=1.0),
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.12,
+                            contrast_limit=0.12,
+                            p=1.0,
+                        ),
+                        A.CLAHE(clip_limit=2.5, tile_grid_size=(8, 8), p=1.0),
+                    ],
+                    p=0.35,
+                ),
+                A.OneOf(
+                    [
+                        A.GaussianBlur(blur_limit=(3, 3), p=1.0),
+                        A.GaussNoise(p=1.0),
+                        A.ImageCompression(quality_range=(85, 98), p=1.0),
+                    ],
+                    p=0.20,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ]
+        )
+    raise ValueError(f"Unsupported augmentation profile: {profile}")
+
+
 def setup_logger(log_path: str) -> logging.Logger:
     """Setup logger with file and console handlers."""
     logger = logging.getLogger("train")
@@ -220,6 +468,7 @@ def main(
     val_split: float = VAL_SPLIT,
     use_fpn: bool = USE_FPN,
     fpn_mode: str = FPN_MODE,
+    fpn_type: str = FPN_TYPE,
     num_epochs: int = NUM_EPOCHS,
     batch_size: int = BATCH_SIZE,
     num_workers: int = 4,
@@ -251,9 +500,19 @@ def main(
     roi_context_max: float = ROI_CONTEXT_RANGE[1],
     grad_accum_steps: int = 1,
     use_amp: bool = True,
+    split_mode: str = SPLIT_MODE,
+    augmentation_profile: str = AUGMENTATION_PROFILE,
+    checkpoint_task_weight_overrides: dict[str, float] | None = None,
+    checkpoint_score_mode: str = CHECKPOINT_SCORE_MODE,
 ):
     metric_column = "MRE (pixels)"
-    metric_label = CHECKPOINT_SCORE_NAME
+    metric_label_map = {
+        "combined": CHECKPOINT_SCORE_NAME,
+        "server_proxy_v1": "Server proxy score",
+        "server_proxy_v2": "Server proxy score",
+        "robust_domain_v1": "Robust domain score",
+    }
+    metric_label = metric_label_map.get(checkpoint_score_mode, CHECKPOINT_SCORE_NAME)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.abspath(output_dir)
     log_dir = os.path.join(output_dir, "log")
@@ -312,6 +571,8 @@ def main(
                 use_fpn = bool(init_checkpoint_meta["use_fpn"])
             if fpn_mode == FPN_MODE and init_checkpoint_meta.get("fpn_mode"):
                 fpn_mode = str(init_checkpoint_meta["fpn_mode"])
+            if fpn_type == FPN_TYPE and init_checkpoint_meta.get("fpn_type"):
+                fpn_type = str(init_checkpoint_meta["fpn_type"])
         elif task_head_profile == TASK_HEAD_PROFILE:
             task_head_profile = "uniform"
     logger.info(f"Device used: {device}")
@@ -323,6 +584,7 @@ def main(
     logger.info(f"Task adapter profile: {task_adapter_profile}")
     logger.info(f"Task loss family profile: {task_loss_family_profile}")
     logger.info(f"FPN mode: {fpn_mode}")
+    logger.info(f"FPN type: {fpn_type}")
     logger.info(f"Learning rate: {learning_rate:.8f}")
     logger.info(f"Init checkpoint: {init_checkpoint if init_checkpoint else 'none'}")
     logger.info(f"Train task IDs: {train_task_ids if train_task_ids else 'all'}")
@@ -337,26 +599,26 @@ def main(
     logger.info(f"ROI context range: ({roi_context_min:.3f}, {roi_context_max:.3f})")
     logger.info(f"Grad accumulation steps: {grad_accum_steps}")
     logger.info(f"AMP: {'ENABLED' if (use_amp and device.type == 'cuda') else 'DISABLED'}")
+    logger.info(f"Split mode: {split_mode}")
+    logger.info(f"Augmentation profile: {augmentation_profile}")
+    logger.info(f"Checkpoint score mode: {checkpoint_score_mode}")
     logger.info(f"Heatmap size: {HEATMAP_SIZE}")
     effective_task_loss_weights = dict(TASK_LOSS_WEIGHTS)
     if task_loss_weight_overrides:
         effective_task_loss_weights.update(task_loss_weight_overrides)
+    effective_checkpoint_task_weights = dict(CHECKPOINT_TASK_WEIGHTS)
+    if checkpoint_task_weight_overrides:
+        effective_checkpoint_task_weights.update(checkpoint_task_weight_overrides)
     logger.info(f"Task loss weights: {effective_task_loss_weights}")
+    logger.info(f"Checkpoint task weights: {effective_checkpoint_task_weights}")
     logger.info(f"Sampler task weights override: {sampler_task_weight_overrides or {}}")
 
     logger.info(
         f"FPN neck: {'ENABLED' if use_fpn else 'DISABLED'} "
-        f"(mode={fpn_mode}, set USE_FPN={use_fpn} at top of train.py)"
+        f"(mode={fpn_mode}, type={fpn_type}, set USE_FPN={use_fpn} at top of train.py)"
     )
 
-    train_transforms = A.Compose(
-        [
-            A.RandomBrightnessContrast(p=0.2),
-            A.GaussNoise(p=0.1),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2(),
-        ]
-    )
+    train_transforms = _build_train_transforms(augmentation_profile)
 
     val_transforms = A.Compose(
         [
@@ -372,6 +634,7 @@ def main(
         sigma=HEATMAP_SIGMA,
         input_size=input_size,
     )
+    temp_dataset.dataframe = _assign_pseudo_domains(temp_dataset.dataframe, DATA_ROOT_PATH)
 
     task_configs = _build_task_configs(temp_dataset.dataframe)
     task_id_to_name = {cfg["task_id"]: cfg["task_name"] for cfg in task_configs}
@@ -379,11 +642,26 @@ def main(
     if sampler_task_weight_overrides:
         effective_sampler_task_weights.update(sampler_task_weight_overrides)
 
-    train_indices, val_indices = _stratified_split_indices(
-        temp_dataset.dataframe,
-        val_split=val_split,
-        seed=RANDOM_SEED,
-    )
+    if split_mode == "row":
+        train_indices, val_indices = _stratified_split_indices(
+            temp_dataset.dataframe,
+            val_split=val_split,
+            seed=RANDOM_SEED,
+        )
+    elif split_mode == "grouped":
+        train_indices, val_indices = _grouped_stratified_split_indices(
+            temp_dataset.dataframe,
+            val_split=val_split,
+            seed=RANDOM_SEED,
+        )
+    elif split_mode == "pseudo_domain_grouped":
+        train_indices, val_indices = _pseudo_domain_grouped_split_indices(
+            temp_dataset.dataframe,
+            val_split=val_split,
+            seed=RANDOM_SEED,
+        )
+    else:
+        raise ValueError(f"Unsupported split_mode: {split_mode}")
     train_size = len(train_indices)
     val_size = len(val_indices)
     normalization_stats = compute_normalization_stats_from_dataframe(
@@ -427,7 +705,7 @@ def main(
     val_subset = torch.utils.data.Subset(val_dataset, val_indices)
 
     logger.info(
-        f"Dataset split (per-task stratified, val_split={val_split:.6f}): "
+        f"Dataset split ({split_mode}, val_split={val_split:.6f}): "
         f"{train_size} training samples, {val_size} validation samples"
     )
 
@@ -463,6 +741,7 @@ def main(
         heatmap_size=HEATMAP_SIZE,
         use_fpn=use_fpn,
         fpn_mode=fpn_mode,
+        fpn_type=fpn_type,
         head_type=head_type,
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
@@ -470,8 +749,19 @@ def main(
     ).to(device)
     if init_checkpoint is not None:
         state_dict, checkpoint_meta = _load_checkpoint_payload(init_checkpoint, device)
-        model.load_state_dict(state_dict, strict=True)
-        logger.info(f"Loaded initialization checkpoint: {init_checkpoint}")
+        load_result, skipped_keys, missing_after_match = _load_matching_state_dict(model, state_dict)
+        logger.info(f"Loaded initialization checkpoint with compatible-key warm start: {init_checkpoint}")
+        logger.info(
+            f"Warm-start summary: matched={len(model.state_dict()) - len(missing_after_match)}, "
+            f"missing={len(missing_after_match)}, skipped={len(skipped_keys)}"
+        )
+        if skipped_keys:
+            preview = ", ".join(f"{name} [{reason}]" for name, reason in skipped_keys[:12])
+            logger.info(f"Skipped checkpoint keys (first 12): {preview}")
+        if load_result.missing_keys:
+            logger.info(f"Missing model keys after warm start (first 12): {load_result.missing_keys[:12]}")
+        if load_result.unexpected_keys:
+            logger.info(f"Unexpected checkpoint keys after warm start (first 12): {load_result.unexpected_keys[:12]}")
         if checkpoint_meta:
             logger.info(f"Init checkpoint meta: {checkpoint_meta}")
 
@@ -534,11 +824,15 @@ def main(
                             pred_logits, pred_heatmaps = model_output
                         target_coords = torch.stack([batch["train_label"][i] for i in task_indices], 0).to(device)
                         pred_coords_transformed = softargmax_heatmaps_to_transformed_coords(pred_logits)
+                        refined_coords_transformed = aux_outputs.get("refined_coords_transformed")
                         target_coords_transformed = target_coords.clone()
                         coord_loss = F.l1_loss(pred_coords_transformed, target_coords_transformed)
+                        if refined_coords_transformed is not None:
+                            refined_coord_loss = F.l1_loss(refined_coords_transformed, target_coords_transformed)
+                            coord_loss = 0.4 * coord_loss + 0.6 * refined_coord_loss
                         heatmap_loss = F.mse_loss(pred_heatmaps, task_heatmaps)
                         pred_coords_original = transformed_coords_to_original_normalized(
-                            pred_coords_transformed,
+                            refined_coords_transformed if refined_coords_transformed is not None else pred_coords_transformed,
                             [batch["meta"][i] for i in task_indices],
                         ).to(device)
                         target_coords_original = torch.stack([batch["label"][i] for i in task_indices], 0).to(device)
@@ -624,16 +918,63 @@ def main(
             if ema is not None:
                 restore_state = {name: value.detach().clone() for name, value in model.state_dict().items()}
                 ema.copy_to(model)
-            val_results_df = evaluate_keypoint(
-                model,
-                val_loader,
-                device,
-                task_id_to_name,
-                normalization_stats=normalization_stats,
-            )
+            if checkpoint_score_mode == "robust_domain_v1":
+                val_results_df, val_case_df = evaluate_keypoint(
+                    model,
+                    val_loader,
+                    device,
+                    task_id_to_name,
+                    normalization_stats=normalization_stats,
+                    return_case_df=True,
+                )
+            else:
+                val_results_df = evaluate_keypoint(
+                    model,
+                    val_loader,
+                    device,
+                    task_id_to_name,
+                    normalization_stats=normalization_stats,
+                )
+                val_case_df = None
             if restore_state is not None:
                 model.load_state_dict(restore_state, strict=True)
-            selected_val_score = compute_combined_score(val_results_df, normalization_stats=normalization_stats)
+            proxy_breakdown = None
+            robust_domain_breakdown = None
+            if checkpoint_score_mode == "server_proxy_v1":
+                proxy_breakdown = compute_server_proxy_breakdown(
+                    val_results_df,
+                    normalization_stats=normalization_stats,
+                    task_weights=effective_checkpoint_task_weights,
+                    hard_task_ids=SERVER_PROXY_HARD_TASK_IDS,
+                )
+                selected_val_score = float(proxy_breakdown["proxy_score"])
+            elif checkpoint_score_mode == "server_proxy_v2":
+                proxy_breakdown = compute_server_proxy_breakdown(
+                    val_results_df,
+                    normalization_stats=normalization_stats,
+                    task_weights=effective_checkpoint_task_weights,
+                    hard_task_ids=tuple(SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES.keys()),
+                    hard_task_weight_overrides=SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
+                    base_weight=0.45,
+                    hard_task_weight=0.35,
+                    worst_task_weight=0.20,
+                    worst_k=3,
+                )
+                selected_val_score = float(proxy_breakdown["proxy_score"])
+            elif checkpoint_score_mode == "robust_domain_v1":
+                robust_domain_breakdown = compute_robust_domain_breakdown(
+                    val_results_df,
+                    val_case_df,
+                    normalization_stats=normalization_stats,
+                    task_weights=effective_checkpoint_task_weights,
+                )
+                selected_val_score = float(robust_domain_breakdown["robust_score"])
+            else:
+                selected_val_score = compute_combined_score(
+                    val_results_df,
+                    normalization_stats=normalization_stats,
+                    task_weights=effective_checkpoint_task_weights,
+                )
             selected_val_mre = float("inf")
             selected_val_measurement = float("inf")
             selected_val_normalized_mre = float("inf")
@@ -701,6 +1042,20 @@ def main(
                 logger.info(
                     f"--- Average Val Normalized Measurement MAE: {selected_val_normalized_measurement:.6f} ---"
                 )
+            if proxy_breakdown is not None:
+                logger.info(
+                    "--- Server proxy breakdown: "
+                    f"base={proxy_breakdown['base_score']:.6f}, "
+                    f"hard={proxy_breakdown['hard_task_score']:.6f}, "
+                    f"worst={proxy_breakdown['worst_task_score']:.6f} ---"
+                )
+            if robust_domain_breakdown is not None:
+                logger.info(
+                    "--- Robust domain breakdown: "
+                    f"base={robust_domain_breakdown['base_score']:.6f}, "
+                    f"mean_domain={robust_domain_breakdown['mean_domain_score']:.6f}, "
+                    f"worst_domain={robust_domain_breakdown['worst_domain_score']:.6f} ---"
+                )
             logger.info(f"--- Average Val {metric_label} (Lower is better): {selected_val_score:.6f} ---")
 
             improved = selected_val_score < (best_val_score - early_stopping_min_delta)
@@ -714,6 +1069,7 @@ def main(
                             "encoder_name": encoder_name,
                             "use_fpn": use_fpn,
                             "fpn_mode": fpn_mode,
+                            "fpn_type": fpn_type,
                             "head_type": head_type,
                             "task_head_profile": task_head_profile,
                             "task_decoder_profile": task_decoder_profile,
@@ -734,6 +1090,12 @@ def main(
                             "train_roi_crop": train_roi_crop,
                             "roi_crop_tasks": sorted(roi_crop_tasks) if roi_crop_tasks else [],
                             "roi_context_range": [roi_context_min, roi_context_max],
+                            "split_mode": split_mode,
+                            "augmentation_profile": augmentation_profile,
+                            "checkpoint_task_weight_overrides": checkpoint_task_weight_overrides or {},
+                            "checkpoint_score_mode": checkpoint_score_mode,
+                            "server_proxy_hard_task_ids": list(SERVER_PROXY_HARD_TASK_IDS),
+                            "server_proxy_v2_hard_task_weight_overrides": SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
                         },
                     }
                 torch.save(checkpoint_payload, model_save_path)
@@ -789,6 +1151,13 @@ if __name__ == "__main__":
         choices=("shared", "task_specific"),
         default=FPN_MODE,
         help=f"FPN layout when enabled (default: {FPN_MODE}).",
+    )
+    parser.add_argument(
+        "--fpn-type",
+        type=str,
+        choices=("fpn", "bifpn"),
+        default=FPN_TYPE,
+        help=f"FPN neck type when enabled (default: {FPN_TYPE}).",
     )
     parser.add_argument(
         "--no-fpn",
@@ -884,16 +1253,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "coarse_refine_v1", "fugc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1"),
         default=TASK_ADAPTER_PROFILE,
-        help=f"Task-specific soft-sharing adapter profile (default: {TASK_ADAPTER_PROFILE}).",
+        help=f"Task-specific feature adapter profile (default: {TASK_ADAPTER_PROFILE}).",
     )
     parser.add_argument(
         "--task-loss-family-profile",
@@ -901,6 +1270,27 @@ if __name__ == "__main__":
         choices=("uniform", "dataset_v1", "weak_tasks_v1"),
         default=TASK_LOSS_FAMILY_PROFILE,
         help=f"Dataset-family auxiliary loss profile (default: {TASK_LOSS_FAMILY_PROFILE}).",
+    )
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        choices=("row", "grouped", "pseudo_domain_grouped"),
+        default=SPLIT_MODE,
+        help=f"Validation split strategy (default: {SPLIT_MODE}).",
+    )
+    parser.add_argument(
+        "--augmentation-profile",
+        type=str,
+        choices=("baseline", "strong_ultrasound_v1", "ultrasound_robust_v1"),
+        default=AUGMENTATION_PROFILE,
+        help=f"Training augmentation profile (default: {AUGMENTATION_PROFILE}).",
+    )
+    parser.add_argument(
+        "--checkpoint-score-mode",
+        type=str,
+        choices=("combined", "server_proxy_v1", "server_proxy_v2", "robust_domain_v1"),
+        default=CHECKPOINT_SCORE_MODE,
+        help=f"Validation score used for best-checkpoint selection (default: {CHECKPOINT_SCORE_MODE}).",
     )
     parser.add_argument(
         "--fugc-segment-loss-weight",
@@ -931,6 +1321,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Optional comma-separated TASK=VALUE loss-weight overrides.",
+    )
+    parser.add_argument(
+        "--checkpoint-task-weights",
+        type=str,
+        default=None,
+        help="Optional comma-separated TASK=VALUE checkpoint-selection weight overrides.",
     )
     parser.add_argument(
         "--sampler-task-weights",
@@ -996,6 +1392,7 @@ if __name__ == "__main__":
         val_split=float(args.val_split),
         use_fpn=use_fpn,
         fpn_mode=str(args.fpn_mode),
+        fpn_type=str(args.fpn_type),
         num_epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         num_workers=int(args.num_workers),
@@ -1010,6 +1407,9 @@ if __name__ == "__main__":
         task_decoder_profile=str(args.task_decoder_profile),
         task_adapter_profile=str(args.task_adapter_profile),
         task_loss_family_profile=str(args.task_loss_family_profile),
+        split_mode=str(args.split_mode),
+        augmentation_profile=str(args.augmentation_profile),
+        checkpoint_score_mode=str(args.checkpoint_score_mode),
         learning_rate=float(args.learning_rate),
         init_checkpoint=args.init_checkpoint,
         train_task_ids=_parse_task_id_csv(args.train_task_ids),
@@ -1018,6 +1418,7 @@ if __name__ == "__main__":
         femur_shaft_loss_weight=float(args.femur_shaft_loss_weight),
         fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),
         task_loss_weight_overrides=_parse_weight_csv(args.task_loss_weights),
+        checkpoint_task_weight_overrides=_parse_weight_csv(args.checkpoint_task_weights),
         sampler_task_weight_overrides=_parse_weight_csv(args.sampler_task_weights),
         use_ema=not bool(args.no_ema),
         ema_decay=float(args.ema_decay),

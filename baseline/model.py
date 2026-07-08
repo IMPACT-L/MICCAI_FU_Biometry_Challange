@@ -25,6 +25,7 @@ from utils import (
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 OUTPUT_DECIMALS = 6
+DEFAULT_TTA_TASK_IDS = {"AOP", "FA", "FUGC", "HC", "IVC", "PSAX", "fetal_femur"}
 
 
 def normalize_submission_image_path(image_path: str, task_id: str) -> str:
@@ -39,6 +40,13 @@ def normalize_submission_image_path(image_path: str, task_id: str) -> str:
 
 def round_float_list(values, decimals: int = OUTPUT_DECIMALS):
     return [round(float(value), decimals) for value in values]
+
+
+def parse_task_id_csv(value: Optional[str]) -> Optional[set[str]]:
+    if value is None:
+        return None
+    task_ids = {item.strip() for item in str(value).split(",") if item.strip()}
+    return task_ids or None
 
 
 def load_checkpoint_payload(checkpoint_path: str, device: torch.device):
@@ -172,9 +180,12 @@ class Model:
         encoder_name: str = "vit_base_patch14_dinov2.lvd142m",
         use_fpn: Optional[bool] = None,
         fpn_mode: Optional[str] = None,
+        fpn_type: Optional[str] = None,
         task_head_profile: Optional[str] = None,
         task_decoder_profile: Optional[str] = None,
         task_adapter_profile: Optional[str] = None,
+        tta_mode: str = "none",
+        tta_task_ids: Optional[set[str]] = None,
     ):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {self.device}")
@@ -183,10 +194,13 @@ class Model:
         self.encoder_name = encoder_name
         self.use_fpn = use_fpn
         self.fpn_mode = fpn_mode
+        self.fpn_type = fpn_type
         self.head_type = "basic"
         self.task_head_profile = task_head_profile
         self.task_decoder_profile = task_decoder_profile
         self.task_adapter_profile = task_adapter_profile
+        self.tta_mode = str(tta_mode)
+        self.tta_task_ids = tta_task_ids
         self.model = None
         self.task_configs = None
         self.task_id_to_name = None
@@ -199,6 +213,40 @@ class Model:
                 ToTensorV2(),
             ]
         )
+
+    def _predict_task_transformed_coords(self, task_images: torch.Tensor, task_id: str) -> torch.Tensor:
+        model_output = self.model(task_images, task_id=task_id, return_prior=True)
+        aux_outputs = {}
+        if len(model_output) == 3:
+            _, pred_heatmaps, aux_outputs = model_output
+        else:
+            _, pred_heatmaps = model_output
+
+        refined_coords = aux_outputs.get("refined_coords_transformed")
+        if self.tta_mode != "hflip" or (self.tta_task_ids is not None and task_id not in self.tta_task_ids):
+            return refined_coords if refined_coords is not None else decode_heatmaps_to_normalized_coords(pred_heatmaps)
+
+        flipped_images = torch.flip(task_images, dims=[-1])
+        flipped_output = self.model(flipped_images, task_id=task_id, return_prior=True)
+        flipped_aux = {}
+        if len(flipped_output) == 3:
+            _, flipped_heatmaps, flipped_aux = flipped_output
+        else:
+            _, flipped_heatmaps = flipped_output
+
+        flipped_refined = flipped_aux.get("refined_coords_transformed")
+        if refined_coords is not None or flipped_refined is not None:
+            base_coords = refined_coords if refined_coords is not None else decode_heatmaps_to_normalized_coords(pred_heatmaps)
+            flip_coords = (
+                flipped_refined
+                if flipped_refined is not None
+                else decode_heatmaps_to_normalized_coords(flipped_heatmaps)
+            ).clone()
+            flip_coords[:, 0::2] = 1.0 - flip_coords[:, 0::2]
+            return 0.5 * (base_coords + flip_coords)
+
+        merged_heatmaps = 0.5 * (pred_heatmaps + torch.flip(flipped_heatmaps, dims=[-1]))
+        return decode_heatmaps_to_normalized_coords(merged_heatmaps)
 
     def _build_task_configs(self, dataframe: pd.DataFrame):
         task_configs = []
@@ -231,7 +279,9 @@ class Model:
             "fpn_mode",
             "task_specific" if checkpoint_has_task_fpns else "shared",
         )
+        inferred_fpn_type = checkpoint_meta.get("fpn_type", "fpn")
         self.fpn_mode = inferred_fpn_mode if self.fpn_mode is None else self.fpn_mode
+        self.fpn_type = inferred_fpn_type if self.fpn_type is None else self.fpn_type
         self.encoder_name = checkpoint_meta.get("encoder_name", self.encoder_name)
         self.head_type = checkpoint_meta.get("head_type", self.head_type)
         self.task_head_profile = (
@@ -259,10 +309,16 @@ class Model:
             f"task_decoder_profile={self.task_decoder_profile}, "
             f"task_adapter_profile={self.task_adapter_profile}, "
             f"fpn_mode={self.fpn_mode}, "
+            f"fpn_type={self.fpn_type}, "
             f"heatmap_size={self.heatmap_size}, "
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
         )
+        if self.tta_mode == "hflip":
+            print(
+                "Inference TTA: hflip "
+                f"(tasks={sorted(self.tta_task_ids) if self.tta_task_ids is not None else 'all'})"
+            )
 
         self.model = MultiTaskModelFactory(
             encoder_name=self.encoder_name,
@@ -271,6 +327,7 @@ class Model:
             heatmap_size=self.heatmap_size,
             use_fpn=use_fpn,
             fpn_mode=self.fpn_mode,
+            fpn_type=self.fpn_type,
             head_type=self.head_type,
             task_head_profile=self.task_head_profile,
             task_decoder_profile=self.task_decoder_profile,
@@ -335,9 +392,7 @@ class Model:
                 for task_id in unique_tasks:
                     task_indices = [i for i, tid in enumerate(task_ids) if tid == task_id]
                     task_images = images[task_indices]
-                    pred_logits = self.model(task_images, task_id=task_id)
-                    pred_heatmaps = torch.sigmoid(pred_logits)
-                    outputs_transformed = decode_heatmaps_to_normalized_coords(pred_heatmaps)
+                    outputs_transformed = self._predict_task_transformed_coords(task_images, task_id)
                     outputs = transformed_coords_to_original_normalized(
                         outputs_transformed,
                         [meta[i] for i in task_indices],
@@ -422,16 +477,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "coarse_refine_v1", "fugc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=None,
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1"),
         default=None,
-        help="Optional task-specific soft-sharing adapter override. If omitted, inferred from checkpoint.",
+        help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--fpn",
@@ -453,6 +508,26 @@ if __name__ == "__main__":
         default=None,
         help="Optional FPN mode override. If omitted, inferred from checkpoint.",
     )
+    parser.add_argument(
+        "--fpn-type",
+        type=str,
+        choices=("fpn", "bifpn"),
+        default=None,
+        help="Optional FPN neck type override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
+        "--tta-mode",
+        type=str,
+        choices=("none", "hflip"),
+        default="none",
+        help="Inference-time test-time augmentation mode.",
+    )
+    parser.add_argument(
+        "--tta-task-ids",
+        type=str,
+        default="AOP,FA,FUGC,HC,IVC,PSAX,fetal_femur",
+        help="Comma-separated task IDs to apply TTA to. Ignored when --tta-mode none.",
+    )
     args = parser.parse_args()
 
     model = Model(
@@ -460,9 +535,12 @@ if __name__ == "__main__":
         encoder_name=args.encoder_name,
         use_fpn=args.use_fpn,
         fpn_mode=args.fpn_mode,
+        fpn_type=args.fpn_type,
         task_head_profile=args.task_head_profile,
         task_decoder_profile=args.task_decoder_profile,
         task_adapter_profile=args.task_adapter_profile,
+        tta_mode=args.tta_mode,
+        tta_task_ids=(DEFAULT_TTA_TASK_IDS if args.tta_mode == "hflip" and args.tta_task_ids == "AOP,FA,FUGC,HC,IVC,PSAX,fetal_femur" else parse_task_id_csv(args.tta_task_ids)),
     )
     json_path = model.predict(
         args.data_root,
