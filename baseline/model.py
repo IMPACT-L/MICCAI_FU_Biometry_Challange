@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from model_factory import MultiTaskModelFactory
+from model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 from utils import (
     canonicalize_task_coords,
     decode_heatmaps_to_normalized_coords,
@@ -178,6 +179,7 @@ class Model:
         self,
         checkpoint_path: str = "best_model.pth",
         encoder_name: str = "vit_base_patch14_dinov2.lvd142m",
+        model_profile: Optional[str] = None,
         use_fpn: Optional[bool] = None,
         fpn_mode: Optional[str] = None,
         fpn_type: Optional[str] = None,
@@ -191,6 +193,7 @@ class Model:
         print(f"Using device: {self.device}")
 
         self.checkpoint_path = checkpoint_path
+        self.model_profile = model_profile
         self.encoder_name = encoder_name
         self.use_fpn = use_fpn
         self.fpn_mode = fpn_mode
@@ -299,6 +302,27 @@ class Model:
             if self.task_adapter_profile is not None
             else checkpoint_meta.get("task_adapter_profile", "uniform")
         )
+        if self.model_profile is not None:
+            profile_config = apply_model_profile(
+                self.model_profile,
+                "inference",
+                {
+                    "encoder_name": self.encoder_name,
+                    "use_fpn": use_fpn,
+                    "fpn_mode": self.fpn_mode,
+                    "fpn_type": self.fpn_type,
+                    "task_head_profile": self.task_head_profile,
+                    "task_decoder_profile": self.task_decoder_profile,
+                    "task_adapter_profile": self.task_adapter_profile,
+                },
+            )
+            self.encoder_name = str(profile_config["encoder_name"])
+            use_fpn = bool(profile_config["use_fpn"])
+            self.fpn_mode = str(profile_config["fpn_mode"])
+            self.fpn_type = str(profile_config["fpn_type"])
+            self.task_head_profile = str(profile_config["task_head_profile"])
+            self.task_decoder_profile = str(profile_config["task_decoder_profile"])
+            self.task_adapter_profile = str(profile_config["task_adapter_profile"])
         self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
         self.heatmap_size = tuple(checkpoint_meta.get("heatmap_size", list(self.heatmap_size)))
         print(
@@ -314,6 +338,7 @@ class Model:
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
         )
+        print(f"Model profile: {self.model_profile if self.model_profile is not None else 'checkpoint/manual'}")
         if self.tta_mode == "hflip":
             print(
                 "Inference TTA: hflip "
@@ -462,6 +487,13 @@ if __name__ == "__main__":
         help="Also create submission.zip containing the prediction JSON.",
     )
     parser.add_argument(
+        "--model-profile",
+        type=str,
+        choices=MODEL_PROFILE_NAMES,
+        default=None,
+        help="Named inference architecture preset. When provided, it overrides checkpoint-inferred architecture fields.",
+    )
+    parser.add_argument(
         "--encoder-name",
         type=str,
         default="vit_base_patch14_dinov2.lvd142m",
@@ -477,7 +509,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "coarse_refine_v1", "fugc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=None,
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
@@ -533,6 +565,7 @@ if __name__ == "__main__":
     model = Model(
         checkpoint_path=args.checkpoint_path,
         encoder_name=args.encoder_name,
+        model_profile=args.model_profile,
         use_fpn=args.use_fpn,
         fpn_mode=args.fpn_mode,
         fpn_type=args.fpn_type,

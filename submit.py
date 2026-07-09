@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from baseline.model_factory import MultiTaskModelFactory
+from baseline.model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 from baseline.utils import (
     canonicalize_task_coords,
     decode_heatmaps_to_normalized_coords,
@@ -251,6 +252,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="Inference batch size.")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker count.")
     parser.add_argument(
+        "--model-profile",
+        default=None,
+        choices=MODEL_PROFILE_NAMES,
+        help="Named submission architecture preset. When provided, it overrides checkpoint-inferred architecture fields.",
+    )
+    parser.add_argument(
         "--encoder-name",
         default=None,
         help="Optional backbone override. If omitted, inferred from checkpoint.",
@@ -270,7 +277,7 @@ def main():
     parser.add_argument(
         "--task-decoder-profile",
         default=None,
-        choices=("uniform", "coarse_refine_v1", "fugc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
@@ -359,6 +366,27 @@ def main():
     task_adapter_profile = args.task_adapter_profile or inferred_task_adapter_profile
     use_fpn = inferred_use_fpn if args.use_fpn is None else args.use_fpn
     input_size = int(args.input_size or inferred_input_size)
+    if args.model_profile is not None:
+        profile_config = apply_model_profile(
+            args.model_profile,
+            "inference",
+            {
+                "encoder_name": encoder_name,
+                "use_fpn": use_fpn,
+                "fpn_mode": fpn_mode,
+                "fpn_type": fpn_type,
+                "task_head_profile": task_head_profile,
+                "task_decoder_profile": task_decoder_profile,
+                "task_adapter_profile": task_adapter_profile,
+            },
+        )
+        encoder_name = str(profile_config["encoder_name"])
+        use_fpn = bool(profile_config["use_fpn"])
+        fpn_mode = str(profile_config["fpn_mode"])
+        fpn_type = str(profile_config["fpn_type"])
+        task_head_profile = str(profile_config["task_head_profile"])
+        task_decoder_profile = str(profile_config["task_decoder_profile"])
+        task_adapter_profile = str(profile_config["task_adapter_profile"])
     tta_task_ids = (
         DEFAULT_TTA_TASK_IDS
         if args.tta_mode == "hflip" and args.tta_task_ids == "AOP,FA,FUGC,HC,IVC,PSAX,fetal_femur"
@@ -399,6 +427,7 @@ def main():
         f"heatmap_size={inferred_heatmap_size}, "
         f"FPN={'ENABLED' if use_fpn else 'DISABLED'}"
     )
+    print(f"Model profile: {args.model_profile if args.model_profile is not None else 'checkpoint/manual'}")
     if args.tta_mode == "hflip":
         print(f"Submission TTA: hflip (tasks={sorted(tta_task_ids) if tta_task_ids is not None else 'all'})")
 

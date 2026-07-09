@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 from dataset import KeypointDataset, KeypointUniformSampler
 from model_factory import MultiTaskModelFactory
+from model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 from utils import (
     build_line_mask_from_transformed_coords,
     compute_combined_score,
@@ -683,6 +684,8 @@ def setup_logger(log_path: str) -> logging.Logger:
 
 def main(
     val_split: float = VAL_SPLIT,
+    model_profile: str | None = None,
+    random_seed: int = RANDOM_SEED,
     use_fpn: bool = USE_FPN,
     fpn_mode: str = FPN_MODE,
     fpn_type: str = FPN_TYPE,
@@ -725,6 +728,52 @@ def main(
     cardiac_split_screen_mode: str = CARDIAC_SPLIT_SCREEN_MODE,
     cardiac_split_screen_vdark_threshold: float = CARDIAC_SPLIT_SCREEN_VDARK_THRESHOLD,
 ):
+    if model_profile is not None:
+        profile_config = apply_model_profile(
+            model_profile,
+            "train",
+            {
+                "encoder_name": encoder_name,
+                "input_size": input_size,
+                "use_fpn": use_fpn,
+                "fpn_mode": fpn_mode,
+                "fpn_type": fpn_type,
+                "head_type": head_type,
+                "task_head_profile": task_head_profile,
+                "task_decoder_profile": task_decoder_profile,
+                "task_adapter_profile": task_adapter_profile,
+                "task_loss_family_profile": task_loss_family_profile,
+                "split_mode": split_mode,
+                "augmentation_profile": augmentation_profile,
+                "checkpoint_score_mode": checkpoint_score_mode,
+                "cardiac_split_screen_mode": cardiac_split_screen_mode,
+                "measurement_loss_weight": measurement_loss_weight,
+                "dataset_loss_weight": dataset_loss_weight,
+                "femur_shaft_loss_weight": femur_shaft_loss_weight,
+                "fugc_segment_loss_weight": fugc_segment_loss_weight,
+                "ivc_band_loss_weight": ivc_band_loss_weight,
+            },
+        )
+        encoder_name = str(profile_config["encoder_name"])
+        input_size = int(profile_config["input_size"])
+        use_fpn = bool(profile_config["use_fpn"])
+        fpn_mode = str(profile_config["fpn_mode"])
+        fpn_type = str(profile_config["fpn_type"])
+        head_type = str(profile_config["head_type"])
+        task_head_profile = str(profile_config["task_head_profile"])
+        task_decoder_profile = str(profile_config["task_decoder_profile"])
+        task_adapter_profile = str(profile_config["task_adapter_profile"])
+        task_loss_family_profile = str(profile_config["task_loss_family_profile"])
+        split_mode = str(profile_config["split_mode"])
+        augmentation_profile = str(profile_config["augmentation_profile"])
+        checkpoint_score_mode = str(profile_config["checkpoint_score_mode"])
+        cardiac_split_screen_mode = str(profile_config["cardiac_split_screen_mode"])
+        measurement_loss_weight = float(profile_config["measurement_loss_weight"])
+        dataset_loss_weight = float(profile_config["dataset_loss_weight"])
+        femur_shaft_loss_weight = float(profile_config["femur_shaft_loss_weight"])
+        fugc_segment_loss_weight = float(profile_config["fugc_segment_loss_weight"])
+        ivc_band_loss_weight = float(profile_config["ivc_band_loss_weight"])
+
     metric_column = "MRE (pixels)"
     metric_label_map = {
         "combined": CHECKPOINT_SCORE_NAME,
@@ -755,7 +804,7 @@ def main(
     logger.info(f"TensorBoard directory: {tensorboard_dir}")
     writer = SummaryWriter(log_dir=tensorboard_dir)
 
-    set_seed(RANDOM_SEED)
+    set_seed(random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     init_checkpoint_meta = {}
     if init_checkpoint is not None:
@@ -796,6 +845,8 @@ def main(
         elif task_head_profile == TASK_HEAD_PROFILE:
             task_head_profile = "uniform"
     logger.info(f"Device used: {device}")
+    logger.info(f"Model profile: {model_profile if model_profile is not None else 'manual'}")
+    logger.info(f"Random seed: {random_seed}")
     logger.info(f"Encoder: {encoder_name}")
     logger.info(f"Input size: {input_size}")
     logger.info(f"Head type: {head_type}")
@@ -893,19 +944,19 @@ def main(
         train_indices, val_indices = _stratified_split_indices(
             temp_dataset.dataframe,
             val_split=val_split,
-            seed=RANDOM_SEED,
+            seed=random_seed,
         )
     elif split_mode == "grouped":
         train_indices, val_indices = _grouped_stratified_split_indices(
             temp_dataset.dataframe,
             val_split=val_split,
-            seed=RANDOM_SEED,
+            seed=random_seed,
         )
     elif split_mode == "pseudo_domain_grouped":
         train_indices, val_indices = _pseudo_domain_grouped_split_indices(
             temp_dataset.dataframe,
             val_split=val_split,
-            seed=RANDOM_SEED,
+            seed=random_seed,
         )
     else:
         raise ValueError(f"Unsupported split_mode: {split_mode}")
@@ -1352,6 +1403,7 @@ def main(
                             "checkpoint_score_mode": checkpoint_score_mode,
                             "cardiac_split_screen_mode": cardiac_split_screen_mode,
                             "cardiac_split_screen_vdark_threshold": cardiac_split_screen_vdark_threshold,
+                            "random_seed": random_seed,
                             "server_proxy_hard_task_ids": list(SERVER_PROXY_HARD_TASK_IDS),
                             "server_proxy_v2_hard_task_weight_overrides": SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
                         },
@@ -1391,6 +1443,13 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Keypoint training script")
+    parser.add_argument(
+        "--model-profile",
+        type=str,
+        choices=MODEL_PROFILE_NAMES,
+        default=None,
+        help="Named architecture/training recipe preset. When provided, it overrides the matching model-shape and split settings.",
+    )
     parser.add_argument(
         "--val-split",
         type=float,
@@ -1488,6 +1547,12 @@ if __name__ == "__main__":
         type=float,
         default=LEARNING_RATE,
         help=f"Base learning rate (default: {LEARNING_RATE}).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=RANDOM_SEED,
+        help=f"Random seed for initialization, split generation, and sampling (default: {RANDOM_SEED}).",
     )
     parser.add_argument(
         "--init-checkpoint",
@@ -1667,6 +1732,8 @@ if __name__ == "__main__":
 
     main(
         val_split=float(args.val_split),
+        model_profile=args.model_profile,
+        random_seed=int(args.seed),
         use_fpn=use_fpn,
         fpn_mode=str(args.fpn_mode),
         fpn_type=str(args.fpn_type),
