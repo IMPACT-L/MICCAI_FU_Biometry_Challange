@@ -499,6 +499,21 @@ def compute_fugc_segment_loss(
     return torch.nn.functional.binary_cross_entropy_with_logits(segment_logits, target_mask)
 
 
+def compute_ivc_band_loss(
+    band_logits: torch.Tensor | None,
+    target_coords_transformed: torch.Tensor,
+    heatmap_size: tuple[int, int],
+) -> torch.Tensor:
+    if band_logits is None:
+        return target_coords_transformed.new_tensor(0.0)
+    target_mask = build_line_mask_from_transformed_coords(
+        target_coords_transformed,
+        heatmap_size=heatmap_size,
+        thickness=3,
+    )
+    return torch.nn.functional.binary_cross_entropy_with_logits(band_logits, target_mask)
+
+
 def compute_dataset_specific_loss(
     pred_coords: torch.Tensor,
     target_coords: torch.Tensor,
