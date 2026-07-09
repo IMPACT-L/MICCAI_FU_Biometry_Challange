@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import os
 import re
@@ -25,6 +26,7 @@ from utils import (
     compute_dataset_specific_loss,
     compute_femur_shaft_loss,
     compute_fugc_segment_loss,
+    compute_ivc_band_loss,
     compute_normalization_stats_from_dataframe,
     compute_measurement_loss,
     compute_robust_domain_breakdown,
@@ -74,6 +76,7 @@ HEATMAP_SIZE = (64, 64)
 HEATMAP_SIGMA = 1.8
 FEMUR_SHAFT_LOSS_WEIGHT = 0.15
 FUGC_SEGMENT_LOSS_WEIGHT = 0.08
+IVC_BAND_LOSS_WEIGHT = 0.08
 ROI_CROP_TASKS = ("FUGC", "IVC", "fetal_femur")
 ROI_CONTEXT_RANGE = (1.2, 1.8)
 TASK_LOSS_WEIGHTS = {
@@ -98,6 +101,11 @@ CHECKPOINT_TASK_WEIGHTS = {
     "PSAX": 1.20,
     "fetal_femur": 1.20,
 }
+CARDIAC_SPLIT_SCREEN_TASK_IDS = ("A4C", "PSAX", "PLAX", "IVC")
+CARDIAC_SPLIT_SCREEN_MODE = "keep"
+CARDIAC_SPLIT_SCREEN_VDARK_THRESHOLD = 12.0
+CARDIAC_SPLIT_SCREEN_CENTER_MAX = 0.42
+CARDIAC_SPLIT_SCREEN_RIGHT_EXTENT_MAX = 0.72
 
 
 def _resolve_image_path_for_split(data_root: str, rel_path: str) -> str | None:
@@ -148,6 +156,82 @@ def _assign_pseudo_domains(dataframe, data_root: str):
         domain_labels.get(idx, "unknown")
         for idx in dataframe.index
     ]
+    return dataframe
+
+
+def _extract_row_x_extent(row) -> tuple[float, float, float] | None:
+    try:
+        width = max(float(row["width"]), 1.0)
+        num_points = int(row["num_classes"])
+    except Exception:
+        return None
+
+    xs = []
+    for point_idx in range(1, num_points + 1):
+        col = f"point_{point_idx}_xy"
+        if col not in row or row[col] is None:
+            continue
+        try:
+            point_xy = json.loads(row[col])
+            xs.append(float(point_xy[0]))
+        except Exception:
+            continue
+    if not xs:
+        return None
+    xs_np = np.array(xs, dtype=np.float32)
+    return (
+        float(xs_np.min() / width),
+        float(xs_np.max() / width),
+        float(xs_np.mean() / width),
+    )
+
+
+def _assign_cardiac_split_screen_flags(
+    dataframe,
+    data_root: str,
+    vdark_threshold: float = CARDIAC_SPLIT_SCREEN_VDARK_THRESHOLD,
+    center_max: float = CARDIAC_SPLIT_SCREEN_CENTER_MAX,
+    right_extent_max: float = CARDIAC_SPLIT_SCREEN_RIGHT_EXTENT_MAX,
+):
+    dataframe = dataframe.copy()
+    dataframe["split_screen_score"] = 0.0
+    dataframe["is_split_screen_cardiac"] = False
+
+    candidate_task_ids = set(CARDIAC_SPLIT_SCREEN_TASK_IDS)
+    for idx, row in dataframe.iterrows():
+        task_id = str(row["task_id"])
+        if task_id not in candidate_task_ids:
+            continue
+
+        image_path = _resolve_image_path_for_split(data_root, row["image_path"])
+        if image_path is None:
+            continue
+        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+        if image is None:
+            continue
+
+        height, width = image.shape[:2]
+        mid_left = max(0, width // 2 - 3)
+        mid_right = min(width, width // 2 + 3)
+        center_strip = image[:, mid_left:mid_right]
+        if center_strip.size == 0:
+            continue
+
+        background_mean = float(image.mean())
+        vdark = max(0.0, background_mean - float(center_strip.mean()))
+        dataframe.at[idx, "split_screen_score"] = float(vdark)
+
+        extent = _extract_row_x_extent(row)
+        if extent is None:
+            continue
+        _, x_max_norm, x_center_norm = extent
+        is_split_screen = (
+            vdark >= float(vdark_threshold)
+            and x_center_norm <= float(center_max)
+            and x_max_norm <= float(right_extent_max)
+        )
+        dataframe.at[idx, "is_split_screen_cardiac"] = bool(is_split_screen)
+
     return dataframe
 
 
@@ -375,6 +459,7 @@ def _pseudo_domain_grouped_split_indices(dataframe, val_split: float, seed: int)
 
 
 def _build_train_transforms(profile: str):
+    keypoint_params = A.KeypointParams(format="xy", remove_invisible=False)
     if profile == "baseline":
         return A.Compose(
             [
@@ -382,7 +467,8 @@ def _build_train_transforms(profile: str):
                 A.GaussNoise(p=0.1),
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
-            ]
+            ],
+            keypoint_params=keypoint_params,
         )
     if profile == "strong_ultrasound_v1":
         return A.Compose(
@@ -409,7 +495,8 @@ def _build_train_transforms(profile: str):
                 ),
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
-            ]
+            ],
+            keypoint_params=keypoint_params,
         )
     if profile == "ultrasound_robust_v1":
         return A.Compose(
@@ -436,7 +523,137 @@ def _build_train_transforms(profile: str):
                 ),
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
-            ]
+            ],
+            keypoint_params=keypoint_params,
+        )
+    if profile == "ultrasound_domain_shift_v1":
+        return A.Compose(
+            [
+                A.HorizontalFlip(p=0.25),
+                A.Affine(
+                    scale={"x": (0.92, 1.10), "y": (0.92, 1.10)},
+                    translate_percent={"x": (-0.04, 0.04), "y": (-0.04, 0.04)},
+                    rotate=(-12, 12),
+                    shear={"x": (-8, 8), "y": (-4, 4)},
+                    fit_output=False,
+                    keep_ratio=False,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=0,
+                    p=0.55,
+                ),
+                A.OneOf(
+                    [
+                        A.RandomGamma(gamma_limit=(88, 112), p=1.0),
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.14,
+                            contrast_limit=0.14,
+                            p=1.0,
+                        ),
+                        A.CLAHE(clip_limit=2.5, tile_grid_size=(8, 8), p=1.0),
+                    ],
+                    p=0.35,
+                ),
+                A.OneOf(
+                    [
+                        A.GaussianBlur(blur_limit=(3, 3), p=1.0),
+                        A.GaussNoise(p=1.0),
+                        A.ImageCompression(quality_range=(85, 98), p=1.0),
+                    ],
+                    p=0.20,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ],
+            keypoint_params=keypoint_params,
+        )
+    if profile == "ultrasound_domain_shift_v2":
+        return A.Compose(
+            [
+                A.HorizontalFlip(p=0.30),
+                A.Affine(
+                    scale={"x": (0.88, 1.16), "y": (0.88, 1.16)},
+                    translate_percent={"x": (-0.06, 0.06), "y": (-0.06, 0.06)},
+                    rotate=(-15, 15),
+                    shear={"x": (-10, 10), "y": (-6, 6)},
+                    fit_output=False,
+                    keep_ratio=False,
+                    border_mode=cv2.BORDER_CONSTANT,
+                    fill=0,
+                    p=0.65,
+                ),
+                A.OneOf(
+                    [
+                        A.RandomGamma(gamma_limit=(84, 116), p=1.0),
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.18,
+                            contrast_limit=0.18,
+                            p=1.0,
+                        ),
+                        A.CLAHE(clip_limit=3.0, tile_grid_size=(8, 8), p=1.0),
+                    ],
+                    p=0.45,
+                ),
+                A.OneOf(
+                    [
+                        A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                        A.MotionBlur(blur_limit=5, p=1.0),
+                        A.GaussNoise(p=1.0),
+                        A.ImageCompression(quality_range=(82, 97), p=1.0),
+                    ],
+                    p=0.28,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ],
+            keypoint_params=keypoint_params,
+        )
+    if profile == "ultrasound_mixed_v1":
+        return A.Compose(
+            [
+                A.OneOf(
+                    [
+                        A.NoOp(p=1.0),
+                        A.Affine(
+                            scale={"x": (0.94, 1.08), "y": (0.94, 1.08)},
+                            translate_percent={"x": (-0.03, 0.03), "y": (-0.03, 0.03)},
+                            rotate=(-8, 8),
+                            shear={"x": (-5, 5), "y": (-3, 3)},
+                            fit_output=False,
+                            keep_ratio=False,
+                            border_mode=cv2.BORDER_CONSTANT,
+                            fill=0,
+                            p=1.0,
+                        ),
+                    ],
+                    p=0.35,
+                ),
+                A.HorizontalFlip(p=0.12),
+                A.OneOf(
+                    [
+                        A.NoOp(p=1.0),
+                        A.RandomGamma(gamma_limit=(90, 110), p=1.0),
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.10,
+                            contrast_limit=0.10,
+                            p=1.0,
+                        ),
+                        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+                    ],
+                    p=0.35,
+                ),
+                A.OneOf(
+                    [
+                        A.NoOp(p=1.0),
+                        A.GaussianBlur(blur_limit=(3, 3), p=1.0),
+                        A.GaussNoise(p=1.0),
+                        A.ImageCompression(quality_range=(88, 98), p=1.0),
+                    ],
+                    p=0.15,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ],
+            keypoint_params=keypoint_params,
         )
     raise ValueError(f"Unsupported augmentation profile: {profile}")
 
@@ -490,6 +707,7 @@ def main(
     dataset_loss_weight: float = 0.0,
     femur_shaft_loss_weight: float = FEMUR_SHAFT_LOSS_WEIGHT,
     fugc_segment_loss_weight: float = FUGC_SEGMENT_LOSS_WEIGHT,
+    ivc_band_loss_weight: float = IVC_BAND_LOSS_WEIGHT,
     task_loss_weight_overrides: dict[str, float] | None = None,
     sampler_task_weight_overrides: dict[str, float] | None = None,
     use_ema: bool = True,
@@ -504,6 +722,8 @@ def main(
     augmentation_profile: str = AUGMENTATION_PROFILE,
     checkpoint_task_weight_overrides: dict[str, float] | None = None,
     checkpoint_score_mode: str = CHECKPOINT_SCORE_MODE,
+    cardiac_split_screen_mode: str = CARDIAC_SPLIT_SCREEN_MODE,
+    cardiac_split_screen_vdark_threshold: float = CARDIAC_SPLIT_SCREEN_VDARK_THRESHOLD,
 ):
     metric_column = "MRE (pixels)"
     metric_label_map = {
@@ -592,6 +812,7 @@ def main(
     logger.info(f"Dataset-specific loss weight: {dataset_loss_weight:.6f}")
     logger.info(f"Femur shaft loss weight: {femur_shaft_loss_weight:.6f}")
     logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
+    logger.info(f"IVC band loss weight: {ivc_band_loss_weight:.6f}")
     logger.info(f"EMA: {'ENABLED' if use_ema else 'DISABLED'}")
     logger.info(f"EMA decay: {ema_decay:.6f}")
     logger.info(f"Train ROI crop: {'ENABLED' if train_roi_crop else 'DISABLED'}")
@@ -602,6 +823,8 @@ def main(
     logger.info(f"Split mode: {split_mode}")
     logger.info(f"Augmentation profile: {augmentation_profile}")
     logger.info(f"Checkpoint score mode: {checkpoint_score_mode}")
+    logger.info(f"Cardiac split-screen mode: {cardiac_split_screen_mode}")
+    logger.info(f"Cardiac split-screen vertical-darkness threshold: {cardiac_split_screen_vdark_threshold:.6f}")
     logger.info(f"Heatmap size: {HEATMAP_SIZE}")
     effective_task_loss_weights = dict(TASK_LOSS_WEIGHTS)
     if task_loss_weight_overrides:
@@ -634,6 +857,30 @@ def main(
         sigma=HEATMAP_SIGMA,
         input_size=input_size,
     )
+    temp_dataset.dataframe = _assign_cardiac_split_screen_flags(
+        temp_dataset.dataframe,
+        DATA_ROOT_PATH,
+        vdark_threshold=cardiac_split_screen_vdark_threshold,
+    )
+    split_screen_counts = (
+        temp_dataset.dataframe[temp_dataset.dataframe["is_split_screen_cardiac"]]
+        .groupby("task_id")
+        .size()
+        .to_dict()
+    )
+    logger.info(
+        "Detected split-screen cardiac training rows: "
+        f"{int(temp_dataset.dataframe['is_split_screen_cardiac'].sum())} total, by task={split_screen_counts}"
+    )
+    if cardiac_split_screen_mode == "exclude":
+        before_count = len(temp_dataset.dataframe)
+        temp_dataset.dataframe = temp_dataset.dataframe[
+            ~temp_dataset.dataframe["is_split_screen_cardiac"].astype(bool)
+        ].reset_index(drop=True)
+        removed_count = before_count - len(temp_dataset.dataframe)
+        logger.info(f"Excluded split-screen cardiac rows before split: {removed_count}")
+    elif cardiac_split_screen_mode != "keep":
+        raise ValueError(f"Unsupported cardiac_split_screen_mode: {cardiac_split_screen_mode}")
     temp_dataset.dataframe = _assign_pseudo_domains(temp_dataset.dataframe, DATA_ROOT_PATH)
 
     task_configs = _build_task_configs(temp_dataset.dataframe)
@@ -863,6 +1110,13 @@ def main(
                                 target_coords_transformed,
                                 heatmap_size=HEATMAP_SIZE,
                             )
+                        ivc_band_loss = pred_logits.new_tensor(0.0)
+                        if current_task_id == "IVC":
+                            ivc_band_loss = compute_ivc_band_loss(
+                                aux_outputs.get("band_logits"),
+                                target_coords_transformed,
+                                heatmap_size=HEATMAP_SIZE,
+                            )
                         base_loss = (
                             heatmap_loss
                             + 0.2 * coord_loss
@@ -870,6 +1124,7 @@ def main(
                             + dataset_loss_weight * dataset_specific_loss
                             + femur_shaft_loss_weight * femur_shaft_loss
                             + fugc_segment_loss_weight * fugc_segment_loss
+                            + ivc_band_loss_weight * ivc_band_loss
                         )
                         task_weight = float(effective_task_loss_weights.get(current_task_id, 1.0))
                         loss = base_loss * task_weight
@@ -1082,6 +1337,7 @@ def main(
                             "dataset_loss_weight": dataset_loss_weight,
                             "femur_shaft_loss_weight": femur_shaft_loss_weight,
                             "fugc_segment_loss_weight": fugc_segment_loss_weight,
+                            "ivc_band_loss_weight": ivc_band_loss_weight,
                             "use_ema": use_ema,
                             "ema_decay": ema_decay,
                             "task_loss_weight_overrides": task_loss_weight_overrides or {},
@@ -1094,6 +1350,8 @@ def main(
                             "augmentation_profile": augmentation_profile,
                             "checkpoint_task_weight_overrides": checkpoint_task_weight_overrides or {},
                             "checkpoint_score_mode": checkpoint_score_mode,
+                            "cardiac_split_screen_mode": cardiac_split_screen_mode,
+                            "cardiac_split_screen_vdark_threshold": cardiac_split_screen_vdark_threshold,
                             "server_proxy_hard_task_ids": list(SERVER_PROXY_HARD_TASK_IDS),
                             "server_proxy_v2_hard_task_weight_overrides": SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
                         },
@@ -1253,7 +1511,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "coarse_refine_v1", "fugc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
     )
@@ -1281,7 +1539,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--augmentation-profile",
         type=str,
-        choices=("baseline", "strong_ultrasound_v1", "ultrasound_robust_v1"),
+        choices=("baseline", "strong_ultrasound_v1", "ultrasound_robust_v1", "ultrasound_domain_shift_v1", "ultrasound_domain_shift_v2", "ultrasound_mixed_v1"),
         default=AUGMENTATION_PROFILE,
         help=f"Training augmentation profile (default: {AUGMENTATION_PROFILE}).",
     )
@@ -1293,10 +1551,29 @@ if __name__ == "__main__":
         help=f"Validation score used for best-checkpoint selection (default: {CHECKPOINT_SCORE_MODE}).",
     )
     parser.add_argument(
+        "--cardiac-split-screen-mode",
+        type=str,
+        choices=("keep", "exclude"),
+        default=CARDIAC_SPLIT_SCREEN_MODE,
+        help=f"How to handle detected split-screen cardiac training rows (default: {CARDIAC_SPLIT_SCREEN_MODE}).",
+    )
+    parser.add_argument(
+        "--cardiac-split-screen-vdark-threshold",
+        type=float,
+        default=CARDIAC_SPLIT_SCREEN_VDARK_THRESHOLD,
+        help="Vertical center-strip darkness threshold used to detect split-screen cardiac images.",
+    )
+    parser.add_argument(
         "--fugc-segment-loss-weight",
         type=float,
         default=FUGC_SEGMENT_LOSS_WEIGHT,
         help="Auxiliary short-segment mask loss for FUGC. Use 0.0 to disable.",
+    )
+    parser.add_argument(
+        "--ivc-band-loss-weight",
+        type=float,
+        default=IVC_BAND_LOSS_WEIGHT,
+        help="Auxiliary diameter-band mask loss for IVC. Use 0.0 to disable.",
     )
     parser.add_argument(
         "--measurement-loss-weight",
@@ -1410,6 +1687,8 @@ if __name__ == "__main__":
         split_mode=str(args.split_mode),
         augmentation_profile=str(args.augmentation_profile),
         checkpoint_score_mode=str(args.checkpoint_score_mode),
+        cardiac_split_screen_mode=str(args.cardiac_split_screen_mode),
+        cardiac_split_screen_vdark_threshold=float(args.cardiac_split_screen_vdark_threshold),
         learning_rate=float(args.learning_rate),
         init_checkpoint=args.init_checkpoint,
         train_task_ids=_parse_task_id_csv(args.train_task_ids),
@@ -1417,6 +1696,7 @@ if __name__ == "__main__":
         dataset_loss_weight=float(args.dataset_loss_weight),
         femur_shaft_loss_weight=float(args.femur_shaft_loss_weight),
         fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),
+        ivc_band_loss_weight=float(args.ivc_band_loss_weight),
         task_loss_weight_overrides=_parse_weight_csv(args.task_loss_weights),
         checkpoint_task_weight_overrides=_parse_weight_csv(args.checkpoint_task_weights),
         sampler_task_weight_overrides=_parse_weight_csv(args.sampler_task_weights),

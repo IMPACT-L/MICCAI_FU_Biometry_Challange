@@ -159,6 +159,27 @@ class KeypointDataset(Dataset):
         cropped_coords[:, 1] -= float(y0)
         return cropped_image, cropped_coords
 
+    def _apply_transforms(
+        self,
+        image: np.ndarray,
+        coords_px: np.ndarray,
+    ) -> tuple[torch.Tensor | np.ndarray, np.ndarray]:
+        if self.transforms is None:
+            return image, coords_px
+
+        has_keypoint_support = bool(
+            getattr(self.transforms, "processors", None)
+            and "keypoints" in self.transforms.processors
+        )
+        if not has_keypoint_support:
+            augmented = self.transforms(image=image)
+            return augmented["image"], coords_px
+
+        keypoints = [tuple(map(float, point)) for point in coords_px.tolist()]
+        augmented = self.transforms(image=image, keypoints=keypoints)
+        transformed_points = np.array(augmented["keypoints"], dtype=np.float32).reshape(-1, 2)
+        return augmented["image"], transformed_points
+
     def __getitem__(self, idx: int) -> dict:
         total = len(self)
         if total == 0:
@@ -211,11 +232,8 @@ class KeypointDataset(Dataset):
             coords_px=label_points,
             input_size=self.input_size,
         )
+        image, transformed_points = self._apply_transforms(image, transformed_points)
         transformed_label = transformed_points.reshape(-1).astype(np.float32)
-
-        if self.transforms:
-            augmented = self.transforms(image=image)
-            image = augmented["image"]
 
         transformed_label[0::2] /= max(float(self.input_size - 1), 1.0)
         transformed_label[1::2] /= max(float(self.input_size - 1), 1.0)
