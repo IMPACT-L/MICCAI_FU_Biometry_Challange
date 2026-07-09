@@ -55,6 +55,18 @@ python3 scripts/prepare_fu_biometry_dataset.py \
   --image-mode copy
 ```
 
+Audit the prepared dataset against the organizer notes and current validation manifest:
+
+```bash
+python scripts/audit_challenge_dataset.py
+```
+
+This audit verifies:
+- expected training CSV row counts and landmark counts
+- validation manifest total (`619`) and per-task counts, including `FUGC=20`
+- absence of duplicate validation entries
+- FA point-order sanity after the organizer-requested fix path
+
 ## Notes
 
 - The script assumes the raw archive already contains the official CSV files and image folders.
@@ -130,12 +142,15 @@ Comparable saved runs:
 | `dinov3_vitb_taskfpn_grouped_serverproxy_v1` | `11.349361` | `27.36` |
 | `dinov3_vitb_taskfpn_grouped_serverproxy_v2_a4c` | `NA` | `27.47` |
 | `dinov3_vitb_taskfpn_grouped_serverproxy_v1_balanced_ft` | `NA` | `28.31` |
+| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_recovery` | `NA` | `28.31` |
 | `dinov3_vitb_taskfpn_localrefine_v1_robustdomain_v1` | `6.869928` | `28.86` |
+| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_ivc_refine` | `NA` | `29.56` |
+| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_fa_fixed_nosplits` | `24.389033` | `32.67` |
 | `dinov3_vitb_taskfpn_pseudodomain_robust_uniform_v1` | `NA` | `34.69` |
 | `vitlarge_dinov3_taskfpn_v1` | `11.004783` | `29.88` |
 | `vitlarge_dinov3_taskfpn_grouped_strongaug_v1` | `11.019315` | `35.68` |
 
-The current comparison shows the exact gap we care about: the best hidden-validation result still did not come from the lowest local `MRE`, and even the more aggressive pseudo-domain robustness branch regressed badly on the public server. Future runs should therefore be judged with grouped validation and server-proxy style checkpointing rather than local mean `MRE` alone.
+The current comparison shows the exact gap we care about: the best hidden-validation result still did not come from the lowest local `MRE`, and even the more aggressive pseudo-domain robustness branch regressed badly on the public server. Excluding detected split-screen cardiac rows was also strongly harmful, despite the test set containing no split-screen images. Future runs should therefore be judged with grouped validation and server-proxy style checkpointing rather than local mean `MRE` alone.
 
 Best full training run:
 
