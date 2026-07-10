@@ -707,6 +707,8 @@ def main(
     init_checkpoint: str | None = None,
     train_task_ids: list[str] | None = None,
     measurement_loss_weight: float = 0.0,
+    measurement_loss_tasks: set[str] | None = None,
+    measurement_task_weight_overrides: dict[str, float] | None = None,
     dataset_loss_weight: float = 0.0,
     femur_shaft_loss_weight: float = FEMUR_SHAFT_LOSS_WEIGHT,
     fugc_segment_loss_weight: float = FUGC_SEGMENT_LOSS_WEIGHT,
@@ -748,6 +750,8 @@ def main(
                 "checkpoint_score_mode": checkpoint_score_mode,
                 "cardiac_split_screen_mode": cardiac_split_screen_mode,
                 "measurement_loss_weight": measurement_loss_weight,
+                "measurement_loss_tasks": sorted(measurement_loss_tasks) if measurement_loss_tasks else [],
+                "measurement_task_weight_overrides": measurement_task_weight_overrides or {},
                 "dataset_loss_weight": dataset_loss_weight,
                 "femur_shaft_loss_weight": femur_shaft_loss_weight,
                 "fugc_segment_loss_weight": fugc_segment_loss_weight,
@@ -769,6 +773,13 @@ def main(
         checkpoint_score_mode = str(profile_config["checkpoint_score_mode"])
         cardiac_split_screen_mode = str(profile_config["cardiac_split_screen_mode"])
         measurement_loss_weight = float(profile_config["measurement_loss_weight"])
+        if profile_config.get("measurement_loss_tasks"):
+            measurement_loss_tasks = {str(task_id) for task_id in profile_config["measurement_loss_tasks"]}
+        if profile_config.get("measurement_task_weight_overrides"):
+            measurement_task_weight_overrides = {
+                str(task_id): float(weight)
+                for task_id, weight in profile_config["measurement_task_weight_overrides"].items()
+            }
         dataset_loss_weight = float(profile_config["dataset_loss_weight"])
         femur_shaft_loss_weight = float(profile_config["femur_shaft_loss_weight"])
         fugc_segment_loss_weight = float(profile_config["fugc_segment_loss_weight"])
@@ -860,6 +871,8 @@ def main(
     logger.info(f"Init checkpoint: {init_checkpoint if init_checkpoint else 'none'}")
     logger.info(f"Train task IDs: {train_task_ids if train_task_ids else 'all'}")
     logger.info(f"Measurement loss weight: {measurement_loss_weight:.6f}")
+    logger.info(f"Measurement loss tasks: {sorted(measurement_loss_tasks) if measurement_loss_tasks else 'all-enabled'}")
+    logger.info(f"Measurement task weights override: {measurement_task_weight_overrides or {}}")
     logger.info(f"Dataset-specific loss weight: {dataset_loss_weight:.6f}")
     logger.info(f"Femur shaft loss weight: {femur_shaft_loss_weight:.6f}")
     logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
@@ -883,9 +896,6 @@ def main(
     effective_checkpoint_task_weights = dict(CHECKPOINT_TASK_WEIGHTS)
     if checkpoint_task_weight_overrides:
         effective_checkpoint_task_weights.update(checkpoint_task_weight_overrides)
-    logger.info(f"Task loss weights: {effective_task_loss_weights}")
-    logger.info(f"Checkpoint task weights: {effective_checkpoint_task_weights}")
-    logger.info(f"Sampler task weights override: {sampler_task_weight_overrides or {}}")
 
     logger.info(
         f"FPN neck: {'ENABLED' if use_fpn else 'DISABLED'} "
@@ -936,6 +946,19 @@ def main(
 
     task_configs = _build_task_configs(temp_dataset.dataframe)
     task_id_to_name = {cfg["task_id"]: cfg["task_name"] for cfg in task_configs}
+    effective_measurement_task_weights = {cfg["task_id"]: 1.0 for cfg in task_configs}
+    if measurement_task_weight_overrides:
+        effective_measurement_task_weights.update(measurement_task_weight_overrides)
+    enabled_measurement_task_ids = (
+        set(measurement_loss_tasks)
+        if measurement_loss_tasks is not None
+        else set(effective_measurement_task_weights.keys())
+    )
+    logger.info(f"Task loss weights: {effective_task_loss_weights}")
+    logger.info(f"Effective measurement task weights: {effective_measurement_task_weights}")
+    logger.info(f"Enabled measurement task IDs: {sorted(enabled_measurement_task_ids)}")
+    logger.info(f"Checkpoint task weights: {effective_checkpoint_task_weights}")
+    logger.info(f"Sampler task weights override: {sampler_task_weight_overrides or {}}")
     effective_sampler_task_weights = {cfg["task_id"]: 1.0 for cfg in task_configs}
     if sampler_task_weight_overrides:
         effective_sampler_task_weights.update(sampler_task_weight_overrides)
@@ -1146,6 +1169,11 @@ def main(
                             [batch["meta"][i] for i in task_indices],
                             current_task_id,
                         )
+                        measurement_task_weight = 0.0
+                        if current_task_id in enabled_measurement_task_ids:
+                            measurement_task_weight = float(
+                                effective_measurement_task_weights.get(current_task_id, 1.0)
+                            )
                         dataset_specific_loss = compute_dataset_specific_loss(
                             pred_coords_original,
                             target_coords_original,
@@ -1177,7 +1205,7 @@ def main(
                         base_loss = (
                             heatmap_loss
                             + 0.2 * coord_loss
-                            + measurement_loss_weight * measurement_loss
+                            + (measurement_loss_weight * measurement_task_weight) * measurement_loss
                             + dataset_loss_weight * dataset_specific_loss
                             + femur_shaft_loss_weight * femur_shaft_loss
                             + fugc_segment_loss_weight * fugc_segment_loss
@@ -1391,6 +1419,8 @@ def main(
                             "heatmap_size": list(HEATMAP_SIZE),
                             "checkpoint_metric": metric_label,
                             "measurement_loss_weight": measurement_loss_weight,
+                            "measurement_loss_tasks": sorted(enabled_measurement_task_ids),
+                            "measurement_task_weight_overrides": measurement_task_weight_overrides or {},
                             "dataset_loss_weight": dataset_loss_weight,
                             "femur_shaft_loss_weight": femur_shaft_loss_weight,
                             "fugc_segment_loss_weight": fugc_segment_loss_weight,
@@ -1653,6 +1683,18 @@ if __name__ == "__main__":
         help="Auxiliary measurement loss weight. Use 0.0 for the task-weighted baseline.",
     )
     parser.add_argument(
+        "--measurement-loss-tasks",
+        type=str,
+        default=None,
+        help="Optional comma-separated task IDs that should receive measurement supervision.",
+    )
+    parser.add_argument(
+        "--measurement-task-weights",
+        type=str,
+        default=None,
+        help="Optional comma-separated TASK=VALUE overrides for per-task measurement supervision weight.",
+    )
+    parser.add_argument(
         "--dataset-loss-weight",
         type=float,
         default=0.0,
@@ -1766,6 +1808,8 @@ if __name__ == "__main__":
         init_checkpoint=args.init_checkpoint,
         train_task_ids=_parse_task_id_csv(args.train_task_ids),
         measurement_loss_weight=float(args.measurement_loss_weight),
+        measurement_loss_tasks=_parse_task_id_set_csv(args.measurement_loss_tasks),
+        measurement_task_weight_overrides=_parse_weight_csv(args.measurement_task_weights),
         dataset_loss_weight=float(args.dataset_loss_weight),
         femur_shaft_loss_weight=float(args.femur_shaft_loss_weight),
         fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),

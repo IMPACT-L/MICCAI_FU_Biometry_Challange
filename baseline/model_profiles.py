@@ -109,6 +109,50 @@ MODEL_PROFILES = {
             "task_adapter_profile": "coarse_refine_v1",
         },
     },
+    "hidden_context_measure_v1": {
+        "description": (
+            "Winning hidden-context adapter family with conservative targeted measurement "
+            "supervision on geometry-sensitive tasks only."
+        ),
+        "train": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "input_size": 512,
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "head_type": "deep",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "uniform",
+            "task_adapter_profile": "coarse_refine_v1",
+            "task_loss_family_profile": "uniform",
+            "split_mode": "grouped",
+            "augmentation_profile": "baseline",
+            "checkpoint_score_mode": "server_proxy_v1",
+            "cardiac_split_screen_mode": "keep",
+            "measurement_loss_weight": 0.01,
+            "measurement_loss_tasks": ["FA", "HC", "IVC", "PLAX", "fetal_femur"],
+            "measurement_task_weight_overrides": {
+                "FA": 1.10,
+                "HC": 1.20,
+                "IVC": 1.40,
+                "PLAX": 0.80,
+                "fetal_femur": 0.80,
+            },
+            "dataset_loss_weight": 0.0,
+            "femur_shaft_loss_weight": 0.15,
+            "fugc_segment_loss_weight": 0.08,
+            "ivc_band_loss_weight": 0.0,
+        },
+        "inference": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "uniform",
+            "task_adapter_profile": "coarse_refine_v1",
+        },
+    },
 }
 
 MODEL_PROFILE_NAMES = tuple(sorted(MODEL_PROFILES.keys()))
