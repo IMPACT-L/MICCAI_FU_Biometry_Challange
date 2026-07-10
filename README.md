@@ -104,28 +104,37 @@ Dedicated-head documentation:
 
 Current best public submission so far:
 
-- Run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1`
-- CodaBench rank: `17`
-- Submission ID: `832817`
-- Overall score: `27.36`
+- Run: `dinov3_vitb_taskfpn_hidden_context_measure_seed42_soft`
+- CodaBench rank: `16`
+- Submission ID: `838695`
+- Overall score: `26.43`
 
 Current second-best public submission so far:
 
-- Run: `dinov3_vitb_taskfpn_grouped_serverproxy_v2_a4c`
-- CodaBench rank: `18`
-- Submission ID: `834123`
-- Overall score: `27.47`
+- Run: `dinov3_vitb_taskfpn_hidden_context_ft_seed7`
+- CodaBench rank: `16`
+- Submission ID: `837762`
+- Overall score: `26.45`
 
 Best local validation run so far:
 
 - Run: `vitlarge_dinov3_taskfpn_v1`
 - Backbone: `vit_large_patch16_dinov3`
 - Local average `MRE`: `11.004783`
-- Best known server-oriented run:
-  - run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1`
-  - local average `MRE`: `11.349361`
-  - CodaBench rank: `17`
-  - overall score: `27.36`
+
+Best known server-oriented family so far:
+
+- Backbone: `vit_base_patch16_dinov3`
+- Neck: task-specific `FPN`
+- Head sizing: `challenge_v1`
+- Decoder: `uniform`
+- Adapter: `coarse_refine_v1`
+- Split: `grouped`
+- Augmentation: `baseline`
+- Checkpoint score: `server_proxy_v1`
+- Best hidden-set variant so far:
+  - run: `dinov3_vitb_taskfpn_hidden_context_measure_seed42_soft`
+  - overall score: `26.43`
 
 Current read of the results:
 
@@ -133,24 +142,25 @@ Current read of the results:
 - Grouped validation and proxy-based checkpoint selection improved server behavior more than simply pushing local MRE lower.
 - Pure local average `MRE` is not enough for model selection; the hidden server distribution is different enough that lower local error can still submit worse.
 - The current evidence supports a server-oriented proxy score more than any single-task rule.
-- The current best direction is `vit_base_patch16_dinov3` with task-specific FPN, grouped split, baseline augmentation, and server-oriented checkpoint selection.
+- The current best direction is the `hidden_context` family: `vit_base_patch16_dinov3` with task-specific FPN, grouped split, baseline augmentation, `coarse_refine_v1` adapters, and server-oriented checkpoint selection.
+- A small targeted measurement term can help slightly, but only when it is softened carefully. The stronger/default measurement variant regressed.
 
 Comparable saved runs:
 
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
+| `dinov3_vitb_taskfpn_hidden_context_measure_seed42_soft` | `NA` | `26.43` |
+| `dinov3_vitb_taskfpn_hidden_context_ft_seed7` | `NA` | `26.45` |
+| `dinov3_vitb_taskfpn_hidden_context_ft_v1` | `NA` | `26.62` |
+| `dinov3_vitb_taskfpn_hidden_context_ft_seed73` | `NA` | `26.86` |
+| `dinov3_vitb_taskfpn_hidden_cluster_ft_seed7` | `8.436502` | `27.03` |
+| `dinov3_vitb_taskfpn_hidden_context_ft_seed42` | `NA` | `27.53` |
+| `dinov3_vitb_taskfpn_hidden_context_measure_v1` | `NA` | `28.32` |
 | `dinov3_vitb_taskfpn_grouped_serverproxy_v1` | `11.349361` | `27.36` |
-| `dinov3_vitb_taskfpn_grouped_serverproxy_v2_a4c` | `NA` | `27.47` |
-| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_balanced_ft` | `NA` | `28.31` |
-| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_recovery` | `NA` | `28.31` |
-| `dinov3_vitb_taskfpn_localrefine_v1_robustdomain_v1` | `6.869928` | `28.86` |
-| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_ivc_refine` | `NA` | `29.56` |
-| `dinov3_vitb_taskfpn_grouped_serverproxy_v1_fa_fixed_nosplits` | `24.389033` | `32.67` |
-| `dinov3_vitb_taskfpn_pseudodomain_robust_uniform_v1` | `NA` | `34.69` |
 | `vitlarge_dinov3_taskfpn_v1` | `11.004783` | `29.88` |
 | `vitlarge_dinov3_taskfpn_grouped_strongaug_v1` | `11.019315` | `35.68` |
 
-The current comparison shows the exact gap we care about: the best hidden-validation result still did not come from the lowest local `MRE`, and even the more aggressive pseudo-domain robustness branch regressed badly on the public server. Excluding detected split-screen cardiac rows was also strongly harmful, despite the test set containing no split-screen images. Future runs should therefore be judged with grouped validation and server-proxy style checkpointing rather than local mean `MRE` alone.
+The current comparison still shows the exact gap we care about: the best hidden-validation result still did not come from the lowest local `MRE`, and broad robustness or augmentation changes usually regressed on the public server. Excluding detected split-screen cardiac rows was also strongly harmful, despite the test set containing no split-screen images. Future runs should therefore be judged with grouped validation and server-proxy style checkpointing rather than local mean `MRE` alone.
 
 Best full training run:
 
@@ -167,7 +177,7 @@ python baseline/train.py \
   --output-dir output/runs/dinov3_vitb_taskfpn
 ```
 
-Current best server-oriented training run:
+Current best server-oriented training run before hidden-set fine-tuning:
 
 ```bash
 conda activate miccai_fu_biometry
@@ -186,6 +196,46 @@ python baseline/train.py \
   --augmentation-profile baseline \
   --checkpoint-score-mode server_proxy_v1 \
   --output-dir output/runs/dinov3_vitb_taskfpn_grouped_serverproxy_v1
+```
+
+Current best hidden-set fine-tuning run:
+
+```bash
+conda activate miccai_fu_biometry
+
+python baseline/train.py \
+  --model-profile hidden_context_ft_v1 \
+  --seed 7 \
+  --epochs 2000 \
+  --early-stopping-patience 10 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --learning-rate 5e-5 \
+  --init-checkpoint output/runs/dinov3_vitb_taskfpn_grouped_serverproxy_v1/checkpoints/best_model.pth \
+  --task-loss-weights A4C=1.25,AOP=1.00,FA=1.15,FUGC=1.00,HC=1.35,IVC=1.35,PLAX=1.10,PSAX=1.10,fetal_femur=1.30 \
+  --sampler-task-weights AOP=1.20,FA=1.20,HC=1.40,IVC=1.40,fetal_femur=1.25 \
+  --output-dir output/runs/dinov3_vitb_taskfpn_hidden_context_ft_seed7
+```
+
+Current best hidden-set measurement-tuned run:
+
+```bash
+conda activate miccai_fu_biometry
+
+python baseline/train.py \
+  --model-profile hidden_context_measure_v1 \
+  --seed 42 \
+  --epochs 2000 \
+  --early-stopping-patience 10 \
+  --batch-size 4 \
+  --num-workers 4 \
+  --learning-rate 2e-5 \
+  --init-checkpoint output/runs/dinov3_vitb_taskfpn_hidden_context_ft_seed7/checkpoints/best_model.pth \
+  --measurement-loss-weight 0.008 \
+  --measurement-task-weights FA=1.00,HC=1.15,IVC=1.30,PLAX=0.70,fetal_femur=0.70 \
+  --task-loss-weights A4C=1.20,AOP=1.00,FA=1.15,FUGC=1.00,HC=1.40,IVC=1.40,PLAX=1.10,PSAX=1.10,fetal_femur=1.35 \
+  --sampler-task-weights AOP=1.15,FA=1.20,HC=1.45,IVC=1.45,fetal_femur=1.30 \
+  --output-dir output/runs/dinov3_vitb_taskfpn_hidden_context_measure_seed42_soft
 ```
 
 Best large-backbone training run:
@@ -245,7 +295,7 @@ python submit.py \
   --num-workers 4
 ```
 
-Current best server submission package:
+Current best server submission package before hidden-set fine-tuning:
 
 ```bash
 conda activate miccai_fu_biometry
@@ -262,6 +312,19 @@ python submit.py \
   --task-decoder-profile uniform \
   --task-adapter-profile uniform \
   --fpn-mode task_specific
+```
+
+Current best hidden-set submission package:
+
+```bash
+conda activate miccai_fu_biometry
+
+python submit.py \
+  --checkpoint-path output/runs/dinov3_vitb_taskfpn_hidden_context_measure_seed42_soft/checkpoints/best_model.pth \
+  --output-dir output/submissions/dinov3_vitb_taskfpn_hidden_context_measure_seed42_soft \
+  --batch-size 8 \
+  --num-workers 4 \
+  --model-profile hidden_context_measure_v1
 ```
 
 Large-backbone submission package:
@@ -312,9 +375,9 @@ Current weak-task order from local evaluation of `dinov3_vitb_taskfpn`:
 The current baseline is improved and challenge-compliant, but it is still far from the top leaderboard cluster. We will follow this order for the next round of work:
 
 1. Keep server-oriented checkpoint selection and grouped validation as the default path for new runs.
-2. Prioritize the hard tasks that still show unstable hidden-set transfer, especially `A4C`, `IVC`, and `HC`.
-3. Improve `IVC` and `AOP` without sacrificing current strengths in `FUGC`, `fetal_femur`, and `PLAX`.
-4. Continue testing ViT-B variants before returning to larger backbones, since ViT-L improved local MRE but did not yet beat the best server result.
+2. Keep the winning hidden-context family fixed: ViT-B DINOv3, task-specific FPN, `challenge_v1`, `uniform` decoder, `coarse_refine_v1` adapter.
+3. Explore only nearby variants around the current best soft measurement run, not broader decoder or augmentation changes.
+4. Prioritize the hard tasks that still show unstable hidden-set transfer, especially `A4C`, `IVC`, and `HC`.
 5. Add stronger local audit tooling so model selection is based on server-predictive task behavior, not mean local MRE alone.
 
 ## Why this plan
@@ -323,6 +386,8 @@ The current baseline is improved and challenge-compliant, but it is still far fr
 - The best server result so far came from a model chosen with grouped validation and proxy-based checkpoint selection, not from the best local average MRE.
 - The current saved comparisons are still too small to justify a strict single-task rule; the safer conclusion is that validation split design and checkpoint score policy matter more than raw local leaderboard position.
 - Broad all-head specialization has repeatedly hurt server generalization, while cleaner shared decoding with task-specific FPN has been more reliable.
+- The `coarse_refine_v1` context adapter is the first architecture-side change that consistently improved hidden validation.
+- Measurement supervision is only useful when applied conservatively; the default/stronger variant regressed while the softer targeted variant produced the current best run.
 
 ## Audit scripts
 

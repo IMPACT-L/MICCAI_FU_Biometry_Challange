@@ -516,7 +516,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "taskfilm_v1"),
         default=None,
         help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )

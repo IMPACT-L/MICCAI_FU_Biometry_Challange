@@ -1098,6 +1098,8 @@ def main(
         param_groups.append({"params": model.local_refine_adapters.parameters(), "lr": learning_rate * 5.0})
     if getattr(model, "context_adapters", None) is not None:
         param_groups.append({"params": model.context_adapters.parameters(), "lr": learning_rate * 5.0})
+    if getattr(model, "context_expert_adapters", None) is not None:
+        param_groups.append({"params": model.context_expert_adapters.parameters(), "lr": learning_rate * 5.0})
     if getattr(model, "task_film_adapters", None) is not None:
         param_groups.append({"params": model.task_film_adapters.parameters(), "lr": learning_rate * 5.0})
     for task_id, head in model.heads.items():
@@ -1619,7 +1621,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "taskfilm_v1"),
         default=TASK_ADAPTER_PROFILE,
         help=f"Task-specific feature adapter profile (default: {TASK_ADAPTER_PROFILE}).",
     )

@@ -60,6 +60,17 @@ TASK_ADAPTER_PROFILE_PRESETS = {
         "PSAX": "PSAX",
         "fetal_femur": "fetal_femur",
     },
+    "context_experts_v1": {
+        "A4C": "hard",
+        "HC": "hard",
+        "IVC": "hard",
+        "PLAX": "hard",
+        "PSAX": "hard",
+        "AOP": "medium",
+        "FA": "medium",
+        "FUGC": "light",
+        "fetal_femur": "light",
+    },
 }
 TASK_HEAD_PROFILE_PRESETS = {
     "uniform": {},
@@ -364,6 +375,72 @@ class TaskFiLMAdapter(nn.Module):
         modulated = gamma * features + beta
         delta = self.out(modulated)
         return x + self.residual_scale * gate * delta
+
+
+class ContextExpertsAdapter(nn.Module):
+    """Residual context mixer with capacity matched to task difficulty groups."""
+
+    def __init__(self, channels: int, group_names: list[str]):
+        super().__init__()
+        hidden = max(channels, 192)
+        self.shared = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+
+        self.group_blocks = nn.ModuleDict()
+        for group_name in group_names:
+            if group_name == "hard":
+                expert_hidden = max(int(channels * 1.5), 320)
+                block = nn.Sequential(
+                    nn.Conv2d(channels, expert_hidden, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(expert_hidden),
+                    nn.GELU(),
+                    nn.Conv2d(expert_hidden, expert_hidden, kernel_size=3, padding=2, dilation=2, bias=False),
+                    nn.BatchNorm2d(expert_hidden),
+                    nn.GELU(),
+                    nn.Conv2d(expert_hidden, expert_hidden, kernel_size=3, padding=4, dilation=4, bias=False),
+                    nn.BatchNorm2d(expert_hidden),
+                    nn.GELU(),
+                    nn.Conv2d(expert_hidden, channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                )
+            elif group_name == "medium":
+                expert_hidden = max(channels, 224)
+                block = nn.Sequential(
+                    nn.Conv2d(channels, expert_hidden, kernel_size=3, padding=1, bias=False),
+                    nn.BatchNorm2d(expert_hidden),
+                    nn.GELU(),
+                    nn.Conv2d(expert_hidden, expert_hidden, kernel_size=3, padding=2, dilation=2, bias=False),
+                    nn.BatchNorm2d(expert_hidden),
+                    nn.GELU(),
+                    nn.Conv2d(expert_hidden, channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                )
+            else:
+                expert_hidden = max(channels // 2, 128)
+                block = nn.Sequential(
+                    nn.Conv2d(channels, expert_hidden, kernel_size=3, padding=1, groups=max(channels // 32, 1), bias=False),
+                    nn.BatchNorm2d(expert_hidden),
+                    nn.GELU(),
+                    nn.Conv2d(expert_hidden, channels, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                )
+            self.group_blocks[group_name] = block
+
+        self.shared_scale = nn.Parameter(torch.tensor(0.60))
+        self.group_scale = nn.ParameterDict(
+            {group_name: nn.Parameter(torch.tensor(0.40)) for group_name in group_names}
+        )
+
+    def forward(self, x: torch.Tensor, group_name: str | None) -> torch.Tensor:
+        shared_delta = self.shared(x)
+        if group_name is None or group_name not in self.group_blocks:
+            return x + self.shared_scale * shared_delta
+        return x + self.shared_scale * shared_delta + self.group_scale[group_name] * self.group_blocks[group_name](x)
 
 
 class LandmarkGraphRefineBlock(nn.Module):
@@ -2005,6 +2082,7 @@ class MultiTaskModelFactory(nn.Module):
         self.local_refine_adapters = None
         self.context_adapters = None
         self.task_film_adapters = None
+        self.context_expert_adapters = None
         head_channels = self.encoder.out_channels
         if use_fpn:
             if fpn_mode not in FPN_MODES:
@@ -2045,6 +2123,8 @@ class MultiTaskModelFactory(nn.Module):
             self.local_refine_adapters = LocalRefineAdapter(head_channels, active_groups)
         elif task_adapter_profile == "coarse_refine_v1" and active_groups:
             self.context_adapters = ResidualContextAdapter(head_channels, active_groups)
+        elif task_adapter_profile == "context_experts_v1" and active_groups:
+            self.context_expert_adapters = ContextExpertsAdapter(head_channels, active_groups)
         elif task_adapter_profile == "taskfilm_v1" and active_groups:
             self.task_film_adapters = TaskFiLMAdapter(head_channels, active_groups)
         decoder_family_to_head = {
@@ -2123,6 +2203,9 @@ class MultiTaskModelFactory(nn.Module):
         if self.context_adapters is not None:
             adapter_group = self.task_to_adapter_group.get(task_id)
             features = self.context_adapters(features, adapter_group)
+        if self.context_expert_adapters is not None:
+            adapter_group = self.task_to_adapter_group.get(task_id)
+            features = self.context_expert_adapters(features, adapter_group)
         if self.task_film_adapters is not None:
             adapter_group = self.task_to_adapter_group.get(task_id)
             features = self.task_film_adapters(features, adapter_group)

@@ -283,7 +283,7 @@ def main():
     parser.add_argument(
         "--task-adapter-profile",
         default=None,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "taskfilm_v1"),
         help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
