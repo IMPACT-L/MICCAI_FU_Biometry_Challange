@@ -36,6 +36,79 @@ MODEL_PROFILES = {
             "task_adapter_profile": "uniform",
         },
     },
+    "hidden_localrefine_ft_v1": {
+        "description": (
+            "Best stable hidden-transfer recipe with task-specific local image-detail "
+            "adapters enabled. This reruns the earlier promising localrefine path after "
+            "fixing adapter optimizer registration."
+        ),
+        "train": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "input_size": 512,
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "head_type": "deep",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "uniform",
+            "task_adapter_profile": "localrefine_v1",
+            "task_loss_family_profile": "uniform",
+            "split_mode": "grouped",
+            "augmentation_profile": "baseline",
+            "checkpoint_score_mode": "server_proxy_v1",
+            "cardiac_split_screen_mode": "keep",
+            "measurement_loss_weight": 0.0,
+            "dataset_loss_weight": 0.0,
+            "femur_shaft_loss_weight": 0.15,
+            "fugc_segment_loss_weight": 0.08,
+            "ivc_band_loss_weight": 0.0,
+        },
+        "inference": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "uniform",
+            "task_adapter_profile": "localrefine_v1",
+        },
+    },
+    "hidden_context_ft_v1": {
+        "description": (
+            "Best stable hidden-transfer recipe with residual context adapters enabled. "
+            "This is the post-fix rerun of the earlier coarse_refine adapter line."
+        ),
+        "train": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "input_size": 512,
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "head_type": "deep",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "uniform",
+            "task_adapter_profile": "coarse_refine_v1",
+            "task_loss_family_profile": "uniform",
+            "split_mode": "grouped",
+            "augmentation_profile": "baseline",
+            "checkpoint_score_mode": "server_proxy_v1",
+            "cardiac_split_screen_mode": "keep",
+            "measurement_loss_weight": 0.0,
+            "dataset_loss_weight": 0.0,
+            "femur_shaft_loss_weight": 0.15,
+            "fugc_segment_loss_weight": 0.08,
+            "ivc_band_loss_weight": 0.0,
+        },
+        "inference": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "uniform",
+            "task_adapter_profile": "coarse_refine_v1",
+        },
+    },
 }
 
 MODEL_PROFILE_NAMES = tuple(sorted(MODEL_PROFILES.keys()))
