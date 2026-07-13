@@ -11,6 +11,8 @@
 \usepackage{url}
 \usepackage{hyperref}
 \usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc}
 
 \hypersetup{
   colorlinks=true,
@@ -71,8 +73,52 @@ Our unified framework uses a shared pretrained DINOv3 encoder, followed by eithe
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\textwidth]{assets/method_overview_generated_v1.png}
-  \caption{Method overview of the proposed multi-domain ultrasound biometry model. A shared DINOv3 encoder is followed by task-specific feature pyramids, task-conditioned heatmap decoding, soft-argmax coordinate extraction, learned offset refinement, and measurement derivation, with canonical ordering enforced for paired-landmark tasks.}
+  \resizebox{\textwidth}{!}{%
+  \begin{tikzpicture}[
+    font=\scriptsize,
+    node distance=0.95cm and 0.7cm,
+    block/.style={draw, rounded corners=2pt, align=center, minimum width=2.35cm, minimum height=0.78cm, fill=blue!5},
+    process/.style={draw, rounded corners=2pt, align=center, minimum width=2.5cm, minimum height=0.78cm, fill=orange!8},
+    head/.style={draw, rounded corners=2pt, align=left, minimum width=3.8cm, minimum height=1.05cm, fill=green!7},
+    outputbox/.style={draw, rounded corners=2pt, align=center, minimum width=2.55cm, minimum height=0.78cm, fill=gray!8},
+    arrow/.style={-{Latex[length=2.2mm]}, thick}
+  ]
+    \node[block] (input) {Ultrasound image\\task id};
+    \node[process, right=of input] (prep) {Letterbox resize\\$512\times512$};
+    \node[block, right=of prep] (encoder) {Shared DINOv3\\ViT-B encoder};
+    \node[process, right=of encoder] (fpn) {Task-specific FPN\\multi-scale detail};
+    \node[process, right=of fpn] (adapter) {Context-local\\task adapters};
+
+    \node[head, above right=0.75cm and 0.75cm of adapter] (special) {
+      Geometry heads\\
+      A4C: cardiac graph, 16 pts\\
+      HC: compact refine, 4 pts\\
+      IVC: band refine, 2 pts\\
+      FUGC: segment refine, 2 pts
+    };
+    \node[head, below right=0.75cm and 0.75cm of adapter] (offset) {
+      Offset heatmap heads\\
+      AOP/FA/PLAX/PSAX/femur\\
+      $128\times128$ heatmaps\\
+      learned $(\Delta x,\Delta y)$ offsets
+    };
+
+    \node[process, right=1.0cm of $(special.east)!0.5!(offset.east)$] (decode) {Soft-argmax\\+ offset refinement};
+    \node[outputbox, right=of decode] (canon) {Canonical point\\ordering};
+    \node[outputbox, right=of canon] (json) {Landmarks,\\measurements, JSON};
+
+    \draw[arrow] (input) -- (prep);
+    \draw[arrow] (prep) -- (encoder);
+    \draw[arrow] (encoder) -- (fpn);
+    \draw[arrow] (fpn) -- (adapter);
+    \draw[arrow] (adapter.east) -- ++(0.35,0) |- (special.west);
+    \draw[arrow] (adapter.east) -- ++(0.35,0) |- (offset.west);
+    \draw[arrow] (special.east) -- ++(0.35,0) |- (decode.west);
+    \draw[arrow] (offset.east) -- ++(0.35,0) |- (decode.west);
+    \draw[arrow] (decode) -- (canon);
+    \draw[arrow] (canon) -- (json);
+  \end{tikzpicture}}
+  \caption{Final single-model architecture used in this study. The model keeps one shared DINOv3 ViT-B encoder, uses task-specific FPNs and context-local adapters, predicts high-resolution heatmaps, and refines coordinates with learned offsets. Geometry-specific heads are used only for the subsets where landmark structure requires it, while the remaining tasks use stable offset heatmap decoders.}
   \label{fig:overview}
 \end{figure}
 
