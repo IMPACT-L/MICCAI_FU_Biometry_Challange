@@ -469,6 +469,77 @@ def build_line_mask_from_transformed_coords(
     return torch.from_numpy(np.stack(masks, axis=0)).unsqueeze(1).to(coords.device, dtype=coords.dtype)
 
 
+def build_structure_mask_from_transformed_coords(
+    coords: torch.Tensor,
+    heatmap_size: tuple[int, int],
+    task_id: str,
+    thickness: int = 3,
+) -> torch.Tensor:
+    height, width = int(heatmap_size[0]), int(heatmap_size[1])
+    coords_np = coords.detach().cpu().numpy().reshape(coords.shape[0], -1, 2)
+    pairs = MEASUREMENT_PAIRS.get(task_id)
+    if not pairs:
+        pairs = [(idx, idx + 1) for idx in range(max(coords_np.shape[1] - 1, 0))]
+
+    masks = []
+    for sample_points in coords_np:
+        canvas = np.zeros((height, width), dtype=np.float32)
+        for start_idx, end_idx in pairs:
+            if start_idx >= sample_points.shape[0] or end_idx >= sample_points.shape[0]:
+                continue
+            start = sample_points[start_idx]
+            end = sample_points[end_idx]
+            start_xy = (
+                int(round(float(start[0]) * max(width - 1, 1))),
+                int(round(float(start[1]) * max(height - 1, 1))),
+            )
+            end_xy = (
+                int(round(float(end[0]) * max(width - 1, 1))),
+                int(round(float(end[1]) * max(height - 1, 1))),
+            )
+            cv2.line(canvas, start_xy, end_xy, color=1.0, thickness=thickness)
+
+        if sample_points.shape[0] >= 4 and task_id in {"FA", "HC", "PSAX"}:
+            pts = sample_points[:, :2].copy()
+            pts[:, 0] *= max(width - 1, 1)
+            pts[:, 1] *= max(height - 1, 1)
+            center = pts.mean(axis=0)
+            radius = np.linalg.norm(pts - center[None, :], axis=1).mean()
+            if np.isfinite(radius) and radius > 1.0:
+                cv2.circle(
+                    canvas,
+                    (int(round(center[0])), int(round(center[1]))),
+                    int(round(radius)),
+                    color=1.0,
+                    thickness=max(1, thickness // 2),
+                )
+        masks.append(canvas)
+    return torch.from_numpy(np.stack(masks, axis=0)).unsqueeze(1).to(coords.device, dtype=coords.dtype)
+
+
+def compute_structure_map_loss(
+    structure_logits: torch.Tensor | None,
+    target_coords_transformed: torch.Tensor,
+    heatmap_size: tuple[int, int],
+    task_id: str,
+) -> torch.Tensor:
+    if structure_logits is None:
+        return target_coords_transformed.new_tensor(0.0)
+    if task_id == "FUGC":
+        thickness = 2
+    elif task_id in {"A4C", "PLAX"}:
+        thickness = 2
+    else:
+        thickness = 3
+    target_mask = build_structure_mask_from_transformed_coords(
+        target_coords_transformed,
+        heatmap_size=heatmap_size,
+        task_id=task_id,
+        thickness=thickness,
+    )
+    return torch.nn.functional.binary_cross_entropy_with_logits(structure_logits, target_mask)
+
+
 def compute_femur_shaft_loss(
     shaft_logits: torch.Tensor | None,
     target_coords_transformed: torch.Tensor,

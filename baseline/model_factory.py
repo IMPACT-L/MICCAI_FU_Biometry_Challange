@@ -82,6 +82,39 @@ TASK_ADAPTER_PROFILE_PRESETS = {
         "PSAX": "PSAX",
         "fetal_femur": "fetal_femur",
     },
+    "texture_context_v1": {
+        "A4C": "A4C",
+        "AOP": "AOP",
+        "FA": "FA",
+        "FUGC": "FUGC",
+        "HC": "HC",
+        "IVC": "IVC",
+        "PLAX": "PLAX",
+        "PSAX": "PSAX",
+        "fetal_femur": "fetal_femur",
+    },
+    "texture_residual_v1": {
+        "A4C": "A4C",
+        "AOP": "AOP",
+        "FA": "FA",
+        "FUGC": "FUGC",
+        "HC": "HC",
+        "IVC": "IVC",
+        "PLAX": "PLAX",
+        "PSAX": "PSAX",
+        "fetal_femur": "fetal_femur",
+    },
+    "texture_residual_v2": {
+        "A4C": "A4C",
+        "AOP": "AOP",
+        "FA": "FA",
+        "FUGC": "FUGC",
+        "HC": "HC",
+        "IVC": "IVC",
+        "PLAX": "PLAX",
+        "PSAX": "PSAX",
+        "fetal_femur": "fetal_femur",
+    },
 }
 TASK_HEAD_PROFILE_PRESETS = {
     "uniform": {},
@@ -222,6 +255,17 @@ TASK_DECODER_PROFILE_PRESETS = {
         "PLAX": "plax",
         "PSAX": "psax",
         "fetal_femur": "femur",
+    },
+    "structure_v1": {
+        "A4C": "structure_cardiac_graph",
+        "AOP": "structure_offset_deep",
+        "FA": "structure_offset_deep",
+        "FUGC": "structure_fugc",
+        "HC": "structure_hc_refine_offset",
+        "IVC": "structure_ivc_refine_v3",
+        "PLAX": "structure_offset_deep",
+        "PSAX": "structure_offset_deep",
+        "fetal_femur": "structure_femur",
     },
     "geometry_v1": {
         "A4C": "dense",
@@ -567,6 +611,262 @@ class ContextLocalAdapter(nn.Module):
         return mixed + self.local_scale * local_delta
 
 
+class UltrasoundTextureContextAdapter(nn.Module):
+    """Dual-stream adapter that injects raw ultrasound texture and edge evidence.
+
+    DINO features provide semantic context, but ultrasound biometry landmarks often
+    sit on thin boundaries. This adapter builds a high-resolution texture stream
+    from the input image plus Sobel edges and gates it into task-specific features.
+    """
+
+    def __init__(self, feature_channels: int, group_names: list[str], texture_channels: int = 160):
+        super().__init__()
+        self.context = ResidualContextAdapter(feature_channels, group_names)
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
+
+        self.texture_stem = nn.Sequential(
+            nn.Conv2d(7, 40, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(40),
+            nn.GELU(),
+            nn.Conv2d(40, 80, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(80),
+            nn.GELU(),
+            nn.Conv2d(80, 120, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(120),
+            nn.GELU(),
+            nn.Conv2d(120, texture_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(texture_channels),
+            nn.GELU(),
+        )
+        hidden = max(feature_channels, 256)
+        self.shared_fusion = nn.Sequential(
+            nn.Conv2d(feature_channels + texture_channels, hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, hidden, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(hidden),
+            nn.GELU(),
+        )
+        self.group_fusions = nn.ModuleDict(
+            {
+                group_name: nn.Sequential(
+                    nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=max(hidden // 32, 1), bias=False),
+                    nn.BatchNorm2d(hidden),
+                    nn.GELU(),
+                    nn.Conv2d(hidden, hidden, kernel_size=1, bias=False),
+                    nn.BatchNorm2d(hidden),
+                    nn.GELU(),
+                )
+                for group_name in group_names
+            }
+        )
+        self.gate = nn.Sequential(nn.Conv2d(hidden, feature_channels, kernel_size=1), nn.Sigmoid())
+        self.delta = nn.Sequential(
+            nn.Conv2d(hidden, feature_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+        )
+        self.context_scale = nn.Parameter(torch.tensor(0.80))
+        self.texture_scale = nn.Parameter(torch.tensor(0.45))
+
+    def _texture_inputs(self, image: torch.Tensor) -> torch.Tensor:
+        gray = (
+            0.2989 * image[:, 0:1]
+            + 0.5870 * image[:, 1:2]
+            + 0.1140 * image[:, 2:3]
+        )
+        grad_x = F.conv2d(gray, self.sobel_x.to(dtype=image.dtype), padding=1)
+        grad_y = F.conv2d(gray, self.sobel_y.to(dtype=image.dtype), padding=1)
+        grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
+        return torch.cat([image, gray, grad_x, grad_y, grad_mag], dim=1)
+
+    def forward(self, features: torch.Tensor, image: torch.Tensor, group_name: str | None) -> torch.Tensor:
+        context_features = self.context(features, group_name)
+        context_delta = context_features - features
+        mixed = features + self.context_scale * context_delta
+
+        texture = self.texture_stem(self._texture_inputs(image))
+        if texture.shape[-2:] != mixed.shape[-2:]:
+            texture = F.interpolate(texture, size=mixed.shape[-2:], mode="bilinear", align_corners=False)
+
+        hidden = self.shared_fusion(torch.cat([mixed, texture], dim=1))
+        if group_name is not None and group_name in self.group_fusions:
+            hidden = hidden + self.group_fusions[group_name](hidden)
+        gate = self.gate(hidden)
+        delta = self.delta(hidden)
+        return mixed + self.texture_scale * gate * delta
+
+
+class ContextLocalTextureResidualAdapter(nn.Module):
+    """Load-compatible context-local adapter plus a small texture residual.
+
+    This preserves the exact checkpoint key layout for the proven
+    ContextLocalAdapter (`context`, `local`, `context_scale`, `local_scale`) and
+    adds a zero-initialized raw-image texture correction. Warm-started models
+    therefore begin from the old solution instead of relearning the adapter.
+    """
+
+    def __init__(self, feature_channels: int, group_names: list[str], texture_channels: int = 64):
+        super().__init__()
+        self.context = ResidualContextAdapter(feature_channels, group_names)
+        self.local = LocalRefineAdapter(feature_channels, group_names)
+        self.context_scale = nn.Parameter(torch.tensor(0.85))
+        self.local_scale = nn.Parameter(torch.tensor(0.60))
+
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
+
+        self.texture_stem = nn.Sequential(
+            nn.Conv2d(7, 24, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(24),
+            nn.GELU(),
+            nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.GELU(),
+            nn.Conv2d(48, texture_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(texture_channels),
+            nn.GELU(),
+        )
+        self.texture_fusion = nn.Sequential(
+            nn.Conv2d(feature_channels + texture_channels, feature_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.GELU(),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+        )
+        nn.init.zeros_(self.texture_fusion[-1].weight)
+        nn.init.zeros_(self.texture_fusion[-1].bias)
+        self.texture_scale = nn.Parameter(torch.tensor(0.10))
+
+    def _texture_inputs(self, image: torch.Tensor) -> torch.Tensor:
+        gray = (
+            0.2989 * image[:, 0:1]
+            + 0.5870 * image[:, 1:2]
+            + 0.1140 * image[:, 2:3]
+        )
+        grad_x = F.conv2d(gray, self.sobel_x.to(dtype=image.dtype), padding=1)
+        grad_y = F.conv2d(gray, self.sobel_y.to(dtype=image.dtype), padding=1)
+        grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
+        return torch.cat([image, gray, grad_x, grad_y, grad_mag], dim=1)
+
+    def forward(self, features: torch.Tensor, image: torch.Tensor, group_name: str | None) -> torch.Tensor:
+        context_features = self.context(features, group_name)
+        context_delta = context_features - features
+        mixed = features + self.context_scale * context_delta
+
+        refined_features = self.local(mixed, image, group_name)
+        local_delta = refined_features - mixed
+        base = mixed + self.local_scale * local_delta
+
+        texture = self.texture_stem(self._texture_inputs(image))
+        if texture.shape[-2:] != base.shape[-2:]:
+            texture = F.interpolate(texture, size=base.shape[-2:], mode="bilinear", align_corners=False)
+        texture_delta = self.texture_fusion(torch.cat([base, texture], dim=1))
+        return base + self.texture_scale * texture_delta
+
+
+class GatedContextLocalTextureResidualAdapter(nn.Module):
+    """Context-local adapter with conservative task-gated texture residuals.
+
+    Compared with texture_residual_v1, the residual correction is controlled by
+    per-task gates initialized near zero. This keeps the warm-started model
+    stable while allowing ultrasound edge/texture cues to help tasks differently.
+    """
+
+    def __init__(self, feature_channels: int, group_names: list[str], texture_channels: int = 64):
+        super().__init__()
+        self.context = ResidualContextAdapter(feature_channels, group_names)
+        self.local = LocalRefineAdapter(feature_channels, group_names)
+        self.context_scale = nn.Parameter(torch.tensor(0.85))
+        self.local_scale = nn.Parameter(torch.tensor(0.60))
+
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]],
+            dtype=torch.float32,
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x, persistent=False)
+        self.register_buffer("sobel_y", sobel_y, persistent=False)
+
+        self.texture_stem = nn.Sequential(
+            nn.Conv2d(7, 24, kernel_size=5, stride=2, padding=2, bias=False),
+            nn.BatchNorm2d(24),
+            nn.GELU(),
+            nn.Conv2d(24, 48, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(48),
+            nn.GELU(),
+            nn.Conv2d(48, texture_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(texture_channels),
+            nn.GELU(),
+        )
+        self.texture_fusion = nn.Sequential(
+            nn.Conv2d(feature_channels + texture_channels, feature_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.GELU(),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+        )
+        nn.init.zeros_(self.texture_fusion[-1].weight)
+        nn.init.zeros_(self.texture_fusion[-1].bias)
+        self.global_texture_gate = nn.Parameter(torch.tensor(-2.0))
+        self.group_texture_gates = nn.ParameterDict(
+            {group_name: nn.Parameter(torch.tensor(0.0)) for group_name in group_names}
+        )
+        self.max_texture_scale = 0.18
+
+    def _texture_inputs(self, image: torch.Tensor) -> torch.Tensor:
+        gray = (
+            0.2989 * image[:, 0:1]
+            + 0.5870 * image[:, 1:2]
+            + 0.1140 * image[:, 2:3]
+        )
+        grad_x = F.conv2d(gray, self.sobel_x.to(dtype=image.dtype), padding=1)
+        grad_y = F.conv2d(gray, self.sobel_y.to(dtype=image.dtype), padding=1)
+        grad_mag = torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
+        return torch.cat([image, gray, grad_x, grad_y, grad_mag], dim=1)
+
+    def _texture_gate(self, group_name: str | None, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+        gate_logit = self.global_texture_gate
+        if group_name is not None and group_name in self.group_texture_gates:
+            gate_logit = gate_logit + self.group_texture_gates[group_name]
+        gate = self.max_texture_scale * torch.sigmoid(gate_logit)
+        return gate.to(dtype=dtype, device=device).view(1, 1, 1, 1)
+
+    def forward(self, features: torch.Tensor, image: torch.Tensor, group_name: str | None) -> torch.Tensor:
+        context_features = self.context(features, group_name)
+        context_delta = context_features - features
+        mixed = features + self.context_scale * context_delta
+
+        refined_features = self.local(mixed, image, group_name)
+        local_delta = refined_features - mixed
+        base = mixed + self.local_scale * local_delta
+
+        texture = self.texture_stem(self._texture_inputs(image))
+        if texture.shape[-2:] != base.shape[-2:]:
+            texture = F.interpolate(texture, size=base.shape[-2:], mode="bilinear", align_corners=False)
+        texture_delta = self.texture_fusion(torch.cat([base, texture], dim=1))
+        return base + self._texture_gate(group_name, base.dtype, base.device) * texture_delta
+
+
 class LandmarkGraphRefineBlock(nn.Module):
     """Lightweight landmark-relation block for feature-conditioned coordinate refinement."""
 
@@ -781,6 +1081,42 @@ class SubpixelOffsetDeepHeatmapHead(nn.Module):
             "coarse_coords_transformed": coarse_coords,
             "refined_coords_transformed": refined_coords,
         }
+
+
+class StructureAuxiliaryMixin:
+    """Adds a differentiable anatomy-structure map branch to landmark heads."""
+
+    def _init_structure_auxiliary(self, num_points: int, hidden_channels: int = 32) -> None:
+        hidden_channels = max(int(hidden_channels), 16)
+        self.structure_head = nn.Sequential(
+            nn.Conv2d(num_points, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=1),
+        )
+
+    def _append_structure_logits(self, point_logits: torch.Tensor, aux_outputs: dict | None) -> dict:
+        if aux_outputs is None:
+            aux_outputs = {}
+        else:
+            aux_outputs = dict(aux_outputs)
+        aux_outputs["structure_logits"] = self.structure_head(point_logits)
+        return aux_outputs
+
+
+class StructureOffsetDeepHeatmapHead(StructureAuxiliaryMixin, SubpixelOffsetDeepHeatmapHead):
+    """Offset heatmap head regularized by an anatomy structure map."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__(in_channels, num_points, width_multiplier)
+        self._init_structure_auxiliary(num_points=num_points, hidden_channels=max(32, num_points * 4))
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        return point_logits, self._append_structure_logits(point_logits, aux_outputs)
 
 
 class LogitPatchOffsetRefiner(nn.Module):
@@ -2700,6 +3036,60 @@ class PSAXHeatmapHead(nn.Module):
         return x
 
 
+class StructureCardiacGraphRefineHeatmapHead(StructureAuxiliaryMixin, CardiacGraphRefineHeatmapHead):
+    """Cardiac graph head with an auxiliary paired-structure map."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__(in_channels, num_points, width_multiplier)
+        self._init_structure_auxiliary(num_points=num_points, hidden_channels=max(48, num_points * 3))
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        return point_logits, self._append_structure_logits(point_logits, aux_outputs)
+
+
+class StructureHCRefineOffsetHeatmapHead(StructureAuxiliaryMixin, HCRefineOffsetHeatmapHead):
+    """HC refine-offset head with an auxiliary ellipse-diameter structure map."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__(in_channels, num_points, width_multiplier)
+        self._init_structure_auxiliary(num_points=num_points, hidden_channels=32)
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        return point_logits, self._append_structure_logits(point_logits, aux_outputs)
+
+
+class StructureFUGCHeatmapHead(FUGCHeatmapHead):
+    """FUGC head exposing the short-segment map as the generic structure map."""
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        aux_outputs = dict(aux_outputs)
+        aux_outputs["structure_logits"] = aux_outputs["segment_logits"]
+        return point_logits, aux_outputs
+
+
+class StructureIVCRefineV3HeatmapHead(IVCRefineV3HeatmapHead):
+    """IVC head exposing the vessel band map as the generic structure map."""
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        aux_outputs = dict(aux_outputs)
+        aux_outputs["structure_logits"] = aux_outputs["band_logits"]
+        return point_logits, aux_outputs
+
+
+class StructureFemurHeatmapHead(FemurHeatmapHead):
+    """Femur head exposing the shaft map as the generic structure map."""
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        aux_outputs = dict(aux_outputs)
+        aux_outputs["structure_logits"] = aux_outputs["shaft_logits"]
+        return point_logits, aux_outputs
+
+
 class FPN(nn.Module):
     """Feature Pyramid Network (FPN) neck for multi-scale feature enrichment.
 
@@ -3035,13 +3425,21 @@ class MultiTaskModelFactory(nn.Module):
             self.context_expert_adapters = ContextExpertsAdapter(head_channels, active_groups)
         elif task_adapter_profile == "context_local_v1" and active_groups:
             self.context_local_adapters = ContextLocalAdapter(head_channels, active_groups)
+        elif task_adapter_profile == "texture_context_v1" and active_groups:
+            self.context_local_adapters = UltrasoundTextureContextAdapter(head_channels, active_groups)
+        elif task_adapter_profile == "texture_residual_v1" and active_groups:
+            self.context_local_adapters = ContextLocalTextureResidualAdapter(head_channels, active_groups)
+        elif task_adapter_profile == "texture_residual_v2" and active_groups:
+            self.context_local_adapters = GatedContextLocalTextureResidualAdapter(head_channels, active_groups)
         elif task_adapter_profile == "taskfilm_v1" and active_groups:
             self.task_film_adapters = TaskFiLMAdapter(head_channels, active_groups)
         decoder_family_to_head = {
             "basic": HeatmapHead,
             "deep": DeepHeatmapHead,
             "offset_deep": SubpixelOffsetDeepHeatmapHead,
+            "structure_offset_deep": StructureOffsetDeepHeatmapHead,
             "cardiac_graph": CardiacGraphRefineHeatmapHead,
+            "structure_cardiac_graph": StructureCardiacGraphRefineHeatmapHead,
             "a4c_v2": A4CStructuredV2HeatmapHead,
             "a4c_v3": A4CResidualLocalRefineHeatmapHead,
             "a4c_v4": A4CStrongResidualHeatmapHead,
@@ -3049,13 +3447,17 @@ class MultiTaskModelFactory(nn.Module):
             "ivc_refine": IVCRefineHeatmapHead,
             "ivc_refine_v2": IVCRefineV2HeatmapHead,
             "ivc_refine_v3": IVCRefineV3HeatmapHead,
+            "structure_ivc_refine_v3": StructureIVCRefineV3HeatmapHead,
             "line": LineHeatmapHead,
             "compact": CompactHeatmapHead,
             "dense": DenseRelationalHeatmapHead,
             "femur": FemurHeatmapHead,
+            "structure_femur": StructureFemurHeatmapHead,
             "fugc": FUGCHeatmapHead,
+            "structure_fugc": StructureFUGCHeatmapHead,
             "hc_refine": HCRefineHeatmapHead,
             "hc_refine_offset": HCRefineOffsetHeatmapHead,
+            "structure_hc_refine_offset": StructureHCRefineOffsetHeatmapHead,
             "a4c": A4CHeatmapHead,
             "aop": AOPHeatmapHead,
             "fa": FAHeatmapHead,

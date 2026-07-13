@@ -599,6 +599,198 @@ MODEL_PROFILES = {
             "task_adapter_profile": "context_local_v1",
         },
     },
+    "hidden_context_texture_offset128_v1": {
+        "description": (
+            "Dual-stream ultrasound texture extension of offset128_v1. It keeps the same "
+            "DINOv3 ViT-B, task-specific FPN, 128x128 heatmaps, and offset heads, but "
+            "replaces the context-local adapter with a texture-context adapter that fuses "
+            "raw image detail and Sobel edge evidence into the task features."
+        ),
+        "train": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "input_size": 512,
+            "heatmap_size": [128, 128],
+            "heatmap_sigma": 2.8,
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "head_type": "deep",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "hidden_a4c_hc_ivc_fugc_offset_v1",
+            "task_adapter_profile": "texture_context_v1",
+            "task_loss_family_profile": "uniform",
+            "split_mode": "grouped",
+            "augmentation_profile": "baseline",
+            "checkpoint_score_mode": "server_proxy_v1",
+            "cardiac_split_screen_mode": "keep",
+            "measurement_loss_weight": 0.008,
+            "measurement_loss_tasks": ["FA", "HC", "IVC", "PLAX", "fetal_femur"],
+            "measurement_task_weight_overrides": {
+                "FA": 1.00,
+                "HC": 1.20,
+                "IVC": 1.45,
+                "PLAX": 0.75,
+                "fetal_femur": 0.75,
+            },
+            "dataset_loss_weight": 0.0,
+            "femur_shaft_loss_weight": 0.15,
+            "fugc_segment_loss_weight": 0.08,
+            "ivc_band_loss_weight": 0.08,
+        },
+        "inference": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "hidden_a4c_hc_ivc_fugc_offset_v1",
+            "task_adapter_profile": "texture_context_v1",
+        },
+    },
+    "hidden_context_texture_residual_offset128_v1": {
+        "description": (
+            "Load-compatible texture residual extension of offset128_v1. It keeps the "
+            "warm-started context-local adapter intact and adds a zero-initialized "
+            "ultrasound texture/Sobel residual stream so training begins from the old "
+            "solution instead of relearning the adapter."
+        ),
+        "train": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "input_size": 512,
+            "heatmap_size": [128, 128],
+            "heatmap_sigma": 2.8,
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "head_type": "deep",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "hidden_a4c_hc_ivc_fugc_offset_v1",
+            "task_adapter_profile": "texture_residual_v1",
+            "task_loss_family_profile": "uniform",
+            "split_mode": "grouped",
+            "augmentation_profile": "baseline",
+            "checkpoint_score_mode": "server_proxy_v1",
+            "cardiac_split_screen_mode": "keep",
+            "measurement_loss_weight": 0.008,
+            "measurement_loss_tasks": ["FA", "HC", "IVC", "PLAX", "fetal_femur"],
+            "measurement_task_weight_overrides": {
+                "FA": 1.00,
+                "HC": 1.20,
+                "IVC": 1.45,
+                "PLAX": 0.75,
+                "fetal_femur": 0.75,
+            },
+            "dataset_loss_weight": 0.0,
+            "femur_shaft_loss_weight": 0.15,
+            "fugc_segment_loss_weight": 0.08,
+            "ivc_band_loss_weight": 0.08,
+        },
+        "inference": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "hidden_a4c_hc_ivc_fugc_offset_v1",
+            "task_adapter_profile": "texture_residual_v1",
+        },
+    },
+    "hidden_context_texture_residual_offset128_v2": {
+        "description": (
+            "Conservative task-gated texture residual extension of offset128_v1. It "
+            "keeps the warm-started context-local pathway intact and adds a small "
+            "per-task gated ultrasound texture/Sobel residual stream for controlled "
+            "domain-shift adaptation."
+        ),
+        "train": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "input_size": 512,
+            "heatmap_size": [128, 128],
+            "heatmap_sigma": 2.8,
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "head_type": "deep",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "hidden_a4c_hc_ivc_fugc_offset_v1",
+            "task_adapter_profile": "texture_residual_v2",
+            "task_loss_family_profile": "uniform",
+            "split_mode": "grouped",
+            "augmentation_profile": "baseline",
+            "checkpoint_score_mode": "server_proxy_v1",
+            "cardiac_split_screen_mode": "keep",
+            "measurement_loss_weight": 0.008,
+            "measurement_loss_tasks": ["FA", "HC", "IVC", "PLAX", "fetal_femur"],
+            "measurement_task_weight_overrides": {
+                "FA": 1.00,
+                "HC": 1.20,
+                "IVC": 1.45,
+                "PLAX": 0.75,
+                "fetal_femur": 0.75,
+            },
+            "dataset_loss_weight": 0.0,
+            "femur_shaft_loss_weight": 0.15,
+            "fugc_segment_loss_weight": 0.08,
+            "ivc_band_loss_weight": 0.08,
+        },
+        "inference": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "hidden_a4c_hc_ivc_fugc_offset_v1",
+            "task_adapter_profile": "texture_residual_v2",
+        },
+    },
+    "hidden_context_structure_v1": {
+        "description": (
+            "Structure-aware extension of offset128_v1. It keeps the best 128x128 hidden-context "
+            "recipe and adds an auxiliary anatomy-structure map branch so each task learns a "
+            "line, contour, shaft, or cardiac-view support map in addition to point heatmaps."
+        ),
+        "train": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "input_size": 512,
+            "heatmap_size": [128, 128],
+            "heatmap_sigma": 2.8,
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "head_type": "deep",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "structure_v1",
+            "task_adapter_profile": "context_local_v1",
+            "task_loss_family_profile": "uniform",
+            "split_mode": "grouped",
+            "augmentation_profile": "baseline",
+            "checkpoint_score_mode": "server_proxy_v1",
+            "cardiac_split_screen_mode": "keep",
+            "measurement_loss_weight": 0.008,
+            "measurement_loss_tasks": ["FA", "HC", "IVC", "PLAX", "fetal_femur"],
+            "measurement_task_weight_overrides": {
+                "FA": 1.00,
+                "HC": 1.20,
+                "IVC": 1.45,
+                "PLAX": 0.75,
+                "fetal_femur": 0.75,
+            },
+            "dataset_loss_weight": 0.0,
+            "femur_shaft_loss_weight": 0.10,
+            "fugc_segment_loss_weight": 0.05,
+            "ivc_band_loss_weight": 0.05,
+            "structure_loss_weight": 0.05,
+        },
+        "inference": {
+            "encoder_name": "vit_base_patch16_dinov3",
+            "use_fpn": True,
+            "fpn_mode": "task_specific",
+            "fpn_type": "fpn",
+            "task_head_profile": "challenge_v1",
+            "task_decoder_profile": "structure_v1",
+            "task_adapter_profile": "context_local_v1",
+        },
+    },
     "hidden_context_local_offset192_v1": {
         "description": (
             "Controlled follow-up to offset128_v1. It keeps the same hidden-context "

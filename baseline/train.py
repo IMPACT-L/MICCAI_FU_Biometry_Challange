@@ -32,6 +32,7 @@ from utils import (
     compute_measurement_loss,
     compute_robust_domain_breakdown,
     compute_server_proxy_breakdown,
+    compute_structure_map_loss,
     evaluate_keypoint,
     keypoint_collate_fn,
     set_seed,
@@ -86,6 +87,7 @@ HEATMAP_SIGMA = 1.8
 FEMUR_SHAFT_LOSS_WEIGHT = 0.15
 FUGC_SEGMENT_LOSS_WEIGHT = 0.08
 IVC_BAND_LOSS_WEIGHT = 0.08
+STRUCTURE_LOSS_WEIGHT = 0.0
 ROI_CROP_TASKS = ("FUGC", "IVC", "fetal_femur")
 ROI_CONTEXT_RANGE = (1.2, 1.8)
 TASK_LOSS_WEIGHTS = {
@@ -770,6 +772,7 @@ def main(
     femur_shaft_loss_weight: float = FEMUR_SHAFT_LOSS_WEIGHT,
     fugc_segment_loss_weight: float = FUGC_SEGMENT_LOSS_WEIGHT,
     ivc_band_loss_weight: float = IVC_BAND_LOSS_WEIGHT,
+    structure_loss_weight: float = STRUCTURE_LOSS_WEIGHT,
     task_loss_weight_overrides: dict[str, float] | None = None,
     sampler_task_weight_overrides: dict[str, float] | None = None,
     use_ema: bool = True,
@@ -820,6 +823,7 @@ def main(
                 "femur_shaft_loss_weight": femur_shaft_loss_weight,
                 "fugc_segment_loss_weight": fugc_segment_loss_weight,
                 "ivc_band_loss_weight": ivc_band_loss_weight,
+                "structure_loss_weight": structure_loss_weight,
             },
         )
         encoder_name = str(profile_config["encoder_name"])
@@ -856,6 +860,7 @@ def main(
         femur_shaft_loss_weight = float(profile_config["femur_shaft_loss_weight"])
         fugc_segment_loss_weight = float(profile_config["fugc_segment_loss_weight"])
         ivc_band_loss_weight = float(profile_config["ivc_band_loss_weight"])
+        structure_loss_weight = float(profile_config["structure_loss_weight"])
 
     metric_column = "MRE (pixels)"
     metric_label_map = {
@@ -950,6 +955,7 @@ def main(
     logger.info(f"Femur shaft loss weight: {femur_shaft_loss_weight:.6f}")
     logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
     logger.info(f"IVC band loss weight: {ivc_band_loss_weight:.6f}")
+    logger.info(f"Structure map loss weight: {structure_loss_weight:.6f}")
     logger.info(f"EMA: {'ENABLED' if use_ema else 'DISABLED'}")
     logger.info(f"EMA decay: {ema_decay:.6f}")
     logger.info(f"Train ROI crop: {'ENABLED' if train_roi_crop else 'DISABLED'}")
@@ -1329,6 +1335,12 @@ def main(
                                 target_coords_transformed,
                                 heatmap_size=heatmap_size,
                             )
+                        structure_map_loss = compute_structure_map_loss(
+                            aux_outputs.get("structure_logits"),
+                            target_coords_transformed,
+                            heatmap_size=heatmap_size,
+                            task_id=current_task_id,
+                        )
                         base_loss = (
                             heatmap_loss
                             + 0.2 * coord_loss
@@ -1337,6 +1349,7 @@ def main(
                             + femur_shaft_loss_weight * femur_shaft_loss
                             + fugc_segment_loss_weight * fugc_segment_loss
                             + ivc_band_loss_weight * ivc_band_loss
+                            + structure_loss_weight * structure_map_loss
                         )
                         task_weight = float(effective_task_loss_weights.get(current_task_id, 1.0))
                         loss = base_loss * task_weight
@@ -1566,6 +1579,7 @@ def main(
                             "femur_shaft_loss_weight": femur_shaft_loss_weight,
                             "fugc_segment_loss_weight": fugc_segment_loss_weight,
                             "ivc_band_loss_weight": ivc_band_loss_weight,
+                            "structure_loss_weight": structure_loss_weight,
                             "use_ema": use_ema,
                             "ema_decay": ema_decay,
                             "task_loss_weight_overrides": task_loss_weight_overrides or {},
@@ -1773,14 +1787,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "taskfilm_v1"),
         default=TASK_ADAPTER_PROFILE,
         help=f"Task-specific feature adapter profile (default: {TASK_ADAPTER_PROFILE}).",
     )
@@ -1866,6 +1880,12 @@ if __name__ == "__main__":
         type=float,
         default=FEMUR_SHAFT_LOSS_WEIGHT,
         help="Auxiliary shaft mask loss for fetal_femur. Use 0.0 to disable.",
+    )
+    parser.add_argument(
+        "--structure-loss-weight",
+        type=float,
+        default=STRUCTURE_LOSS_WEIGHT,
+        help="Auxiliary anatomy-structure map loss. Use 0.0 to disable.",
     )
     parser.add_argument(
         "--task-loss-weights",
@@ -2004,6 +2024,7 @@ if __name__ == "__main__":
         femur_shaft_loss_weight=float(args.femur_shaft_loss_weight),
         fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),
         ivc_band_loss_weight=float(args.ivc_band_loss_weight),
+        structure_loss_weight=float(args.structure_loss_weight),
         task_loss_weight_overrides=_parse_weight_csv(args.task_loss_weights),
         checkpoint_task_weight_overrides=_parse_weight_csv(args.checkpoint_task_weights),
         sampler_task_weight_overrides=_parse_weight_csv(args.sampler_task_weights),

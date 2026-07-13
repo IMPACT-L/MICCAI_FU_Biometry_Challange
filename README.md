@@ -446,6 +446,120 @@ python scripts/audit_local_server_tasks.py
 
 They summarize which runs generalized better on the server and which local tasks were the clearest warning signs for poor hidden performance.
 
+## Structure-Aware Branch
+
+The next non-incremental model branch is `hidden_context_structure_v1`. It keeps the best stable `offset128_v1` recipe (`DINOv3 ViT-B`, task-specific FPN, `context_local_v1`, grouped split, `128x128` heatmaps) and adds an auxiliary structure-map output to the task heads. The structure map supervises anatomy support lines or compact shapes in addition to landmark heatmaps, so the model learns the relevant object geometry instead of only isolated points.
+
+Run it from the current best `offset128_v1` checkpoint:
+
+```bash
+conda activate miccai_fu_biometry
+
+CUDA_VISIBLE_DEVICES=0 bash scripts/train_hidden_context_structure_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_structure_v1_seed42 \
+  output/runs/dinov3_vitb_hidden_context_offset128_v1_seed42/checkpoints/best_model.pth \
+  42
+```
+
+Predict/evaluate:
+
+```bash
+bash scripts/predict_eval_hidden_context_structure_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_structure_v1_seed42
+```
+
+Build submission:
+
+```bash
+bash scripts/submit_hidden_context_structure_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_structure_v1_seed42 \
+  output/submissions/dinov3_vitb_hidden_context_structure_v1_seed42
+```
+
+## Texture-Context Branch
+
+The larger architecture branch is `hidden_context_texture_offset128_v1`. It keeps the best `offset128_v1` head/heatmap design, but replaces the adapter with a dual-stream ultrasound texture adapter. The adapter fuses DINOv3/FPN semantic features with a raw-image stream built from RGB, grayscale, Sobel gradients, and gradient magnitude. This is intended to recover boundary and speckle evidence that patch-token features can miss.
+
+Run:
+
+```bash
+conda activate miccai_fu_biometry
+
+CUDA_VISIBLE_DEVICES=0 bash scripts/train_hidden_context_texture_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_offset128_v1_seed42 \
+  output/runs/dinov3_vitb_hidden_context_offset128_v1_seed42/checkpoints/best_model.pth \
+  42
+```
+
+Predict/evaluate:
+
+```bash
+bash scripts/predict_eval_hidden_context_texture_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_offset128_v1_seed42
+```
+
+Build submission:
+
+```bash
+bash scripts/submit_hidden_context_texture_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_offset128_v1_seed42 \
+  output/submissions/dinov3_vitb_hidden_context_texture_offset128_v1_seed42
+```
+
+## Texture-Residual Branch
+
+The direct `texture_context_v1` adapter overfit early because it replaced the old `context_local_v1` adapter, causing many adapter weights from the `24.77` checkpoint to be skipped during warm start. The safer branch is `hidden_context_texture_residual_offset128_v1`: it keeps the old context-local adapter layout load-compatible and adds only a zero-initialized Sobel/RGB texture residual. The model starts from the previous solution and can learn a small boundary correction without drifting immediately.
+
+Train:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/train_hidden_context_texture_residual_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_residual_offset128_v1_seed42 \
+  output/runs/dinov3_vitb_hidden_context_offset128_v1_seed42/checkpoints/best_model.pth \
+  42
+```
+
+Predict/evaluate:
+
+```bash
+bash scripts/predict_eval_hidden_context_texture_residual_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_residual_offset128_v1_seed42
+```
+
+Submit package:
+
+```bash
+bash scripts/submit_hidden_context_texture_residual_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_residual_offset128_v1_seed42 \
+  output/submissions/dinov3_vitb_hidden_context_texture_residual_offset128_v1_seed42
+```
+
+The next model-side branch is `hidden_context_texture_residual_offset128_v2`. It keeps the same `offset128_v1` anchor and the same load-compatible context-local pathway, but replaces the single global texture residual scale with conservative per-task gates. This is intended to let weak views use ultrasound edge/texture cues without forcing the same correction onto every task.
+
+Train:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/train_hidden_context_texture_residual_offset128_v2.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_residual_offset128_v2_seed42 \
+  output/runs/dinov3_vitb_hidden_context_offset128_v1_seed42/checkpoints/best_model.pth \
+  42
+```
+
+Predict/evaluate:
+
+```bash
+bash scripts/predict_eval_hidden_context_texture_residual_offset128_v2.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_residual_offset128_v2_seed42
+```
+
+Submit package:
+
+```bash
+bash scripts/submit_hidden_context_texture_residual_offset128_v2.sh \
+  output/runs/dinov3_vitb_hidden_context_texture_residual_offset128_v2_seed42 \
+  output/submissions/dinov3_vitb_hidden_context_texture_residual_offset128_v2_seed42
+```
+
 ## Dedicated-head status
 
 Current `dedicated_v1` decoder coverage:
