@@ -154,6 +154,7 @@ Comparable saved runs:
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
 | `dinov3_vitb_hidden_context_offset128_v1_seed42` | `NA` | `24.77` |
+| `dinov3_vitb_hidden_context_offset256_v1_seed42` | `5.525950` | `24.87` |
 | `dinov3_vitb_hidden_context_offset128_v3_hardtask_ft_seed42` | `5.562717` | `24.87` |
 | `dinov3_vitb_hidden_context_offset128_soup_v1_a85` | `5.604717` | `24.79` |
 | `dinov3_vitb_hidden_context_offset128_soup_v1_a95` | `5.611312` | `24.79` |
@@ -429,6 +430,7 @@ The current baseline is improved and challenge-compliant, but it is still far fr
 - Broad all-head specialization has repeatedly hurt server generalization, while cleaner shared decoding with task-specific FPN has been more reliable.
 - The `offset128_v1` change is the first architecture-side change that clearly improved hidden validation after the `25.31` plateau.
 - The `offset128_v3_hardtask_ft` result shows that very low local MRE can still lose hidden performance if the model drifts from the best server-stable checkpoint.
+- The `offset256_v1` result shows the same pattern: full local MRE improved to `5.525950`, but hidden score was `24.87`, so increasing heatmap resolution beyond `128x128` is not enough by itself.
 - The `offset128_soup_v1_a85` and `offset128_soup_v1_a95` checkpoint soups both scored `24.79`, close but not better than the `24.77` anchor.
 - The next non-incremental branch is `hidden_context_local_offset128_crop_panel_v1`, which keeps the `24.77` architecture but normalizes detected split-screen cardiac training/validation images into single-panel examples instead of excluding them.
 - Measurement supervision is only useful when applied conservatively; the best hidden-server result still came from the offset-refined hidden-context branch rather than from stronger measurement tuning.
