@@ -61,6 +61,14 @@ SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES = {
     "HC": 1.1,
     "fetal_femur": 1.0,
 }
+SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES = {
+    "HC": 1.60,
+    "fetal_femur": 1.55,
+    "PSAX": 1.45,
+    "FA": 1.35,
+    "AOP": 1.30,
+    "A4C": 1.20,
+}
 INPUT_SIZE = 512
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 USE_FPN = True  # ← 开关：设为 True 启用 FPN 特征金字塔
@@ -336,6 +344,52 @@ def _load_matching_state_dict(model: torch.nn.Module, checkpoint_state_dict: dic
     missing_after_match = sorted(set(model_state.keys()) - set(matched_state.keys()))
     load_result = model.load_state_dict(matched_state, strict=False)
     return load_result, skipped, missing_after_match
+
+
+def _set_module_requires_grad(module: torch.nn.Module | None, enabled: bool):
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = bool(enabled)
+
+
+def _freeze_for_targeted_finetune(
+    model: torch.nn.Module,
+    train_task_ids: list[str] | None,
+    freeze_encoder: bool,
+    freeze_fpn: bool,
+    freeze_adapters: bool,
+    freeze_other_heads: bool,
+):
+    target_task_ids = {str(task_id) for task_id in (train_task_ids or [])}
+
+    if freeze_encoder:
+        _set_module_requires_grad(getattr(model, "encoder", None), False)
+
+    if freeze_fpn:
+        _set_module_requires_grad(getattr(model, "fpn", None), False)
+        task_fpns = getattr(model, "task_fpns", None)
+        if task_fpns is not None:
+            for task_fpn in task_fpns.values():
+                _set_module_requires_grad(task_fpn, False)
+
+    if freeze_adapters:
+        _set_module_requires_grad(getattr(model, "soft_adapters", None), False)
+        _set_module_requires_grad(getattr(model, "local_refine_adapters", None), False)
+        _set_module_requires_grad(getattr(model, "context_adapters", None), False)
+        _set_module_requires_grad(getattr(model, "context_expert_adapters", None), False)
+        _set_module_requires_grad(getattr(model, "context_local_adapters", None), False)
+        _set_module_requires_grad(getattr(model, "task_film_adapters", None), False)
+
+    if freeze_other_heads and target_task_ids:
+        for task_id, head in model.heads.items():
+            _set_module_requires_grad(head, task_id in target_task_ids)
+
+
+def _collect_trainable_params(module: torch.nn.Module | None):
+    if module is None:
+        return []
+    return [param for param in module.parameters() if param.requires_grad]
 
 
 def _build_task_configs(dataframe):
@@ -683,6 +737,7 @@ def setup_logger(log_path: str) -> logging.Logger:
 
 
 def main(
+    data_root: str = DATA_ROOT_PATH,
     val_split: float = VAL_SPLIT,
     model_profile: str | None = None,
     random_seed: int = RANDOM_SEED,
@@ -698,6 +753,8 @@ def main(
     output_dir: str = OUTPUT_DIR,
     encoder_name: str = ENCODER,
     input_size: int = INPUT_SIZE,
+    heatmap_size: tuple[int, int] = HEATMAP_SIZE,
+    heatmap_sigma: float = HEATMAP_SIGMA,
     head_type: str = HEAD_TYPE,
     task_head_profile: str = TASK_HEAD_PROFILE,
     task_decoder_profile: str = TASK_DECODER_PROFILE,
@@ -721,8 +778,13 @@ def main(
     roi_crop_tasks: set[str] | None = None,
     roi_context_min: float = ROI_CONTEXT_RANGE[0],
     roi_context_max: float = ROI_CONTEXT_RANGE[1],
+    roi_center_jitter: float = 0.0,
     grad_accum_steps: int = 1,
     use_amp: bool = True,
+    freeze_encoder: bool = False,
+    freeze_fpn: bool = False,
+    freeze_adapters: bool = False,
+    freeze_other_heads: bool = False,
     split_mode: str = SPLIT_MODE,
     augmentation_profile: str = AUGMENTATION_PROFILE,
     checkpoint_task_weight_overrides: dict[str, float] | None = None,
@@ -737,6 +799,8 @@ def main(
             {
                 "encoder_name": encoder_name,
                 "input_size": input_size,
+                "heatmap_size": list(heatmap_size),
+                "heatmap_sigma": heatmap_sigma,
                 "use_fpn": use_fpn,
                 "fpn_mode": fpn_mode,
                 "fpn_type": fpn_type,
@@ -760,6 +824,14 @@ def main(
         )
         encoder_name = str(profile_config["encoder_name"])
         input_size = int(profile_config["input_size"])
+        if profile_config.get("heatmap_size"):
+            profile_heatmap_size = profile_config["heatmap_size"]
+            if isinstance(profile_heatmap_size, int):
+                heatmap_size = (int(profile_heatmap_size), int(profile_heatmap_size))
+            else:
+                heatmap_size = (int(profile_heatmap_size[0]), int(profile_heatmap_size[1]))
+        if profile_config.get("heatmap_sigma"):
+            heatmap_sigma = float(profile_config["heatmap_sigma"])
         use_fpn = bool(profile_config["use_fpn"])
         fpn_mode = str(profile_config["fpn_mode"])
         fpn_type = str(profile_config["fpn_type"])
@@ -790,6 +862,7 @@ def main(
         "combined": CHECKPOINT_SCORE_NAME,
         "server_proxy_v1": "Server proxy score",
         "server_proxy_v2": "Server proxy score",
+        "server_proxy_v3": "Server proxy score",
         "robust_domain_v1": "Robust domain score",
     }
     metric_label = metric_label_map.get(checkpoint_score_mode, CHECKPOINT_SCORE_NAME)
@@ -882,14 +955,20 @@ def main(
     logger.info(f"Train ROI crop: {'ENABLED' if train_roi_crop else 'DISABLED'}")
     logger.info(f"ROI crop tasks: {sorted(roi_crop_tasks) if roi_crop_tasks else 'all-enabled-tasks'}")
     logger.info(f"ROI context range: ({roi_context_min:.3f}, {roi_context_max:.3f})")
+    logger.info(f"ROI center jitter: {roi_center_jitter:.3f}")
     logger.info(f"Grad accumulation steps: {grad_accum_steps}")
     logger.info(f"AMP: {'ENABLED' if (use_amp and device.type == 'cuda') else 'DISABLED'}")
+    logger.info(f"Freeze encoder: {freeze_encoder}")
+    logger.info(f"Freeze FPN: {freeze_fpn}")
+    logger.info(f"Freeze adapters: {freeze_adapters}")
+    logger.info(f"Freeze other heads: {freeze_other_heads}")
     logger.info(f"Split mode: {split_mode}")
     logger.info(f"Augmentation profile: {augmentation_profile}")
     logger.info(f"Checkpoint score mode: {checkpoint_score_mode}")
     logger.info(f"Cardiac split-screen mode: {cardiac_split_screen_mode}")
     logger.info(f"Cardiac split-screen vertical-darkness threshold: {cardiac_split_screen_vdark_threshold:.6f}")
-    logger.info(f"Heatmap size: {HEATMAP_SIZE}")
+    logger.info(f"Heatmap size: {heatmap_size}")
+    logger.info(f"Heatmap sigma: {heatmap_sigma:.6f}")
     effective_task_loss_weights = dict(TASK_LOSS_WEIGHTS)
     if task_loss_weight_overrides:
         effective_task_loss_weights.update(task_loss_weight_overrides)
@@ -912,15 +991,15 @@ def main(
     )
 
     temp_dataset = KeypointDataset(
-        data_root=DATA_ROOT_PATH,
+        data_root=data_root,
         transforms=train_transforms,
-        heatmap_size=HEATMAP_SIZE,
-        sigma=HEATMAP_SIGMA,
+        heatmap_size=heatmap_size,
+        sigma=heatmap_sigma,
         input_size=input_size,
     )
     temp_dataset.dataframe = _assign_cardiac_split_screen_flags(
         temp_dataset.dataframe,
-        DATA_ROOT_PATH,
+        data_root,
         vdark_threshold=cardiac_split_screen_vdark_threshold,
     )
     split_screen_counts = (
@@ -940,9 +1019,11 @@ def main(
         ].reset_index(drop=True)
         removed_count = before_count - len(temp_dataset.dataframe)
         logger.info(f"Excluded split-screen cardiac rows before split: {removed_count}")
+    elif cardiac_split_screen_mode == "crop_panel":
+        logger.info("Detected split-screen cardiac rows will be cropped to the landmark-containing panel during training.")
     elif cardiac_split_screen_mode != "keep":
         raise ValueError(f"Unsupported cardiac_split_screen_mode: {cardiac_split_screen_mode}")
-    temp_dataset.dataframe = _assign_pseudo_domains(temp_dataset.dataframe, DATA_ROOT_PATH)
+    temp_dataset.dataframe = _assign_pseudo_domains(temp_dataset.dataframe, data_root)
 
     task_configs = _build_task_configs(temp_dataset.dataframe)
     task_id_to_name = {cfg["task_id"]: cfg["task_name"] for cfg in task_configs}
@@ -990,14 +1071,16 @@ def main(
     )
 
     train_dataset = KeypointDataset(
-        data_root=DATA_ROOT_PATH,
+        data_root=data_root,
         transforms=train_transforms,
-        heatmap_size=HEATMAP_SIZE,
-        sigma=HEATMAP_SIGMA,
+        heatmap_size=heatmap_size,
+        sigma=heatmap_sigma,
         input_size=input_size,
         roi_crop=train_roi_crop,
         roi_crop_tasks=roi_crop_tasks,
         roi_context_range=(roi_context_min, roi_context_max),
+        roi_center_jitter=roi_center_jitter,
+        cardiac_split_screen_mode=cardiac_split_screen_mode,
     )
     train_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
     if train_task_ids:
@@ -1013,12 +1096,13 @@ def main(
         )
 
     val_dataset = KeypointDataset(
-        data_root=DATA_ROOT_PATH,
+        data_root=data_root,
         transforms=val_transforms,
-        heatmap_size=HEATMAP_SIZE,
-        sigma=HEATMAP_SIGMA,
+        heatmap_size=heatmap_size,
+        sigma=heatmap_sigma,
         input_size=input_size,
         roi_crop=False,
+        cardiac_split_screen_mode=cardiac_split_screen_mode,
     )
     val_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
 
@@ -1059,7 +1143,7 @@ def main(
         encoder_name=encoder_name,
         encoder_weights=ENCODER_WEIGHTS,
         task_configs=task_configs,
-        heatmap_size=HEATMAP_SIZE,
+        heatmap_size=heatmap_size,
         use_fpn=use_fpn,
         fpn_mode=fpn_mode,
         fpn_type=fpn_type,
@@ -1086,24 +1170,65 @@ def main(
         if checkpoint_meta:
             logger.info(f"Init checkpoint meta: {checkpoint_meta}")
 
-    param_groups = [{"params": model.encoder.parameters(), "lr": learning_rate * 0.2}]
+    _freeze_for_targeted_finetune(
+        model=model,
+        train_task_ids=train_task_ids,
+        freeze_encoder=freeze_encoder,
+        freeze_fpn=freeze_fpn,
+        freeze_adapters=freeze_adapters,
+        freeze_other_heads=freeze_other_heads,
+    )
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    logger.info(
+        f"Trainable parameters after freezing: {trainable_params}/{total_params} "
+        f"({100.0 * trainable_params / max(total_params, 1):.4f}%)"
+    )
+
+    param_groups = []
+    encoder_params = _collect_trainable_params(model.encoder)
+    if encoder_params:
+        param_groups.append({"params": encoder_params, "lr": learning_rate * 0.2})
     if model.fpn is not None:
-        param_groups.append({"params": model.fpn.parameters(), "lr": learning_rate * 2.0})
+        fpn_params = _collect_trainable_params(model.fpn)
+        if fpn_params:
+            param_groups.append({"params": fpn_params, "lr": learning_rate * 2.0})
     if getattr(model, "task_fpns", None) is not None:
         for task_id, task_fpn in model.task_fpns.items():
-            param_groups.append({"params": task_fpn.parameters(), "lr": learning_rate * 2.0})
+            task_fpn_params = _collect_trainable_params(task_fpn)
+            if task_fpn_params:
+                param_groups.append({"params": task_fpn_params, "lr": learning_rate * 2.0})
     if getattr(model, "soft_adapters", None) is not None:
-        param_groups.append({"params": model.soft_adapters.parameters(), "lr": learning_rate * 5.0})
+        adapter_params = _collect_trainable_params(model.soft_adapters)
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
     if getattr(model, "local_refine_adapters", None) is not None:
-        param_groups.append({"params": model.local_refine_adapters.parameters(), "lr": learning_rate * 5.0})
+        adapter_params = _collect_trainable_params(model.local_refine_adapters)
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
     if getattr(model, "context_adapters", None) is not None:
-        param_groups.append({"params": model.context_adapters.parameters(), "lr": learning_rate * 5.0})
+        adapter_params = _collect_trainable_params(model.context_adapters)
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
     if getattr(model, "context_expert_adapters", None) is not None:
-        param_groups.append({"params": model.context_expert_adapters.parameters(), "lr": learning_rate * 5.0})
+        adapter_params = _collect_trainable_params(model.context_expert_adapters)
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
+    if getattr(model, "context_local_adapters", None) is not None:
+        adapter_params = _collect_trainable_params(model.context_local_adapters)
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
     if getattr(model, "task_film_adapters", None) is not None:
-        param_groups.append({"params": model.task_film_adapters.parameters(), "lr": learning_rate * 5.0})
+        adapter_params = _collect_trainable_params(model.task_film_adapters)
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
     for task_id, head in model.heads.items():
-        param_groups.append({"params": head.parameters(), "lr": learning_rate * 10.0})
+        head_params = _collect_trainable_params(head)
+        if head_params:
+            param_groups.append({"params": head_params, "lr": learning_rate * 10.0})
+
+    if not param_groups:
+        raise ValueError("No trainable parameters remain after applying freeze settings.")
 
     optimizer = optim.AdamW(param_groups)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
@@ -1188,21 +1313,21 @@ def main(
                             femur_shaft_loss = compute_femur_shaft_loss(
                                 aux_outputs.get("shaft_logits"),
                                 target_coords_transformed,
-                                heatmap_size=HEATMAP_SIZE,
+                                heatmap_size=heatmap_size,
                             )
                         fugc_segment_loss = pred_logits.new_tensor(0.0)
                         if current_task_id == "FUGC":
                             fugc_segment_loss = compute_fugc_segment_loss(
                                 aux_outputs.get("segment_logits"),
                                 target_coords_transformed,
-                                heatmap_size=HEATMAP_SIZE,
+                                heatmap_size=heatmap_size,
                             )
                         ivc_band_loss = pred_logits.new_tensor(0.0)
                         if current_task_id == "IVC":
                             ivc_band_loss = compute_ivc_band_loss(
                                 aux_outputs.get("band_logits"),
                                 target_coords_transformed,
-                                heatmap_size=HEATMAP_SIZE,
+                                heatmap_size=heatmap_size,
                             )
                         base_loss = (
                             heatmap_loss
@@ -1301,6 +1426,19 @@ def main(
                     hard_task_weight=0.35,
                     worst_task_weight=0.20,
                     worst_k=3,
+                )
+                selected_val_score = float(proxy_breakdown["proxy_score"])
+            elif checkpoint_score_mode == "server_proxy_v3":
+                proxy_breakdown = compute_server_proxy_breakdown(
+                    val_results_df,
+                    normalization_stats=normalization_stats,
+                    task_weights=effective_checkpoint_task_weights,
+                    hard_task_ids=tuple(SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES.keys()),
+                    hard_task_weight_overrides=SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES,
+                    base_weight=0.40,
+                    hard_task_weight=0.40,
+                    worst_task_weight=0.20,
+                    worst_k=4,
                 )
                 selected_val_score = float(proxy_breakdown["proxy_score"])
             elif checkpoint_score_mode == "robust_domain_v1":
@@ -1418,7 +1556,8 @@ def main(
                             "task_adapter_profile": task_adapter_profile,
                             "task_loss_family_profile": task_loss_family_profile,
                             "input_size": input_size,
-                            "heatmap_size": list(HEATMAP_SIZE),
+                            "heatmap_size": list(heatmap_size),
+                            "heatmap_sigma": heatmap_sigma,
                             "checkpoint_metric": metric_label,
                             "measurement_loss_weight": measurement_loss_weight,
                             "measurement_loss_tasks": sorted(enabled_measurement_task_ids),
@@ -1435,6 +1574,7 @@ def main(
                             "train_roi_crop": train_roi_crop,
                             "roi_crop_tasks": sorted(roi_crop_tasks) if roi_crop_tasks else [],
                             "roi_context_range": [roi_context_min, roi_context_max],
+                            "roi_center_jitter": roi_center_jitter,
                             "split_mode": split_mode,
                             "augmentation_profile": augmentation_profile,
                             "checkpoint_task_weight_overrides": checkpoint_task_weight_overrides or {},
@@ -1444,6 +1584,7 @@ def main(
                             "random_seed": random_seed,
                             "server_proxy_hard_task_ids": list(SERVER_PROXY_HARD_TASK_IDS),
                             "server_proxy_v2_hard_task_weight_overrides": SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
+                            "server_proxy_v3_hard_task_weight_overrides": SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES,
                         },
                     }
                 torch.save(checkpoint_payload, model_save_path)
@@ -1562,6 +1703,12 @@ if __name__ == "__main__":
         help=f"Directory to store logs, checkpoints, and metrics (default: {OUTPUT_DIR}).",
     )
     parser.add_argument(
+        "--data-root",
+        type=str,
+        default=DATA_ROOT_PATH,
+        help=f"Dataset root containing csv/ and images/ (default: {DATA_ROOT_PATH}).",
+    )
+    parser.add_argument(
         "--encoder-name",
         type=str,
         default=ENCODER,
@@ -1572,6 +1719,18 @@ if __name__ == "__main__":
         type=int,
         default=INPUT_SIZE,
         help=f"Square letterbox input size (default: {INPUT_SIZE}).",
+    )
+    parser.add_argument(
+        "--heatmap-size",
+        type=int,
+        default=HEATMAP_SIZE[0],
+        help=f"Square heatmap target size (default: {HEATMAP_SIZE[0]}).",
+    )
+    parser.add_argument(
+        "--heatmap-sigma",
+        type=float,
+        default=HEATMAP_SIGMA,
+        help=f"Gaussian heatmap sigma in heatmap pixels (default: {HEATMAP_SIGMA}).",
     )
     parser.add_argument(
         "--head-type",
@@ -1614,14 +1773,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "taskfilm_v1"),
         default=TASK_ADAPTER_PROFILE,
         help=f"Task-specific feature adapter profile (default: {TASK_ADAPTER_PROFILE}).",
     )
@@ -1649,14 +1808,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint-score-mode",
         type=str,
-        choices=("combined", "server_proxy_v1", "server_proxy_v2", "robust_domain_v1"),
+        choices=("combined", "server_proxy_v1", "server_proxy_v2", "server_proxy_v3", "robust_domain_v1"),
         default=CHECKPOINT_SCORE_MODE,
         help=f"Validation score used for best-checkpoint selection (default: {CHECKPOINT_SCORE_MODE}).",
     )
     parser.add_argument(
         "--cardiac-split-screen-mode",
         type=str,
-        choices=("keep", "exclude"),
+        choices=("keep", "exclude", "crop_panel"),
         default=CARDIAC_SPLIT_SCREEN_MODE,
         help=f"How to handle detected split-screen cardiac training rows (default: {CARDIAC_SPLIT_SCREEN_MODE}).",
     )
@@ -1749,6 +1908,26 @@ if __name__ == "__main__":
         help="Disable AMP mixed-precision training.",
     )
     parser.add_argument(
+        "--freeze-encoder",
+        action="store_true",
+        help="Freeze the encoder backbone parameters during training.",
+    )
+    parser.add_argument(
+        "--freeze-fpn",
+        action="store_true",
+        help="Freeze the shared or task-specific FPN parameters during training.",
+    )
+    parser.add_argument(
+        "--freeze-adapters",
+        action="store_true",
+        help="Freeze task adapter parameters during training.",
+    )
+    parser.add_argument(
+        "--freeze-other-heads",
+        action="store_true",
+        help="When --train-task-ids is set, freeze heads for all non-target tasks.",
+    )
+    parser.add_argument(
         "--train-roi-crop",
         action="store_true",
         help="Enable GT-centered ROI crop augmentation for selected training tasks.",
@@ -1771,6 +1950,12 @@ if __name__ == "__main__":
         default=ROI_CONTEXT_RANGE[1],
         help="Maximum context multiplier for ROI crop box.",
     )
+    parser.add_argument(
+        "--roi-center-jitter",
+        type=float,
+        default=0.0,
+        help="Randomly shift ROI crop center by this fraction of crop width/height during ROI training.",
+    )
     args = parser.parse_args()
 
     # --no-fpn takes precedence over --fpn
@@ -1781,6 +1966,7 @@ if __name__ == "__main__":
         use_fpn = True
 
     main(
+        data_root=str(args.data_root),
         val_split=float(args.val_split),
         model_profile=args.model_profile,
         random_seed=int(args.seed),
@@ -1796,6 +1982,8 @@ if __name__ == "__main__":
         output_dir=str(args.output_dir),
         encoder_name=str(args.encoder_name),
         input_size=int(args.input_size),
+        heatmap_size=(int(args.heatmap_size), int(args.heatmap_size)),
+        heatmap_sigma=float(args.heatmap_sigma),
         head_type=str(args.head_type),
         task_head_profile=str(args.task_head_profile),
         task_decoder_profile=str(args.task_decoder_profile),
@@ -1823,8 +2011,13 @@ if __name__ == "__main__":
         ema_decay=float(args.ema_decay),
         grad_accum_steps=int(args.grad_accum_steps),
         use_amp=not bool(args.no_amp),
+        freeze_encoder=bool(args.freeze_encoder),
+        freeze_fpn=bool(args.freeze_fpn),
+        freeze_adapters=bool(args.freeze_adapters),
+        freeze_other_heads=bool(args.freeze_other_heads),
         train_roi_crop=bool(args.train_roi_crop),
         roi_crop_tasks=_parse_task_id_set_csv(args.roi_crop_tasks),
         roi_context_min=float(args.roi_context_min),
         roi_context_max=float(args.roi_context_max),
+        roi_center_jitter=float(args.roi_center_jitter),
     )

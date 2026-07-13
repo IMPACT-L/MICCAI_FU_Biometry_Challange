@@ -16,6 +16,7 @@ from utils import canonicalize_task_coords, letterbox_image_and_points
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
+CARDIAC_SPLIT_SCREEN_TASK_IDS = {"A4C", "PSAX", "PLAX", "IVC"}
 
 
 class KeypointDataset(Dataset):
@@ -31,6 +32,8 @@ class KeypointDataset(Dataset):
         roi_crop: bool = False,
         roi_crop_tasks: Optional[set[str]] = None,
         roi_context_range: Tuple[float, float] = (1.4, 2.0),
+        roi_center_jitter: float = 0.0,
+        cardiac_split_screen_mode: str = "keep",
     ):
         super().__init__()
         self.data_root = data_root
@@ -41,6 +44,8 @@ class KeypointDataset(Dataset):
         self.roi_crop = roi_crop
         self.roi_crop_tasks = roi_crop_tasks
         self.roi_context_range = roi_context_range
+        self.roi_center_jitter = float(roi_center_jitter)
+        self.cardiac_split_screen_mode = str(cardiac_split_screen_mode)
         self.csv_path = os.path.join(self.data_root, "csv")
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
@@ -147,6 +152,9 @@ class KeypointDataset(Dataset):
         context = float(np.random.uniform(context_min, context_max))
         crop_w = min(float(image_w), max(box_w * context, box_w + 32.0))
         crop_h = min(float(image_h), max(box_h * context, box_h + 32.0))
+        if self.roi_center_jitter > 0.0:
+            center_x += float(np.random.uniform(-self.roi_center_jitter, self.roi_center_jitter)) * crop_w
+            center_y += float(np.random.uniform(-self.roi_center_jitter, self.roi_center_jitter)) * crop_h
 
         x0 = int(np.floor(np.clip(center_x - crop_w * 0.5, 0.0, max(image_w - crop_w, 0.0))))
         y0 = int(np.floor(np.clip(center_y - crop_h * 0.5, 0.0, max(image_h - crop_h, 0.0))))
@@ -158,6 +166,68 @@ class KeypointDataset(Dataset):
         cropped_coords[:, 0] -= float(x0)
         cropped_coords[:, 1] -= float(y0)
         return cropped_image, cropped_coords
+
+    def _should_crop_cardiac_split_screen(self, record, task_id: str) -> bool:
+        if self.cardiac_split_screen_mode != "crop_panel":
+            return False
+        if str(task_id) not in CARDIAC_SPLIT_SCREEN_TASK_IDS:
+            return False
+        if "is_split_screen_cardiac" not in record:
+            return False
+        return bool(record["is_split_screen_cardiac"])
+
+    @staticmethod
+    def _find_split_screen_seam_x(image: np.ndarray) -> int:
+        image_h, image_w = image.shape[:2]
+        if image_w < 8 or image_h < 8:
+            return image_w // 2
+        if image.ndim == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        else:
+            gray = image
+        band_left = int(round(0.42 * image_w))
+        band_right = int(round(0.58 * image_w))
+        band_left = max(1, min(band_left, image_w - 2))
+        band_right = max(band_left + 1, min(band_right, image_w - 1))
+        central_profile = gray[:, band_left:band_right].mean(axis=0)
+        return int(band_left + int(np.argmin(central_profile)))
+
+    def _apply_cardiac_split_screen_panel_crop(
+        self,
+        image: np.ndarray,
+        coords_px: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        valid_coords = coords_px[np.isfinite(coords_px).all(axis=1)]
+        if len(valid_coords) == 0:
+            return image, coords_px
+
+        image_h, image_w = image.shape[:2]
+        if image_w < 64 or image_h < 64:
+            return image, coords_px
+
+        seam_x = self._find_split_screen_seam_x(image)
+        median_x = float(np.median(valid_coords[:, 0]))
+        if median_x <= float(seam_x):
+            x0 = 0
+            x1 = max(seam_x - 2, 1)
+        else:
+            x0 = min(seam_x + 2, image_w - 1)
+            x1 = image_w
+
+        crop_w = x1 - x0
+        if crop_w < int(0.35 * image_w):
+            return image, coords_px
+
+        shifted = coords_px.copy()
+        shifted[:, 0] -= float(x0)
+        finite_shifted = shifted[np.isfinite(shifted).all(axis=1)]
+        if len(finite_shifted) and (
+            float(finite_shifted[:, 0].min()) < -1.0
+            or float(finite_shifted[:, 0].max()) > float(crop_w)
+        ):
+            return image, coords_px
+
+        return image[:, x0:x1], shifted
 
     def _apply_transforms(
         self,
@@ -220,6 +290,9 @@ class KeypointDataset(Dataset):
         label = np.array(coords, dtype=np.float32)
         label = canonicalize_task_coords(label, task_id)
         label_points = label.reshape(-1, 2)
+
+        if self._should_crop_cardiac_split_screen(record, task_id):
+            image, label_points = self._apply_cardiac_split_screen_panel_crop(image, label_points)
 
         if self._should_apply_roi_crop(task_id):
             image, label_points = self._apply_roi_crop(image, label_points)

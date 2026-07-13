@@ -88,6 +88,27 @@ This is important because it confirms the larger DINOv3 backbone is stronger on 
   - overall score: `28.31`
   - note: mild balanced hard-task fine-tuning preserved reasonable performance but still underperformed both `grouped_serverproxy_v1` and `grouped_serverproxy_v2_a4c`
 
+- IVC-refine result:
+  - run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1_ivc_refine`
+  - rank: `29`
+  - submission id: `834676`
+  - overall score: `29.56`
+  - note: replacing only the IVC head with a stronger coarse-to-fine decoder did not transfer to better hidden-server performance and regressed the public score
+
+- FA-fixed no-split-screen result:
+  - run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1_fa_fixed_nosplits`
+  - rank: `36`
+  - submission id: `834905`
+  - overall score: `32.67`
+  - note: applying the FA correction but excluding detected split-screen cardiac rows caused a major hidden-server regression; split-screen exclusion should not be used
+
+- Recovery result:
+  - run: `dinov3_vitb_taskfpn_grouped_serverproxy_v1_recovery`
+  - rank: `23`
+  - submission id: `835027`
+  - overall score: `28.31`
+  - note: removing the FA auto-fix and keeping split-screen cardiac rows restored the stable behavior; this matches the earlier conclusion that the regression came from the training-pipeline changes
+
 ## Why `weak_tasks_v1` was added
 
 `weak_tasks_v1` keeps the stable proven path for stronger tasks and specializes only:
@@ -122,3 +143,42 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
   --fugc-segment-loss-weight 0.08 \
   --output-dir output/runs/dinov3_vitb_taskfpn_weaktasks_v1
 ```
+
+## 2026-07-12 update
+
+- The `offset128_v1` architectural change produced the new best public result so far.
+- run: `dinov3_vitb_hidden_context_offset128_v1_seed42`
+- rank: `8`
+- submission id: `844351`
+- overall score: `24.77`
+- note: this is the first architecture-level improvement after the `25.31` plateau. It keeps the hidden-context DINOv3 ViT-B/task-specific-FPN family, increases heatmap resolution to `128x128`, and adds learned subpixel offset refinement for dense point tasks.
+- Next controlled branch: `hidden_context_local_offset128_v2` keeps the `offset128_v1` architecture and adds zero-started post-offset correction only for `HC` and `IVC`, trained from the `24.77` checkpoint with the encoder/FPN/adapters and non-target heads frozen.
+- If `offset128_v2` is unchanged, the next branch is `offset128_v3_hardtask_ft`: train the task-specific FPN/adapters/heads for `A4C,AOP,HC,IVC,PLAX` from the `24.77` checkpoint, freeze only the DINOv3 encoder and non-target heads, and keep FA/FUGC/PSAX/femur behavior anchored.
+- `offset128_v3_hardtask_ft` result: local average MRE improved to `5.562717`, but CodaBench overall was `24.87`, slightly worse than `offset128_v1`. This indicates local hard-task fitting exceeded the hidden-server optimum; use it for conservative checkpoint soup/backoff or as an analysis branch, not as the anchor.
+- `offset128_soup_v1_a85` candidate was built by merging 85% `offset128_v2` and 15% `offset128_v3_hardtask_ft`. Local average MRE is `5.604717`; pre-submit audit versus `offset128_v1` passed with only `0.1601px` mean shift. Hidden score was `24.79`, close but not better than `offset128_v1`.
+- `offset128_soup_v1_a95` candidate was built by merging 95% `offset128_v2` and 5% `offset128_v3_hardtask_ft`. Local average MRE is `5.611312`; pre-submit audit versus `offset128_v1` passed with only `0.1172px` mean shift. Hidden score was also `24.79`, so checkpoint soup is not the next route for improvement.
+- New high-leverage branch: `hidden_context_local_offset128_crop_panel_v1`. It keeps split-screen cardiac rows but crops them to the landmark-containing panel for train/internal-val, matching the organizer statement that the hidden test set has no split-screen images. Smoke run passed and detected `23` split-screen cardiac rows (`A4C=7`, `IVC=14`, `PSAX=2`).
+- Pseudo-hardtasks round-2 was the previous best.
+- run: `dinov3_vitb_taskfpn_hidden_context_pseudo_hardtasks_round2_v1_seed42_local`
+- rank: `12`
+- submission id: `843991`
+- overall score: `25.31`
+- note: this remains the best pre-offset anchor checkpoint and is the warm-start source for `offset128_v1`.
+- Pseudo-labeled target-domain adaptation on the official validation images produced the new best public result so far.
+- run: `dinov3_vitb_taskfpn_hidden_context_pseudo_hardtasks_v1_seed42`
+- rank: `13`
+- submission id: `842049`
+- overall score: `25.32`
+- note: adapting only the harder hidden-gap tasks on the unlabeled validation distribution beat the earlier BN-only recalibration branch.
+- BN recalibration on the official unlabeled validation manifest produced the new best public result so far.
+- run: `dinov3_vitb_taskfpn_hidden_context_local_fugc_fa_bn_v1`
+- rank: `13`
+- submission id: `842013`
+- overall score: `25.37`
+- note: this became the predecessor branch once pseudo-hardtasks adaptation improved it slightly.
+- seed-73 BN recalibration follow-up was close but slightly worse.
+- run: `dinov3_vitb_taskfpn_hidden_context_local_fugc_fa_bn_seed73_v1`
+- rank: `13`
+- submission id: `842018`
+- overall score: `25.42`
+- note: same adaptation idea works, but the seed-42 FUGC+FA base remains the better source checkpoint.

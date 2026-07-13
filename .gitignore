@@ -15,6 +15,10 @@ output/submissions/**
 !output/submissions/**/codabench_result_*.txt
 output/misc/
 output/misc/**
+output/analysis/
+output/analysis/**
+output/pseudo_datasets/
+output/pseudo_datasets/**
 output/analysis/**/A4C/
 output/analysis/**/AOP/
 output/analysis/**/FA/
@@ -34,6 +38,8 @@ best_model.pth
 paper/**/*.aux
 paper/**/*.bbl
 paper/**/*.blg
+paper/**/*.fdb_latexmk
+paper/**/*.fls
 paper/**/*.log
 paper/**/*.out
 paper/**/*.pdf

@@ -71,6 +71,17 @@ TASK_ADAPTER_PROFILE_PRESETS = {
         "FUGC": "light",
         "fetal_femur": "light",
     },
+    "context_local_v1": {
+        "A4C": "A4C",
+        "AOP": "AOP",
+        "FA": "FA",
+        "FUGC": "FUGC",
+        "HC": "HC",
+        "IVC": "IVC",
+        "PLAX": "PLAX",
+        "PSAX": "PSAX",
+        "fetal_femur": "fetal_femur",
+    },
 }
 TASK_HEAD_PROFILE_PRESETS = {
     "uniform": {},
@@ -118,6 +129,99 @@ TASK_DECODER_PROFILE_PRESETS = {
     },
     "hc_refine_v1": {
         "HC": "hc_refine",
+    },
+    "hidden_hc_ivc_refine_v1": {
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+    },
+    "hidden_a4c_hc_ivc_refine_v1": {
+        "A4C": "cardiac_graph",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+    },
+    "hidden_a4cv2_hc_ivc_refine_v1": {
+        "A4C": "a4c_v2",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+    },
+    "hidden_a4cv3_hc_ivc_refine_v1": {
+        "A4C": "a4c_v3",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+    },
+    "hidden_a4cv4_hc_ivc_refine_v1": {
+        "A4C": "a4c_v4",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+    },
+    "hidden_a4c_hc_ivc_fugc_refine_v1": {
+        "A4C": "cardiac_graph",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "FUGC": "fugc",
+    },
+    "hidden_a4c_hc_ivc_fugc_offset_v1": {
+        "A4C": "cardiac_graph",
+        "AOP": "offset_deep",
+        "FA": "offset_deep",
+        "FUGC": "fugc",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "PLAX": "offset_deep",
+        "PSAX": "offset_deep",
+        "fetal_femur": "offset_deep",
+    },
+    "hidden_a4c_hc_ivc_fugc_offset_v2": {
+        "A4C": "cardiac_graph",
+        "AOP": "offset_deep",
+        "FA": "offset_deep",
+        "FUGC": "fugc",
+        "HC": "hc_refine_offset",
+        "IVC": "ivc_refine_v3",
+        "PLAX": "offset_deep",
+        "PSAX": "offset_deep",
+        "fetal_femur": "offset_deep",
+    },
+    "hidden_a4cv2_hc_ivc_fugc_refine_v1": {
+        "A4C": "a4c_v2",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "FUGC": "fugc",
+    },
+    "hidden_a4cv3_hc_ivc_fugc_refine_v1": {
+        "A4C": "a4c_v3",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "FUGC": "fugc",
+    },
+    "hidden_a4cv4_hc_ivc_fugc_refine_v1": {
+        "A4C": "a4c_v4",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "FUGC": "fugc",
+    },
+    "hidden_a4c_hc_ivc_plax_refine_v1": {
+        "A4C": "cardiac_graph",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "PLAX": "plax",
+    },
+    "hidden_a4c_hc_ivc_femur_refine_v1": {
+        "A4C": "cardiac_graph",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "fetal_femur": "femur",
+    },
+    "geometry_family_v2": {
+        "A4C": "cardiac_graph",
+        "AOP": "aop",
+        "FA": "fa_refine",
+        "FUGC": "fugc",
+        "HC": "hc_refine",
+        "IVC": "ivc_refine_v2",
+        "PLAX": "plax",
+        "PSAX": "psax",
+        "fetal_femur": "femur",
     },
     "geometry_v1": {
         "A4C": "dense",
@@ -443,6 +547,26 @@ class ContextExpertsAdapter(nn.Module):
         return x + self.shared_scale * shared_delta + self.group_scale[group_name] * self.group_blocks[group_name](x)
 
 
+class ContextLocalAdapter(nn.Module):
+    """Hybrid adapter that mixes global context first, then corrects with image detail."""
+
+    def __init__(self, channels: int, group_names: list[str]):
+        super().__init__()
+        self.context = ResidualContextAdapter(channels, group_names)
+        self.local = LocalRefineAdapter(channels, group_names)
+        self.context_scale = nn.Parameter(torch.tensor(0.85))
+        self.local_scale = nn.Parameter(torch.tensor(0.60))
+
+    def forward(self, features: torch.Tensor, image: torch.Tensor, group_name: str | None) -> torch.Tensor:
+        context_features = self.context(features, group_name)
+        context_delta = context_features - features
+        mixed = features + self.context_scale * context_delta
+
+        refined_features = self.local(mixed, image, group_name)
+        local_delta = refined_features - mixed
+        return mixed + self.local_scale * local_delta
+
+
 class LandmarkGraphRefineBlock(nn.Module):
     """Lightweight landmark-relation block for feature-conditioned coordinate refinement."""
 
@@ -540,6 +664,189 @@ class DeepHeatmapHead(nn.Module):
         if x.shape[-2:] != out_size:
             x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
         return x
+
+
+class SubpixelOffsetDeepHeatmapHead(nn.Module):
+    """Deep heatmap decoder plus learned per-landmark subpixel offsets.
+
+    The decoder attribute intentionally matches DeepHeatmapHead so existing
+    checkpoints can warm-start the heatmap branch while the offset branch learns
+    a local correction from FPN features.
+    """
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        base_hidden1 = max(in_channels // 2, 192)
+        base_hidden2 = max(base_hidden1 // 2, 128)
+        base_hidden3 = max(base_hidden2 // 2, 96)
+        hidden1 = max(int(base_hidden1 * width_multiplier), 96)
+        hidden2 = max(int(base_hidden2 * width_multiplier), 64)
+        hidden3 = max(int(base_hidden3 * width_multiplier), 64)
+        self.num_points = int(num_points)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+        token_dim = max(in_channels // 2, 128)
+        self.coord_embed = nn.Sequential(
+            nn.Linear(2, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.point_feat_proj = nn.Sequential(
+            nn.Linear(in_channels, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.global_proj = nn.Sequential(
+            nn.Linear(in_channels, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.point_index_embed = nn.Parameter(torch.zeros(1, self.num_points, token_dim))
+        nn.init.trunc_normal_(self.point_index_embed, std=0.02)
+        self.refine_blocks = nn.ModuleList([LandmarkGraphRefineBlock(token_dim) for _ in range(2)])
+        self.offset_head = nn.Sequential(
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, 2),
+            nn.Tanh(),
+        )
+        self.refine_max_offset = 0.030
+
+    @staticmethod
+    def _softargmax_coords(logits: torch.Tensor) -> torch.Tensor:
+        bsz, num_points, h, w = logits.shape
+        probs = torch.softmax(logits.view(bsz, num_points, -1), dim=-1).view(bsz, num_points, h, w)
+        xs = torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype)
+        ys = torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype)
+        grid_x = xs.view(1, 1, 1, w)
+        grid_y = ys.view(1, 1, h, 1)
+        expected_x = (probs * grid_x).sum(dim=(-2, -1))
+        expected_y = (probs * grid_y).sum(dim=(-2, -1))
+        return torch.stack([expected_x, expected_y], dim=-1).reshape(bsz, num_points * 2)
+
+    @staticmethod
+    def _sample_point_features(feat: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        bsz = feat.shape[0]
+        point_coords = coords.view(bsz, -1, 2)
+        grid = point_coords.mul(2.0).sub(1.0).unsqueeze(2)
+        sampled = F.grid_sample(
+            feat,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        return sampled.squeeze(-1).transpose(1, 2).contiguous()
+
+    def forward(self, x: torch.Tensor, out_size):
+        refine_features = x
+        point_logits = self.decoder(x)
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+
+        coarse_coords = self._softargmax_coords(point_logits)
+        coarse_points = coarse_coords.view(coarse_coords.shape[0], self.num_points, 2)
+        point_features = self._sample_point_features(refine_features, coarse_coords)
+        global_feature = F.adaptive_avg_pool2d(refine_features, output_size=1).flatten(1)
+        tokens = (
+            self.coord_embed(coarse_points)
+            + self.point_feat_proj(point_features)
+            + self.global_proj(global_feature).unsqueeze(1)
+            + self.point_index_embed
+        )
+        for block in self.refine_blocks:
+            tokens = block(tokens)
+        offsets = self.offset_head(tokens) * self.refine_max_offset
+        refined_coords = torch.clamp(coarse_points + offsets, 0.0, 1.0).reshape(coarse_coords.shape[0], -1)
+        return point_logits, {
+            "coarse_coords_transformed": coarse_coords,
+            "refined_coords_transformed": refined_coords,
+        }
+
+
+class LogitPatchOffsetRefiner(nn.Module):
+    """Small zero-started local correction from heatmap evidence around each point."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_points: int,
+        hidden_channels: int = 64,
+        patch_size: int = 13,
+        span: float = 0.055,
+        max_offset: float = 0.012,
+    ):
+        super().__init__()
+        self.num_points = int(num_points)
+        self.patch_size = int(patch_size)
+        self.span = float(span)
+        self.max_offset = float(max_offset)
+        self.refine_head = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, 2),
+            nn.Tanh(),
+        )
+        final_linear = self.refine_head[-2]
+        nn.init.zeros_(final_linear.weight)
+        nn.init.zeros_(final_linear.bias)
+
+    def _sample_patches(self, context: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        bsz = context.shape[0]
+        point_coords = coords.view(bsz, self.num_points, 2)
+        grid_lin = torch.linspace(-1.0, 1.0, self.patch_size, device=context.device, dtype=context.dtype)
+        grid_y, grid_x = torch.meshgrid(grid_lin, grid_lin, indexing="ij")
+        base_grid = torch.stack([grid_x, grid_y], dim=-1).view(1, self.patch_size, self.patch_size, 2)
+        patches = []
+        for point_idx in range(self.num_points):
+            center = point_coords[:, point_idx, :].view(bsz, 1, 1, 2)
+            sample_grid = center + base_grid * self.span
+            sample_grid = sample_grid.clamp(0.0, 1.0).mul(2.0).sub(1.0)
+            patches.append(
+                F.grid_sample(
+                    context,
+                    sample_grid,
+                    mode="bilinear",
+                    padding_mode="border",
+                    align_corners=False,
+                )
+            )
+        return torch.cat(patches, dim=0)
+
+    def forward(self, context: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        bsz = context.shape[0]
+        patches = self._sample_patches(context, coords)
+        offsets = self.refine_head(patches).view(self.num_points, bsz, 2).transpose(0, 1)
+        points = coords.view(bsz, self.num_points, 2)
+        refined = torch.clamp(points + offsets * self.max_offset, 0.0, 1.0)
+        return refined.reshape(bsz, self.num_points * 2)
 
 
 class LineHeatmapHead(nn.Module):
@@ -1107,6 +1414,440 @@ class A4CHeatmapHead(nn.Module):
         return x
 
 
+class A4CStructuredV2HeatmapHead(nn.Module):
+    """Group-aware A4C decoder with graph reasoning and local per-point refinement."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 224) * width_multiplier), 128)
+        hidden2 = max(int(max(hidden1 // 2, 176) * width_multiplier), 112)
+        hidden3 = max(int(max(hidden2 // 2, 144) * width_multiplier), 96)
+        token_dim = max(hidden3, 128)
+        self.num_points = num_points
+        self.local_patch_size = 12
+        self.local_span = 0.08
+        self.num_groups = max(1, min(4, num_points // 4 if num_points >= 8 else num_points))
+
+        group_ids = torch.arange(num_points, dtype=torch.long) * self.num_groups // max(num_points, 1)
+        self.register_buffer("group_ids", group_ids.clamp(0, self.num_groups - 1), persistent=False)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.context = nn.Sequential(
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, dilation=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+        )
+        self.point_head = nn.Conv2d(hidden3, num_points, kernel_size=1)
+        self.coord_embed = nn.Sequential(
+            nn.Linear(2, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.point_feat_proj = nn.Sequential(
+            nn.Linear(hidden3, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.global_proj = nn.Sequential(
+            nn.Linear(hidden3, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.group_feat_proj = nn.Sequential(
+            nn.Linear(hidden3 + 2, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
+        )
+        self.point_index_embed = nn.Parameter(torch.zeros(1, num_points, token_dim))
+        self.group_index_embed = nn.Parameter(torch.zeros(1, self.num_groups, token_dim))
+        nn.init.trunc_normal_(self.point_index_embed, std=0.02)
+        nn.init.trunc_normal_(self.group_index_embed, std=0.02)
+        self.graph_blocks = nn.ModuleList(
+            [LandmarkGraphRefineBlock(token_dim) for _ in range(4)]
+        )
+        self.graph_offset_head = nn.Sequential(
+            nn.LayerNorm(token_dim),
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, 2),
+            nn.Tanh(),
+        )
+        local_hidden = max(token_dim, 128)
+        self.local_refine_head = nn.Sequential(
+            nn.Conv2d(hidden3 + 1, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(hidden3, local_hidden),
+            nn.GELU(),
+            nn.Linear(local_hidden, 2),
+            nn.Tanh(),
+        )
+        self.graph_refine_max_offset = 0.040
+        self.local_refine_max_offset = 0.020
+
+    @staticmethod
+    def _softargmax_coords(logits: torch.Tensor) -> torch.Tensor:
+        bsz, num_points, h, w = logits.shape
+        probs = torch.softmax(logits.view(bsz, num_points, -1), dim=-1).view(bsz, num_points, h, w)
+        xs = torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype)
+        ys = torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype)
+        grid_x = xs.view(1, 1, 1, w)
+        grid_y = ys.view(1, 1, h, 1)
+        expected_x = (probs * grid_x).sum(dim=(-2, -1))
+        expected_y = (probs * grid_y).sum(dim=(-2, -1))
+        return torch.stack([expected_x, expected_y], dim=-1).reshape(bsz, num_points * 2)
+
+    @staticmethod
+    def _sample_point_features(feat: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        bsz, channels = feat.shape[:2]
+        point_coords = coords.view(bsz, -1, 2)
+        grid = point_coords.mul(2.0).sub(1.0).unsqueeze(2)
+        sampled = F.grid_sample(
+            feat,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        return sampled.squeeze(-1).transpose(1, 2).contiguous()
+
+    def _build_group_tokens(self, coarse_points: torch.Tensor, point_features: torch.Tensor) -> torch.Tensor:
+        bsz = coarse_points.shape[0]
+        group_tokens = []
+        for group_idx in range(self.num_groups):
+            mask = self.group_ids == group_idx
+            coords_group = coarse_points[:, mask, :]
+            feats_group = point_features[:, mask, :]
+            pooled = torch.cat([feats_group.mean(dim=1), coords_group.mean(dim=1)], dim=-1)
+            token = self.group_feat_proj(pooled)
+            group_tokens.append(token)
+        return torch.stack(group_tokens, dim=1) + self.group_index_embed
+
+    def _sample_local_patches(self, feat: torch.Tensor, point_logits: torch.Tensor, coarse_points: torch.Tensor) -> torch.Tensor:
+        bsz, channels, _, _ = feat.shape
+        patches = []
+        patch_size = self.local_patch_size
+        grid_lin = torch.linspace(-1.0, 1.0, patch_size, device=feat.device, dtype=feat.dtype)
+        grid_y, grid_x = torch.meshgrid(grid_lin, grid_lin, indexing="ij")
+        base_grid = torch.stack([grid_x, grid_y], dim=-1).view(1, patch_size, patch_size, 2)
+        for point_idx in range(self.num_points):
+            refine_feat = torch.cat(
+                [feat, torch.sigmoid(point_logits[:, point_idx : point_idx + 1])],
+                dim=1,
+            )
+            center = coarse_points[:, point_idx, :].view(bsz, 1, 1, 2)
+            sample_grid = center + base_grid * self.local_span
+            sample_grid = sample_grid.clamp(0.0, 1.0).mul(2.0).sub(1.0)
+            patch = F.grid_sample(
+                refine_feat,
+                sample_grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=False,
+            )
+            patches.append(patch)
+        return torch.stack(patches, dim=1)
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = x + self.context(x)
+        x = self.decoder(x)
+        point_logits = self.point_head(x)
+        feat_for_refine = x
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+        if feat_for_refine.shape[-2:] != out_size:
+            feat_for_refine = F.interpolate(feat_for_refine, size=out_size, mode="bilinear", align_corners=False)
+
+        coarse_coords = self._softargmax_coords(point_logits)
+        coarse_points = coarse_coords.view(coarse_coords.shape[0], self.num_points, 2)
+        point_features = self._sample_point_features(feat_for_refine, coarse_coords)
+        pooled_feature = F.adaptive_avg_pool2d(feat_for_refine, output_size=1).flatten(1)
+        group_tokens = self._build_group_tokens(coarse_points, point_features)
+        group_context = group_tokens[:, self.group_ids, :]
+        point_tokens = (
+            self.coord_embed(coarse_points)
+            + self.point_feat_proj(point_features)
+            + self.global_proj(pooled_feature).unsqueeze(1)
+            + group_context
+            + self.point_index_embed
+        )
+        for block in self.graph_blocks:
+            point_tokens = block(point_tokens)
+        graph_offsets = self.graph_offset_head(point_tokens) * self.graph_refine_max_offset
+
+        local_patches = self._sample_local_patches(feat_for_refine, point_logits, coarse_points)
+        patch_input = local_patches.view(
+            coarse_points.shape[0] * self.num_points,
+            local_patches.shape[2],
+            local_patches.shape[3],
+            local_patches.shape[4],
+        )
+        local_offsets = self.local_refine_head(patch_input).view(coarse_points.shape[0], self.num_points, 2)
+        local_offsets = local_offsets * self.local_refine_max_offset
+
+        refined_coords = torch.clamp(coarse_points + graph_offsets + local_offsets, 0.0, 1.0).reshape(coarse_coords.shape[0], -1)
+        return point_logits, {
+            "coarse_coords_transformed": coarse_coords,
+            "refined_coords_transformed": refined_coords,
+        }
+
+
+class A4CResidualLocalRefineHeatmapHead(CardiacGraphRefineHeatmapHead):
+    """Checkpoint-compatible A4C upgrade with small zero-init local residual refinement."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__(in_channels, num_points, width_multiplier=width_multiplier)
+        hidden3 = self.point_head.in_channels
+        refine_hidden = max(hidden3, 96)
+        self.local_patch_size = 12
+        self.local_span = 0.06
+        self.local_refine_head = nn.Sequential(
+            nn.Conv2d(hidden3 + 1, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(hidden3, refine_hidden),
+            nn.GELU(),
+            nn.Linear(refine_hidden, 2),
+            nn.Tanh(),
+        )
+        self.local_refine_max_offset = 0.010
+        final_linear = self.local_refine_head[-2]
+        nn.init.zeros_(final_linear.weight)
+        nn.init.zeros_(final_linear.bias)
+
+    def _sample_local_patches(self, feat: torch.Tensor, point_logits: torch.Tensor, coarse_points: torch.Tensor) -> torch.Tensor:
+        bsz = feat.shape[0]
+        patch_size = self.local_patch_size
+        grid_lin = torch.linspace(-1.0, 1.0, patch_size, device=feat.device, dtype=feat.dtype)
+        grid_y, grid_x = torch.meshgrid(grid_lin, grid_lin, indexing="ij")
+        base_grid = torch.stack([grid_x, grid_y], dim=-1).view(1, patch_size, patch_size, 2)
+        patches = []
+        for point_idx in range(self.num_points):
+            refine_feat = torch.cat(
+                [feat, torch.sigmoid(point_logits[:, point_idx : point_idx + 1])],
+                dim=1,
+            )
+            center = coarse_points[:, point_idx, :].view(bsz, 1, 1, 2)
+            sample_grid = center + base_grid * self.local_span
+            sample_grid = sample_grid.clamp(0.0, 1.0).mul(2.0).sub(1.0)
+            patch = F.grid_sample(
+                refine_feat,
+                sample_grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=False,
+            )
+            patches.append(patch)
+        return torch.stack(patches, dim=1)
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = x + self.context(x)
+        x = self.decoder(x)
+        point_logits = self.point_head(x)
+        feat_for_refine = x
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+        if feat_for_refine.shape[-2:] != out_size:
+            feat_for_refine = F.interpolate(feat_for_refine, size=out_size, mode="bilinear", align_corners=False)
+
+        coarse_coords = self._softargmax_coords(point_logits)
+        coarse_points = coarse_coords.view(coarse_coords.shape[0], self.num_points, 2)
+        point_features = self._sample_point_features(feat_for_refine, coarse_coords)
+        pooled_feature = F.adaptive_avg_pool2d(feat_for_refine, output_size=1).flatten(1)
+        tokens = (
+            self.coord_embed(coarse_points)
+            + self.point_feat_proj(point_features)
+            + self.global_proj(pooled_feature).unsqueeze(1)
+            + self.point_index_embed
+        )
+        for block in self.graph_blocks:
+            tokens = block(tokens)
+        graph_offsets = self.offset_head(tokens) * self.refine_max_offset
+
+        local_patches = self._sample_local_patches(feat_for_refine, point_logits, coarse_points)
+        patch_input = local_patches.view(
+            coarse_points.shape[0] * self.num_points,
+            local_patches.shape[2],
+            local_patches.shape[3],
+            local_patches.shape[4],
+        )
+        local_offsets = self.local_refine_head(patch_input).view(coarse_points.shape[0], self.num_points, 2)
+        local_offsets = local_offsets * self.local_refine_max_offset
+
+        refined_coords = torch.clamp(coarse_points + graph_offsets + local_offsets, 0.0, 1.0).reshape(coarse_coords.shape[0], -1)
+        return point_logits, {
+            "coarse_coords_transformed": coarse_coords,
+            "refined_coords_transformed": refined_coords,
+        }
+
+
+class A4CStrongResidualHeatmapHead(CardiacGraphRefineHeatmapHead):
+    """Stronger checkpoint-compatible A4C head with multiscale residual heatmaps and local refinement."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__(in_channels, num_points, width_multiplier=width_multiplier)
+        hidden3 = self.point_head.in_channels
+        refine_hidden = max(hidden3 + 32, 128)
+        self.local_patch_size = 14
+        self.local_span = 0.08
+        self.ms_d1 = nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, dilation=1, bias=False)
+        self.ms_d2 = nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=2, dilation=2, bias=False)
+        self.ms_d4 = nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=4, dilation=4, bias=False)
+        self.ms_bn = nn.BatchNorm2d(hidden3)
+        self.ms_act = nn.GELU()
+        self.ms_fuse = nn.Sequential(
+            nn.Conv2d(hidden3 * 2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+        )
+        self.heatmap_residual_head = nn.Sequential(
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, num_points, kernel_size=1),
+        )
+        self.local_refine_head = nn.Sequential(
+            nn.Conv2d(hidden3 + 1, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(hidden3, refine_hidden),
+            nn.GELU(),
+            nn.Linear(refine_hidden, 2),
+            nn.Tanh(),
+        )
+        self.heatmap_residual_scale = 0.35
+        self.local_refine_max_offset = 0.014
+        heatmap_last = self.heatmap_residual_head[-1]
+        nn.init.zeros_(heatmap_last.weight)
+        nn.init.zeros_(heatmap_last.bias)
+        local_last = self.local_refine_head[-2]
+        nn.init.zeros_(local_last.weight)
+        nn.init.zeros_(local_last.bias)
+
+    def _sample_local_patches(self, feat: torch.Tensor, point_logits: torch.Tensor, coarse_points: torch.Tensor) -> torch.Tensor:
+        bsz = feat.shape[0]
+        patch_size = self.local_patch_size
+        grid_lin = torch.linspace(-1.0, 1.0, patch_size, device=feat.device, dtype=feat.dtype)
+        grid_y, grid_x = torch.meshgrid(grid_lin, grid_lin, indexing="ij")
+        base_grid = torch.stack([grid_x, grid_y], dim=-1).view(1, patch_size, patch_size, 2)
+        patches = []
+        for point_idx in range(self.num_points):
+            refine_feat = torch.cat(
+                [feat, torch.sigmoid(point_logits[:, point_idx : point_idx + 1])],
+                dim=1,
+            )
+            center = coarse_points[:, point_idx, :].view(bsz, 1, 1, 2)
+            sample_grid = center + base_grid * self.local_span
+            sample_grid = sample_grid.clamp(0.0, 1.0).mul(2.0).sub(1.0)
+            patch = F.grid_sample(
+                refine_feat,
+                sample_grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=False,
+            )
+            patches.append(patch)
+        return torch.stack(patches, dim=1)
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = x + self.context(x)
+        x = self.decoder(x)
+        ms_context = self.ms_act(self.ms_bn(self.ms_d1(x) + self.ms_d2(x) + self.ms_d4(x)))
+        fused_feat = self.ms_fuse(torch.cat([x, ms_context], dim=1))
+
+        base_logits = self.point_head(x)
+        residual_logits = self.heatmap_residual_head(fused_feat) * self.heatmap_residual_scale
+        point_logits = base_logits + residual_logits
+        feat_for_refine = fused_feat
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+        if feat_for_refine.shape[-2:] != out_size:
+            feat_for_refine = F.interpolate(feat_for_refine, size=out_size, mode="bilinear", align_corners=False)
+
+        coarse_coords = self._softargmax_coords(point_logits)
+        coarse_points = coarse_coords.view(coarse_coords.shape[0], self.num_points, 2)
+        point_features = self._sample_point_features(feat_for_refine, coarse_coords)
+        pooled_feature = F.adaptive_avg_pool2d(feat_for_refine, output_size=1).flatten(1)
+        tokens = (
+            self.coord_embed(coarse_points)
+            + self.point_feat_proj(point_features)
+            + self.global_proj(pooled_feature).unsqueeze(1)
+            + self.point_index_embed
+        )
+        for block in self.graph_blocks:
+            tokens = block(tokens)
+        graph_offsets = self.offset_head(tokens) * self.refine_max_offset
+
+        local_patches = self._sample_local_patches(feat_for_refine, point_logits, coarse_points)
+        patch_input = local_patches.view(
+            coarse_points.shape[0] * self.num_points,
+            local_patches.shape[2],
+            local_patches.shape[3],
+            local_patches.shape[4],
+        )
+        local_offsets = self.local_refine_head(patch_input).view(coarse_points.shape[0], self.num_points, 2)
+        local_offsets = local_offsets * self.local_refine_max_offset
+
+        refined_coords = torch.clamp(coarse_points + graph_offsets + local_offsets, 0.0, 1.0).reshape(coarse_coords.shape[0], -1)
+        return point_logits, {
+            "coarse_coords_transformed": coarse_coords,
+            "refined_coords_transformed": refined_coords,
+        }
+
+
 class AOPHeatmapHead(nn.Module):
     """Dedicated arc-aware decoder for compact curved AOP anatomy."""
 
@@ -1194,6 +1935,122 @@ class FAHeatmapHead(nn.Module):
         if x.shape[-2:] != out_size:
             x = F.interpolate(x, size=out_size, mode="bilinear", align_corners=False)
         return x
+
+
+class FARefineHeatmapHead(nn.Module):
+    """Axis-aware coarse-to-fine decoder for fetal abdomen landmarks."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__()
+        hidden1 = max(int(max(in_channels // 2, 208) * width_multiplier), 120)
+        hidden2 = max(int(max(hidden1 // 2, 144) * width_multiplier), 96)
+        hidden3 = max(int(max(hidden2 // 2, 112) * width_multiplier), 72)
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.axis_context = nn.Sequential(
+            nn.Conv2d(hidden1, hidden1, kernel_size=(1, 9), padding=(0, 4), bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=(9, 1), padding=(4, 0), bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+            nn.Conv2d(hidden1, hidden1, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm2d(hidden1),
+            nn.GELU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden1, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Conv2d(hidden2, hidden2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden2),
+            nn.GELU(),
+            nn.Upsample(scale_factor=2.0, mode="bilinear", align_corners=False),
+            nn.Conv2d(hidden2, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+            nn.Conv2d(hidden3, hidden3, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden3),
+            nn.GELU(),
+        )
+        self.point_head = nn.Conv2d(hidden3, num_points, kernel_size=1)
+        self.refine_patch_size = 18
+        refine_hidden = max(hidden3, 96)
+        refine_in_channels = hidden3 + num_points
+        self.refine_head = nn.Sequential(
+            nn.Conv2d(refine_in_channels, refine_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(refine_hidden),
+            nn.GELU(),
+            nn.Conv2d(refine_hidden, refine_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(refine_hidden),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(refine_hidden, refine_hidden),
+            nn.GELU(),
+            nn.Linear(refine_hidden, num_points * 2),
+            nn.Tanh(),
+        )
+        self.refine_max_offset = 0.045
+
+    @staticmethod
+    def _softargmax_coords(logits: torch.Tensor) -> torch.Tensor:
+        bsz, num_points, h, w = logits.shape
+        probs = torch.softmax(logits.view(bsz, num_points, -1), dim=-1).view(bsz, num_points, h, w)
+        xs = torch.linspace(0.0, 1.0, w, device=logits.device, dtype=logits.dtype)
+        ys = torch.linspace(0.0, 1.0, h, device=logits.device, dtype=logits.dtype)
+        grid_x = xs.view(1, 1, 1, w)
+        grid_y = ys.view(1, 1, h, 1)
+        expected_x = (probs * grid_x).sum(dim=(-2, -1))
+        expected_y = (probs * grid_y).sum(dim=(-2, -1))
+        return torch.stack([expected_x, expected_y], dim=-1).reshape(bsz, num_points * 2)
+
+    def _sample_refine_roi(self, feat: torch.Tensor, coarse_coords: torch.Tensor) -> torch.Tensor:
+        bsz = feat.shape[0]
+        patch_size = self.refine_patch_size
+        points = coarse_coords.reshape(bsz, -1, 2)
+        min_xy = points.min(dim=1).values
+        max_xy = points.max(dim=1).values
+        center = 0.5 * (min_xy + max_xy)
+        span_xy = (max_xy - min_xy).clamp(0.08, 0.60)
+        span = span_xy.amax(dim=-1).clamp(0.16, 0.34)
+
+        grid_lin = torch.linspace(-1.0, 1.0, patch_size, device=feat.device, dtype=feat.dtype)
+        grid_y, grid_x = torch.meshgrid(grid_lin, grid_lin, indexing="ij")
+        base_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).repeat(bsz, 1, 1, 1)
+
+        sample_grid = center.view(bsz, 1, 1, 2) + base_grid * span.view(bsz, 1, 1, 1)
+        sample_grid = sample_grid.clamp(0.0, 1.0)
+        sample_grid = sample_grid * 2.0 - 1.0
+        return F.grid_sample(feat, sample_grid, mode="bilinear", padding_mode="border", align_corners=False)
+
+    def forward(self, x: torch.Tensor, out_size):
+        x = self.stem(x)
+        x = x + self.axis_context(x)
+        x = self.decoder(x)
+        point_logits = self.point_head(x)
+        feat_for_refine = x
+        if point_logits.shape[-2:] != out_size:
+            point_logits = F.interpolate(point_logits, size=out_size, mode="bilinear", align_corners=False)
+        if feat_for_refine.shape[-2:] != out_size:
+            feat_for_refine = F.interpolate(feat_for_refine, size=out_size, mode="bilinear", align_corners=False)
+
+        coarse_coords = self._softargmax_coords(point_logits)
+        refine_input = torch.cat([feat_for_refine, torch.sigmoid(point_logits)], dim=1)
+        roi_patch = self._sample_refine_roi(refine_input, coarse_coords)
+        offsets = self.refine_head(roi_patch) * self.refine_max_offset
+        refined_coords = (coarse_coords + offsets).clamp(0.0, 1.0)
+        return point_logits, {
+            "coarse_coords_transformed": coarse_coords,
+            "refined_coords_transformed": refined_coords,
+        }
 
 
 class HCHeatmapHead(nn.Module):
@@ -1355,6 +2212,30 @@ class HCRefineHeatmapHead(nn.Module):
             "coarse_coords_transformed": coarse_coords,
             "refined_coords_transformed": refined_coords,
         }
+
+
+class HCRefineOffsetHeatmapHead(HCRefineHeatmapHead):
+    """HC refine head with an additional zero-started local heatmap offset stage."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__(in_channels, num_points, width_multiplier)
+        self.post_offset_refiner = LogitPatchOffsetRefiner(
+            in_channels=num_points,
+            num_points=num_points,
+            hidden_channels=64,
+            patch_size=13,
+            span=0.050,
+            max_offset=0.010,
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        refined_coords = aux_outputs["refined_coords_transformed"]
+        post_refined_coords = self.post_offset_refiner(torch.sigmoid(point_logits), refined_coords)
+        aux_outputs = dict(aux_outputs)
+        aux_outputs["pre_post_offset_coords_transformed"] = refined_coords
+        aux_outputs["refined_coords_transformed"] = post_refined_coords
+        return point_logits, aux_outputs
 
 
 class IVCHeatmapHead(nn.Module):
@@ -1696,6 +2577,32 @@ class IVCRefineV2HeatmapHead(nn.Module):
             "band_logits": band_logits,
             "refined_coords_transformed": refined_coords,
         }
+
+
+class IVCRefineV3HeatmapHead(IVCRefineV2HeatmapHead):
+    """IVC rotated-strip head with a zero-started local endpoint correction stage."""
+
+    def __init__(self, in_channels: int, num_points: int, width_multiplier: float = 1.0):
+        super().__init__(in_channels, num_points, width_multiplier)
+        self.post_offset_refiner = LogitPatchOffsetRefiner(
+            in_channels=num_points + 1,
+            num_points=num_points,
+            hidden_channels=64,
+            patch_size=15,
+            span=0.060,
+            max_offset=0.014,
+        )
+
+    def forward(self, x: torch.Tensor, out_size):
+        point_logits, aux_outputs = super().forward(x, out_size)
+        refined_coords = aux_outputs["refined_coords_transformed"]
+        band_logits = aux_outputs["band_logits"]
+        post_context = torch.cat([torch.sigmoid(point_logits), torch.sigmoid(band_logits)], dim=1)
+        post_refined_coords = self.post_offset_refiner(post_context, refined_coords)
+        aux_outputs = dict(aux_outputs)
+        aux_outputs["pre_post_offset_coords_transformed"] = refined_coords
+        aux_outputs["refined_coords_transformed"] = post_refined_coords
+        return point_logits, aux_outputs
 
 
 class PLAXHeatmapHead(nn.Module):
@@ -2083,6 +2990,7 @@ class MultiTaskModelFactory(nn.Module):
         self.context_adapters = None
         self.task_film_adapters = None
         self.context_expert_adapters = None
+        self.context_local_adapters = None
         head_channels = self.encoder.out_channels
         if use_fpn:
             if fpn_mode not in FPN_MODES:
@@ -2125,24 +3033,33 @@ class MultiTaskModelFactory(nn.Module):
             self.context_adapters = ResidualContextAdapter(head_channels, active_groups)
         elif task_adapter_profile == "context_experts_v1" and active_groups:
             self.context_expert_adapters = ContextExpertsAdapter(head_channels, active_groups)
+        elif task_adapter_profile == "context_local_v1" and active_groups:
+            self.context_local_adapters = ContextLocalAdapter(head_channels, active_groups)
         elif task_adapter_profile == "taskfilm_v1" and active_groups:
             self.task_film_adapters = TaskFiLMAdapter(head_channels, active_groups)
         decoder_family_to_head = {
             "basic": HeatmapHead,
             "deep": DeepHeatmapHead,
+            "offset_deep": SubpixelOffsetDeepHeatmapHead,
             "cardiac_graph": CardiacGraphRefineHeatmapHead,
+            "a4c_v2": A4CStructuredV2HeatmapHead,
+            "a4c_v3": A4CResidualLocalRefineHeatmapHead,
+            "a4c_v4": A4CStrongResidualHeatmapHead,
             "refine": ROIRefineHeatmapHead,
             "ivc_refine": IVCRefineHeatmapHead,
             "ivc_refine_v2": IVCRefineV2HeatmapHead,
+            "ivc_refine_v3": IVCRefineV3HeatmapHead,
             "line": LineHeatmapHead,
             "compact": CompactHeatmapHead,
             "dense": DenseRelationalHeatmapHead,
             "femur": FemurHeatmapHead,
             "fugc": FUGCHeatmapHead,
             "hc_refine": HCRefineHeatmapHead,
+            "hc_refine_offset": HCRefineOffsetHeatmapHead,
             "a4c": A4CHeatmapHead,
             "aop": AOPHeatmapHead,
             "fa": FAHeatmapHead,
+            "fa_refine": FARefineHeatmapHead,
             "hc": HCHeatmapHead,
             "ivc": IVCHeatmapHead,
             "plax": PLAXHeatmapHead,
@@ -2206,6 +3123,9 @@ class MultiTaskModelFactory(nn.Module):
         if self.context_expert_adapters is not None:
             adapter_group = self.task_to_adapter_group.get(task_id)
             features = self.context_expert_adapters(features, adapter_group)
+        if self.context_local_adapters is not None:
+            adapter_group = self.task_to_adapter_group.get(task_id)
+            features = self.context_local_adapters(features, input_image, adapter_group)
         if self.task_film_adapters is not None:
             adapter_group = self.task_to_adapter_group.get(task_id)
             features = self.task_film_adapters(features, adapter_group)

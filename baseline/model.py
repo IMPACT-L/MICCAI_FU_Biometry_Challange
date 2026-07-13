@@ -27,6 +27,8 @@ from utils import (
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 OUTPUT_DECIMALS = 6
 DEFAULT_TTA_TASK_IDS = {"AOP", "FA", "FUGC", "HC", "IVC", "PSAX", "fetal_femur"}
+IMAGENET_MEAN = torch.tensor((0.485, 0.456, 0.406), dtype=torch.float32).view(1, 3, 1, 1)
+IMAGENET_STD = torch.tensor((0.229, 0.224, 0.225), dtype=torch.float32).view(1, 3, 1, 1)
 
 
 def normalize_submission_image_path(image_path: str, task_id: str) -> str:
@@ -48,6 +50,51 @@ def parse_task_id_csv(value: Optional[str]) -> Optional[set[str]]:
         return None
     task_ids = {item.strip() for item in str(value).split(",") if item.strip()}
     return task_ids or None
+
+
+def _unnormalize_batch(images: torch.Tensor) -> torch.Tensor:
+    mean = IMAGENET_MEAN.to(device=images.device, dtype=images.dtype)
+    std = IMAGENET_STD.to(device=images.device, dtype=images.dtype)
+    return (images * std + mean).clamp(0.0, 1.0)
+
+
+def _normalize_batch(images: torch.Tensor) -> torch.Tensor:
+    mean = IMAGENET_MEAN.to(device=images.device, dtype=images.dtype)
+    std = IMAGENET_STD.to(device=images.device, dtype=images.dtype)
+    return (images.clamp(0.0, 1.0) - mean) / std
+
+
+def _apply_clahe_rgb(image_rgb_uint8: np.ndarray, clip_limit: float = 2.0) -> np.ndarray:
+    lab = cv2.cvtColor(image_rgb_uint8, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    merged = cv2.merge((l, a, b))
+    return cv2.cvtColor(merged, cv2.COLOR_LAB2RGB)
+
+
+def _apply_gamma_rgb(image_rgb_uint8: np.ndarray, gamma: float) -> np.ndarray:
+    image_float = image_rgb_uint8.astype(np.float32) / 255.0
+    corrected = np.power(np.clip(image_float, 0.0, 1.0), gamma)
+    return np.clip(corrected * 255.0, 0.0, 255.0).astype(np.uint8)
+
+
+def build_photometric_variants(images: torch.Tensor) -> list[torch.Tensor]:
+    base = _unnormalize_batch(images).detach().cpu()
+    base_np = (base.permute(0, 2, 3, 1).numpy() * 255.0).round().clip(0, 255).astype(np.uint8)
+
+    variants_np = [
+        base_np,
+        np.stack([_apply_clahe_rgb(img, clip_limit=2.0) for img in base_np], axis=0),
+        np.stack([_apply_gamma_rgb(img, gamma=0.85) for img in base_np], axis=0),
+        np.stack([_apply_gamma_rgb(img, gamma=1.15) for img in base_np], axis=0),
+    ]
+
+    variants = []
+    for variant_np in variants_np:
+        variant = torch.from_numpy(variant_np).permute(0, 3, 1, 2).to(dtype=images.dtype, device=images.device) / 255.0
+        variants.append(_normalize_batch(variant))
+    return variants
 
 
 def load_checkpoint_payload(checkpoint_path: str, device: torch.device):
@@ -217,7 +264,7 @@ class Model:
             ]
         )
 
-    def _predict_task_transformed_coords(self, task_images: torch.Tensor, task_id: str) -> torch.Tensor:
+    def _forward_task_coords(self, task_images: torch.Tensor, task_id: str) -> torch.Tensor:
         model_output = self.model(task_images, task_id=task_id, return_prior=True)
         aux_outputs = {}
         if len(model_output) == 3:
@@ -226,30 +273,31 @@ class Model:
             _, pred_heatmaps = model_output
 
         refined_coords = aux_outputs.get("refined_coords_transformed")
-        if self.tta_mode != "hflip" or (self.tta_task_ids is not None and task_id not in self.tta_task_ids):
-            return refined_coords if refined_coords is not None else decode_heatmaps_to_normalized_coords(pred_heatmaps)
+        return refined_coords if refined_coords is not None else decode_heatmaps_to_normalized_coords(pred_heatmaps)
+
+    def _predict_task_transformed_coords(self, task_images: torch.Tensor, task_id: str) -> torch.Tensor:
+        apply_tta = self.tta_mode != "none" and (self.tta_task_ids is None or task_id in self.tta_task_ids)
+        use_hflip = self.tta_mode in {"hflip", "hflip_photometric"}
+        use_photometric = self.tta_mode in {"photometric", "hflip_photometric"}
+
+        def predict_variant(images_variant: torch.Tensor) -> torch.Tensor:
+            if not use_photometric:
+                return self._forward_task_coords(images_variant, task_id)
+            variant_preds = [self._forward_task_coords(variant, task_id) for variant in build_photometric_variants(images_variant)]
+            return torch.stack(variant_preds, dim=0).mean(dim=0)
+
+        if not apply_tta:
+            return self._forward_task_coords(task_images, task_id)
+
+        base_coords = canonicalize_task_coords(predict_variant(task_images), task_id)
+        if not use_hflip:
+            return base_coords
 
         flipped_images = torch.flip(task_images, dims=[-1])
-        flipped_output = self.model(flipped_images, task_id=task_id, return_prior=True)
-        flipped_aux = {}
-        if len(flipped_output) == 3:
-            _, flipped_heatmaps, flipped_aux = flipped_output
-        else:
-            _, flipped_heatmaps = flipped_output
-
-        flipped_refined = flipped_aux.get("refined_coords_transformed")
-        if refined_coords is not None or flipped_refined is not None:
-            base_coords = refined_coords if refined_coords is not None else decode_heatmaps_to_normalized_coords(pred_heatmaps)
-            flip_coords = (
-                flipped_refined
-                if flipped_refined is not None
-                else decode_heatmaps_to_normalized_coords(flipped_heatmaps)
-            ).clone()
-            flip_coords[:, 0::2] = 1.0 - flip_coords[:, 0::2]
-            return 0.5 * (base_coords + flip_coords)
-
-        merged_heatmaps = 0.5 * (pred_heatmaps + torch.flip(flipped_heatmaps, dims=[-1]))
-        return decode_heatmaps_to_normalized_coords(merged_heatmaps)
+        flip_coords = predict_variant(flipped_images).clone()
+        flip_coords[:, 0::2] = 1.0 - flip_coords[:, 0::2]
+        flip_coords = canonicalize_task_coords(flip_coords, task_id)
+        return 0.5 * (base_coords + flip_coords)
 
     def _build_task_configs(self, dataframe: pd.DataFrame):
         task_configs = []
@@ -339,9 +387,9 @@ class Model:
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
         )
         print(f"Model profile: {self.model_profile if self.model_profile is not None else 'checkpoint/manual'}")
-        if self.tta_mode == "hflip":
+        if self.tta_mode != "none":
             print(
-                "Inference TTA: hflip "
+                f"Inference TTA: {self.tta_mode} "
                 f"(tasks={sorted(self.tta_task_ids) if self.tta_task_ids is not None else 'all'})"
             )
 
@@ -509,14 +557,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "geometry_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=None,
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "taskfilm_v1"),
         default=None,
         help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
@@ -550,7 +598,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tta-mode",
         type=str,
-        choices=("none", "hflip"),
+        choices=("none", "hflip", "photometric", "hflip_photometric"),
         default="none",
         help="Inference-time test-time augmentation mode.",
     )
