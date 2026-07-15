@@ -782,6 +782,7 @@ Lower overall score is better. The table below lists the saved CodaBench leaderb
 | 2026-07-13 | - | unknown | - | 24.79 | `dinov3_vitb_hidden_context_offset128_soup_v1_a95` |
 | 2026-07-13 09:15 | 9 | 845990 | saharch | 24.87 | `dinov3_vitb_hidden_context_offset256_v1_seed42` |
 | 2026-07-14 20:47 | 6 | 850233 | hmzrse | 24.21 | `20260714_2047_850233` |
+| 2026-07-15 | - | - | - | 24.22 | `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_mid_seed42` |
 | 2026-07-15 | - | - | - | 24.23 | `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42` |
 | 2026-07-15 | - | - | - | 24.88 | `dinov3_vitb_hidden_context_boundary_offset128_v1_seed42` |
 

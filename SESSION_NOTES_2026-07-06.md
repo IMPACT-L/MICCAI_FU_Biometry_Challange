@@ -338,4 +338,5 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
 - recommended upload order if testing this signal: `fugc_hc` first, then `mid` only if a second chance is available.
 - hidden result:
   - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42` scored `24.23`.
-  - conclusion: target-equivariance produced a competitive but not best signal. Keep the `24.21` AOP-locked femur-clean blend as the primary anchor.
+  - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_mid_seed42` scored `24.22`.
+  - conclusion: target-equivariance produced competitive but not best signals. Keep the `24.21` AOP-locked femur-clean blend as the primary anchor.
