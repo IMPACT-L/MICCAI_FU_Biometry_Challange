@@ -212,6 +212,7 @@ Comparable saved runs:
 
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
+| `dinov3_vitb_hidden_context_offset128_femurclean_v10_probe_aop850_locked_seed42` | `NA` | `24.21` |
 | `dinov3_vitb_hidden_context_offset128_v1_femurclean_edgesnap_taskblend_v6_keepbestfemur_seed42` | `NA` | `24.22` |
 | `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v6_top2_seed42` | `NA` | `24.27` |
 | `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v5_top1_or_top2_seed42` | `NA` | `24.29` |
