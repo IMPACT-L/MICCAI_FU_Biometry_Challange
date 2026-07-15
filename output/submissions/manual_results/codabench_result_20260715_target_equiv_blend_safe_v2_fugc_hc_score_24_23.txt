@@ -1,0 +1,4 @@
+run: dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42
+date: 2026-07-15
+score: 24.23
+notes: Target-equivariance safe-v2 hybrid candidate. Improved over raw target-equivariance variants but remained slightly worse than the 24.21 best AOP-locked femur-clean blend.

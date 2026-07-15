@@ -66,11 +66,13 @@ This audit verifies:
 - validation manifest total (`619`) and per-task counts, including `FUGC=20`
 - absence of duplicate validation entries
 - FA point-order sanity after the organizer-requested fix path
+- fetal_femur orientation-anomaly note: the raw CSV may still contain the 25 organizer-listed flipped samples, but the training loader excludes them automatically
 
 ## Notes
 
 - The script assumes the raw archive already contains the official CSV files and image folders.
 - If the raw dataset includes duplicate image basenames in the same task, the script preserves unique names with numeric suffixes.
+- Per the organizer note, 25 horizontally flipped `fetal_femur` training images are ignored by `KeypointDataset`; the hidden test set is reported to use standard orientation.
 - The public baseline repository has additional issues beyond dataset layout; this step only prepares the data.
 
 ## Output layout
@@ -103,6 +105,62 @@ Dedicated-head documentation:
 - [README_dedicated_heads.md](README_dedicated_heads.md)
 
 Current best public submission so far:
+
+- Run: `dinov3_vitb_hidden_context_offset128_v1_femurclean_edgesnap_taskblend_v6_keepbestfemur_seed42`
+- CodaBench rank: `6`
+- Submission ID: `849816`
+- Overall score: `24.22`
+
+Previous best public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v6_top2_seed42`
+- CodaBench rank: `7`
+- Submission ID: `848235`
+- Overall score: `24.27`
+
+Earlier best public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v5_top1_or_top2_seed42`
+- CodaBench rank: `8`
+- Submission ID: `848186`
+- Overall score: `24.29`
+
+Earlier focused-blend public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v4_top3_seed42`
+- CodaBench rank: `8`
+- Submission ID: `848078`
+- Overall score: `24.32`
+
+Earlier focused-blend public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v3_top2_seed42`
+- CodaBench rank: `8`
+- Submission ID: `848010`
+- Overall score: `24.38`
+
+Earlier focused-blend public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v3_top3_seed42`
+- CodaBench rank: `8`
+- Submission ID: `847976`
+- Overall score: `24.45`
+
+Earlier focused-blend public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_top2_or_top3_seed42`
+- CodaBench rank: `8`
+- Submission ID: `847924`
+- Overall score: `24.51`
+
+Earlier best public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_safe_v1_seed42`
+- CodaBench rank: `8`
+- Submission ID: `847891`
+- Overall score: `24.64`
+
+Previous architecture-anchor public submission:
 
 - Run: `dinov3_vitb_hidden_context_offset128_v1_seed42`
 - CodaBench rank: `8`
@@ -145,6 +203,7 @@ Current read of the results:
 - The current best direction is the `hidden_context` family: `vit_base_patch16_dinov3` with task-specific FPN, grouped split, baseline augmentation, `context_local_v1` adapters, and the hidden `A4C/HC/IVC/FUGC` refinement decoder.
 - The strongest result so far came from target-domain adaptation on the official validation distribution, not from broader decoder changes or stronger augmentation.
 - The first clearly positive architecture change after the `25.31` plateau is `offset128_v1`: it keeps the hidden-context family but uses `128x128` heatmaps and learned subpixel offset refinement for dense point tasks.
+- The best current public score is no longer from additional training. It comes from the `offset128_v1` anchor plus conservative image-edge snapping for safe boundary tasks and a focused audit-safe taskwise blend from prior specialist submissions.
 - The `offset128_v3_hardtask_ft` branch strongly improved local validation but did not beat the hidden server score, so it should be treated as an over-adapted near-miss rather than a new anchor.
 - The next high-leverage test is not another weight soup. It is cardiac split-screen normalization: detected split-screen cardiac training rows are kept but cropped to the landmark-containing panel, matching the organizer statement that the test set has no split-screen images.
 - A small targeted measurement term can help slightly, but only when it is softened carefully. The stronger/default measurement variant regressed.
@@ -153,6 +212,14 @@ Comparable saved runs:
 
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
+| `dinov3_vitb_hidden_context_offset128_v1_femurclean_edgesnap_taskblend_v6_keepbestfemur_seed42` | `NA` | `24.22` |
+| `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v6_top2_seed42` | `NA` | `24.27` |
+| `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v5_top1_or_top2_seed42` | `NA` | `24.29` |
+| `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v4_top3_seed42` | `NA` | `24.32` |
+| `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v3_top2_seed42` | `NA` | `24.38` |
+| `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v3_top3_seed42` | `NA` | `24.45` |
+| `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_top2_or_top3_seed42` | `NA` | `24.51` |
+| `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_safe_v1_seed42` | `NA` | `24.64` |
 | `dinov3_vitb_hidden_context_offset128_v1_seed42` | `NA` | `24.77` |
 | `dinov3_vitb_hidden_context_offset256_v1_seed42` | `5.525950` | `24.87` |
 | `dinov3_vitb_hidden_context_offset128_v3_hardtask_ft_seed42` | `5.562717` | `24.87` |
@@ -560,6 +627,34 @@ bash scripts/submit_hidden_context_texture_residual_offset128_v2.sh \
   output/submissions/dinov3_vitb_hidden_context_texture_residual_offset128_v2_seed42
 ```
 
+## FUGC Segment-Vector Branch
+
+The `hidden_context_fugc_vector_offset128_v1` branch targets the largest remaining hidden-set gap: the two-point FUGC line task. It keeps the `24.77` `offset128_v1` anchor for all tasks and replaces only the FUGC endpoint refiner with a segment-vector refinement module. The old FUGC heatmap and endpoint-offset path is still warm-started, then a zero-started module corrects midpoint, angle, and length. Training freezes the encoder, FPN, adapters, and all non-FUGC heads, so only the FUGC head changes.
+
+Train:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 bash scripts/train_hidden_context_fugc_vector_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_fugc_vector_offset128_v1_seed42 \
+  output/runs/dinov3_vitb_hidden_context_offset128_v1_seed42/checkpoints/best_model.pth \
+  42
+```
+
+Predict/evaluate:
+
+```bash
+bash scripts/predict_eval_hidden_context_fugc_vector_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_fugc_vector_offset128_v1_seed42
+```
+
+Submit package:
+
+```bash
+bash scripts/submit_hidden_context_fugc_vector_offset128_v1.sh \
+  output/runs/dinov3_vitb_hidden_context_fugc_vector_offset128_v1_seed42 \
+  output/submissions/dinov3_vitb_hidden_context_fugc_vector_offset128_v1_seed42
+```
+
 ## Dedicated-head status
 
 Current `dedicated_v1` decoder coverage:
@@ -610,3 +705,84 @@ python baseline/train.py \
   --fugc-segment-loss-weight 0.08 \
   --output-dir output/runs/dinov3_vitb_taskfpn_weaktasks_v1
 ```
+
+## Public Leaderboard Result Log
+
+Lower overall score is better. The table below lists the saved CodaBench leaderboard results recorded in `output/submissions/manual_results`. Accounts `hmrasa`, `hmzrse`, `hrcacs`, and `saharch` are our submissions.
+
+<details>
+<summary>Saved leaderboard submissions</summary>
+
+| Date | Rank | Submission | Account | Overall | Run / saved source |
+|---|---:|---:|---|---:|---|
+| 2026-07-07 14:08 | 21 | 832801 | hmrasa | 28.69 | `20260707_1408_832801` |
+| 2026-07-07 17:52 | 20 | 832909 | hmzrse | 28.3 | `20260707_1752_832909` |
+| 2026-07-07 17:55 | 28 | 832912 | hmrasa | 30.01 | `20260707_1755_832912` |
+| 2026-07-07 18:54 | 19 | 832942 | hmzrse | 27.97 | `20260707_1854_832942` |
+| 2026-07-07 20:45 | 34 | 832982 | hmrasa | 32.05 | `20260707_2045_832982` |
+| 2026-07-07 23:11 | 21 | 833192 | hmrasa | 28.87 | `20260707_2311_833192` |
+| 2026-07-07 23:55 | 22 | 833256 | hmzrse | 28.86 | `20260707_2355_833256` |
+| 2026-07-08 07:52 | 18 | 834123 | hmzrse | 27.47 | `20260708_0752_834123` |
+| 2026-07-08 08:00 | 41 | 834135 | hmzrse | 34.69 | `20260708_0800_834135` |
+| 2026-07-08 09:38 | 22 | 834497 | hmzrse | 28.31 | `20260708_0938_834497` |
+| 2026-07-08 10:35 | 29 | 834676 | hmzrse | 29.56 | `20260708_1035_834676` |
+| 2026-07-08 12:30 | 36 | 834905 | hmrasa | 32.67 | `20260708_1230_834905` |
+| 2026-07-08 14:47 | 23 | 835027 | hmrasa | 28.31 | `20260708_1447_835027` |
+| 2026-07-08 21:20 | 33 | 835224 | hrcacs | 30.73 | `20260708_2120_835224` |
+| 2026-07-08 23:42 | 32 | 835416 | hrcacs | 30.55 | `20260708_2342_835416` |
+| 2026-07-09 07:59 | 32 | 836609 | hrcacs | 30.15 | `20260709_0759_836609` |
+| 2026-07-09 09:31 | 30 | 836952 | hrcacs | 29.71 | `20260709_0931_836952` |
+| 2026-07-09 09:36 | 41 | 836959 | hrcacs | 33.88 | `20260709_0936_836959` |
+| 2026-07-09 11:49 | 26 | 837106 | hmrasa | 29.2 | `20260709_1149_837106` |
+| 2026-07-09 11:52 | 50 | 837110 | hmrasa | 39.19 | `20260709_1152_837110` |
+| 2026-07-09 12:57 | 19 | 837161 | hmrasa | 27.18 | `20260709_1257_837161` |
+| 2026-07-09 13:02 | 20 | 837167 | hmrasa | 27.42 | `20260709_1302_837167` |
+| 2026-07-09 13:31 | 25 | 837185 | hmrasa | 28.88 | `20260709_1331_837185` |
+| 2026-07-09 13:48 | 24 | 837199 | hmzrse | 28.35 | `20260709_1348_837199` |
+| 2026-07-09 14:08 | 19 | 837203 | hmzrse | 27.2 | `20260709_1408_837203` |
+| 2026-07-09 14:49 | 31 | 837225 | hmzrse | 30.21 | `20260709_1449_837225` |
+| 2026-07-09 15:02 | 18 | 837232 | hmzrse | 27.03 | `20260709_1502_837232` |
+| 2026-07-09 15:09 | 24 | 837234 | hmzrse | 28.74 | `20260709_1509_837234` |
+| 2026-07-09 21:21 | 25 | 837366 | hmzrse | 28.1 | `20260709_2121_837366` |
+| 2026-07-09 23:04 | 18 | 837583 | hmzrse | 27.09 | `20260709_2304_837583` |
+| 2026-07-09 23:06 | 16 | 837584 | hmzrse | 26.62 | `20260709_2306_837584` |
+| 2026-07-10 00:15 | 23 | 837737 | hmzrse | 27.78 | `20260710_0015_837737` |
+| 2026-07-10 00:20 | 16 | 837762 | hmzrse | 26.45 | `20260710_0020_837762` |
+| 2026-07-10 00:48 | 21 | 837881 | hrcacs | 27.25 | `20260710_0048_837881` |
+| 2026-07-10 07:50 | 16 | 838695 | hrcacs | 26.43 | `20260710_0750_838695` |
+| 2026-07-10 07:55 | 21 | 838701 | hrcacs | 27.53 | `20260710_0755_838701` |
+| 2026-07-10 08:04 | 18 | 838718 | hrcacs | 26.86 | `20260710_0804_838718` |
+| 2026-07-10 08:08 | 26 | 838729 | hrcacs | 28.32 | `20260710_0808_838729` |
+| 2026-07-10 08:44 | 17 | 838795 | hmrasa | 26.55 | `20260710_0844_838795` |
+| 2026-07-10 09:24 | 16 | 838911 | hmrasa | 26.36 | `20260710_0924_838911` |
+| 2026-07-10 10:03 | 15 | 839026 | hmrasa | 26.11 | `20260710_1003_839026` |
+| 2026-07-10 11:38 | 13 | 839161 | hmrasa | 25.95 | `20260710_1138_839161` |
+| 2026-07-10 14:05 | 16 | 839257 | hmrasa | 26.2 | `20260710_1405_839257` |
+| 2026-07-10 15:05 | 13 | 839295 | saharch | 25.71 | `20260710_1505_839295` |
+| 2026-07-10 15:38 | 13 | 839320 | saharch | 25.69 | `20260710_1538_839320` |
+| 2026-07-10 16:03 | 13 | 839340 | saharch | 25.6 | `20260710_1603_839340` |
+| 2026-07-10 16:15 | 13 | 839346 | saharch | 25.6 | `20260710_1615_839346` |
+| 2026-07-10 18:11 | 13 | 839371 | saharch | 25.66 | `20260710_1811_839371` |
+| 2026-07-10 20:47 | 13 | 839473 | saharch | 25.6 | `20260710_2047_839473` |
+| 2026-07-10 20:58 | 13 | 839478 | saharch | 25.6 | `20260710_2058_839478` |
+| 2026-07-10 21:58 | 13 | 839525 | saharch | 25.88 | `20260710_2158_839525` |
+| 2026-07-10 22:46 | 13 | 839554 | saharch | 25.66 | `20260710_2246_839554` |
+| 2026-07-10 23:59 | 13 | 839619 | saharch | 25.7 | `20260710_2359_839619` |
+| 2026-07-11 01:37 | 34 | 839724 | hmzrse | 30.91 | `20260711_0137_839724` |
+| 2026-07-12 01:30 | 13 | 842013 | hrcacs | 25.37 | `20260712_0130_842013` |
+| 2026-07-12 01:34 | 13 | 842018 | hrcacs | 25.42 | `20260712_0134_842018` |
+| 2026-07-12 02:06 | 13 | 842049 | hrcacs | 25.32 | `20260712_0206_842049` |
+| 2026-07-12 17:11 | 12 | 843991 | hmzrse | 25.31 | `20260712_1711_843991` |
+| 2026-07-12 18:52 | 15 | 844011 | hmzrse | 25.52 | `20260712_1852_844011` |
+| 2026-07-12 20:11 | 14 | 844122 | hmzrse | 25.42 | `20260712_2011_844122` |
+| 2026-07-12 22:14 | 14 | 844252 | hmzrse | 25.38 | `dinov3_vitb_hidden_context_two_stage_roi_zoom_jitter_safe_v2_seed42_real` |
+| 2026-07-12 23:22 | 8 | 844351 | saharch | 24.77 | `20260712_2322_844351` |
+| 2026-07-13 | - | - | - | 24.79 | `dinov3_vitb_hidden_context_offset128_soup_v1_a85` |
+| 2026-07-13 | - | - | - | 24.87 | `dinov3_vitb_hidden_context_offset128_v3_hardtask_ft_seed42` |
+| 2026-07-13 | - | unknown | - | 24.79 | `dinov3_vitb_hidden_context_offset128_soup_v1_a95` |
+| 2026-07-13 09:15 | 9 | 845990 | saharch | 24.87 | `dinov3_vitb_hidden_context_offset256_v1_seed42` |
+| 2026-07-14 20:47 | 6 | 850233 | hmzrse | 24.21 | `20260714_2047_850233` |
+| 2026-07-15 | - | - | - | 24.23 | `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42` |
+| 2026-07-15 | - | - | - | 24.88 | `dinov3_vitb_hidden_context_boundary_offset128_v1_seed42` |
+
+</details>

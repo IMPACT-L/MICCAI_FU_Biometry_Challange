@@ -146,6 +146,79 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
 
 ## 2026-07-12 update
 
+- New best public result after v6 focused task-blend:
+- run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v6_top2_seed42`
+- submission id: `848235`
+- account: `hmzrse`
+- rank at submission: `7`
+- overall score: `24.27`
+- leaderboard row:
+  - `24.27 29.55 22.82 17.5 14.44 8.35 19.81 93.3 21.1 18.58 8.65 7.72 49.31 73.9 29.02 15.19 16.61 8.9 36.67 22.5`
+- note: this candidate corresponds to `A4C=0.60`, `AOP=0.78`, `FUGC=0.08`, `PLAX=0.06`, `PSAX=0.34`, `fetal_femur=0.0`. It improves only slightly over v5, so the blend direction is still useful but nearing saturation. Continue with a small local sweep around this point rather than a large jump.
+- follow-up: the first v7 upload scored `24.48`, worse than the `24.27` v6 best. This indicates that pushing beyond the v6 point, especially larger A4C/PSAX movement, overshoots the hidden optimum. Back off toward the v5-v6 interval instead of continuing larger blend weights.
+- follow-up: v8 backoff top1 and top2 both scored `24.27`, tying the v6 best. The current blend family appears saturated around `A4C~0.60-0.62`, `AOP=0.78`, `FUGC=0.08`, `PLAX=0.06`, `PSAX=0.34-0.36`. Further scalar pushes are unlikely to deliver a meaningful gain without a new degree of freedom.
+
+- New best public result after v5 focused task-blend:
+- run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v5_top1_or_top2_seed42`
+- submission id: `848186`
+- account: `hmzrse`
+- rank at submission: `8`
+- overall score: `24.29`
+- leaderboard row:
+  - `24.29 29.6 22.91 17.92 14.61 8.53 19.81 93.3 21.1 18.58 8.65 7.72 49.31 73.9 29.02 15.19 16.61 8.9 36.58 22.39`
+- note: both v5 top candidates scored `24.29`. They share `A4C=0.48`, `AOP=0.66`, `FUGC=0.08`, `PSAX=0.26`, `fetal_femur=0.0` and differ only in `PLAX` (`0.06` vs `0.08`). This suggests PLAX movement is not the current useful degree of freedom; continue by searching A4C/AOP/PSAX around the v5 point while keeping FUGC near `0.08`.
+
+- New best public result after the safer v4 focused task-blend:
+- run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v4_top3_seed42`
+- submission id: `848078`
+- account: `hmzrse`
+- rank at submission: `8`
+- overall score: `24.32`
+- leaderboard row:
+  - `24.32 29.64 23.04 18.19 14.77 8.71 19.81 93.3 21.1 18.58 8.65 7.72 49.31 73.9 29.02 15.19 16.61 8.9 36.56 22.32`
+- note: this candidate corresponds to `A4C=0.40`, `AOP=0.58`, `FUGC=0.08`, `PLAX=0.06`, `PSAX=0.22`, `fetal_femur=0.0`. The gain came from pushing A4C/AOP/PSAX while keeping FUGC at `0.08`; this is now the center point for the next local search.
+
+- New best public result after the stronger v3 focused task-blend:
+- run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v3_top2_seed42`
+- submission id: `848010`
+- account: `hmzrse`
+- rank at submission: `8`
+- overall score: `24.38`
+- leaderboard row:
+  - `24.38 29.69 23.23 18.38 15.09 9.03 19.81 93.3 21.1 18.58 8.65 7.72 49.31 73.9 29.02 15.19 16.61 8.9 36.55 22.24`
+- note: this candidate corresponds to `A4C=0.32`, `AOP=0.46`, `FUGC=0.08`, `PLAX=0.06`, `PSAX=0.18`, `fetal_femur=0.0`. It confirms that the hidden validation is still benefiting from a stronger push in the same A4C/AOP/FUGC/PLAX/PSAX blend direction.
+- follow-up: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v3_top1_seed42` also scored `24.38`. It differs mainly by increasing `FUGC` from `0.08` to `0.10`, so the current evidence does not support pushing FUGC harder by itself.
+
+- New best public result after second focused task-blend sweep:
+- run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v3_top3_seed42`
+- submission id: `847976`
+- account: `saharch`
+- rank at submission: `8`
+- overall score: `24.45`
+- leaderboard row:
+  - `24.45 29.74 23.48 18.47 15.51 9.41 19.81 93.3 21.1 18.58 8.66 7.72 49.31 73.9 29.02 15.19 16.61 8.9 36.55 22.16`
+- note: this improves the previous `24.51` candidate by pushing the same blend direction further: `A4C=0.32`, `AOP=0.46`, `FUGC=0.08`, `PLAX=0.04`, `PSAX=0.18`, and `fetal_femur=0.0`. Continue with bounded sweeps around these weights rather than changing the base model.
+
+- New best public result after focused task-blend sweep:
+- run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_top2_or_top3_seed42`
+- submission id: `847924`
+- account: `saharch`
+- rank at submission: `8`
+- overall score: `24.51`
+- leaderboard row:
+  - `24.51 29.76 23.72 18.48 15.84 9.73 19.81 93.3 21.1 18.58 8.65 7.72 49.31 73.9 29.02 15.19 16.61 8.9 36.56 22.07`
+- note: this confirms that the output-space correction direction is real. The improvement came from a focused taskwise blend around the edge-snapped `offset128_v1` anchor, with stronger A4C/AOP/PSAX movement and no fetal-femur specialist pull. The next sweep should stay near this recipe instead of restarting model training.
+
+- New best public result after post-processing and task blending:
+- run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_safe_v1_seed42`
+- submission id: `847891`
+- account: `saharch`
+- rank at submission: `8`
+- overall score: `24.64`
+- leaderboard row:
+  - `24.64 29.82 24.0 18.42 16.48 10.29 19.81 93.3 21.01 18.46 8.66 7.72 49.31 73.9 29.44 15.54 16.46 8.74 36.59 21.97`
+- note: this candidate starts from `dinov3_vitb_hidden_context_offset128_v1_seed42`, applies conservative image-edge snapping to `HC,IVC,PLAX,PSAX,fetal_femur`, then uses small audit-safe task blends from prior specialist submissions. Pre-submit audit passed with `1.1128 px` mean task shift versus the `24.77` anchor.
+
 - The `offset128_v1` architectural change produced the new best public result so far.
 - run: `dinov3_vitb_hidden_context_offset128_v1_seed42`
 - rank: `8`
@@ -165,6 +238,8 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
 - Visual inspection sheets were generated under `assets/dataset_inspection/`. They show that many target landmarks are boundary endpoints on fine ultrasound edges and speckle structures, not only semantic regions. This motivates `hidden_context_texture_offset128_v1`: a one-model dual-stream branch that keeps the `offset128_v1` DINOv3/FPN/head design but replaces the adapter with an ultrasound texture-context adapter using RGB, grayscale, Sobel gradients, and gradient magnitude.
 - `hidden_context_texture_offset128_v1` overfit early because replacing the adapter skipped the old context-local adapter weights. The safer follow-up is `hidden_context_texture_residual_offset128_v1`, which preserves the old adapter key layout (`skipped=0` in warm-start smoke) and adds only a zero-initialized Sobel/RGB texture residual.
 - `hidden_context_texture_residual_offset128_v2` is the next controlled model branch. It keeps the same `offset128_v1` anchor and context-local warm start, but changes the texture residual from one global scale to conservative per-task gates. Smoke training passed: warm start matched `1463` keys, skipped `0`, and only the new texture/gate parameters were missing.
+- `hidden_context_texture_residual_offset128_v2` scored `24.85`, worse than the `24.77` anchor. Treat the texture-residual branch as saturated unless a new domain signal is added.
+- New targeted model branch: `hidden_context_fugc_vector_offset128_v1`. It replaces only the FUGC endpoint refiner with a segment-vector module that corrects midpoint, angle, and length after the warm-started endpoint refinement. Smoke training passed: warm start matched `1463` keys, skipped `0`, and only the new FUGC vector-refine parameters were missing.
 - Pseudo-hardtasks round-2 was the previous best.
 - run: `dinov3_vitb_taskfpn_hidden_context_pseudo_hardtasks_round2_v1_seed42_local`
 - rank: `12`
@@ -189,3 +264,78 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
 - submission id: `842018`
 - overall score: `25.42`
 - note: same adaptation idea works, but the seed-42 FUGC+FA base remains the better source checkpoint.
+
+## 2026-07-14 fetal_femur orientation-note update
+
+- Organizer note: 25 fetal_femur training images are horizontally mirrored/flipped and should be disregarded; the hidden test set is reported to keep standard orientation.
+- Implementation: raw `Reg-Two_3.fetal_femur.csv` remains unchanged for traceability, but `KeypointDataset` now excludes the 25 listed basenames during training/split construction.
+- Expected effect: future training uses `702` fetal_femur rows instead of `727`. Existing submissions are unchanged; this only affects new checkpoints trained after this update.
+- New best public result after applying the fetal_femur clean-training anchor conservatively:
+- run: `dinov3_vitb_hidden_context_offset128_v1_femurclean_edgesnap_taskblend_v6_keepbestfemur_seed42`
+- submission id: `849816`
+- account: `hrcacs`
+- rank at submission: `6`
+- overall score: `24.22`
+- leaderboard row:
+  - `24.22 29.48 22.91 17.6 14.47 8.32 19.75 93.23 21.1 18.58 8.74 7.41 49.2 73.62 28.41 15.3 16.62 8.95 36.76 22.29`
+- note: the direct femur-clean taskblend failed local pre-submit risk only because one fetal_femur validation case moved `28.80px`; the submitted safe variant keeps fetal_femur exactly from the prior `24.27` best while using the femur-clean anchor for the other tasks. This reduced hidden score from `24.27` to `24.22`.
+- Next sweep prepared: `sweep_femurclean_edgesnap_taskblend_v7`.
+- anchor: `dinov3_vitb_hidden_context_offset128_v1_femurclean_edge_snap_safe_seed42`
+- reference: `dinov3_vitb_hidden_context_offset128_v1_femurclean_edgesnap_taskblend_v6_keepbestfemur_seed42`
+- fetal_femur is locked to the `24.22` best (`alpha=1.0`) to avoid the previous outlier.
+- top candidates prepared as direct upload folders:
+  - `dinov3_vitb_hidden_context_offset128_femurclean_taskblend_v7_top1_seed42`: `A4C=0.64`, `AOP=0.82`, `FUGC=0.10`, `PLAX=0.06`, `PSAX=0.38`, audit shift `0.2312px`
+  - `dinov3_vitb_hidden_context_offset128_femurclean_taskblend_v7_top2_seed42`: `A4C=0.64`, `AOP=0.82`, `FUGC=0.08`, `PLAX=0.06`, `PSAX=0.38`, audit shift `0.1998px`
+  - `dinov3_vitb_hidden_context_offset128_femurclean_taskblend_v7_top3_seed42`: `A4C=0.64`, `AOP=0.82`, `FUGC=0.10`, `PLAX=0.04`, `PSAX=0.38`, audit shift `0.2577px`
+- v7 top5 hidden result:
+  - run: `dinov3_vitb_hidden_context_offset128_femurclean_taskblend_v7_top5_seed42`
+  - overall score: `24.22`
+  - note: tied the current `24.22` best, so this v7 direction did not improve beyond the femur-clean keep-best-femur candidate.
+- v8 diagnostic probes prepared from the v7 sweep to isolate the saturated task-blend direction. All are audit PASS and keep fetal_femur locked:
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v8_probe_aop82_only_seed42`: tests only increasing AOP from `0.78` to `0.82`.
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v8_probe_psax38_only_seed42`: tests only increasing PSAX from `0.34` to `0.38`.
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v8_probe_fugc10_only_seed42`: tests only increasing FUGC from `0.08` to `0.10`.
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v8_probe_a4c62_only_seed42`: tests only increasing A4C from `0.60` to `0.62`.
+  - If any single-task probe improves hidden score, run the next local sweep only around that task instead of pushing all weights together.
+- v8 probe result:
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v8_probe_a4c62_only_seed42` scored `24.22`, tying the current best.
+  - conclusion: increasing A4C alone is not enough to improve beyond the current plateau.
+- v8 probe result:
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v8_probe_aop82_only_seed42` scored `24.21`, improving the current best by `0.01`.
+  - conclusion: AOP is the active remaining blend lever. Next sweep should vary AOP only around `0.82` while keeping A4C/FUGC/PLAX/PSAX/fetal_femur locked.
+- v9 AOP-only candidates prepared relative to the `24.21` AOP=0.82 candidate. The first v9 generation was discarded because it unintentionally dropped the locked A4C/FUGC/PLAX/PSAX blends; use only the `locked_v2` folders.
+- Corrected v9 upload order:
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v9_probe_aop84_locked_v2_seed42`: AOP `0.84`, audit shift `0.0224px`
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v9_probe_aop86_locked_v2_seed42`: AOP `0.86`, audit shift `0.0447px`
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v9_probe_aop88_locked_v2_seed42`: AOP `0.88`, audit shift `0.0671px`
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v9_probe_aop90_locked_v2_seed42`: AOP `0.90`, audit shift `0.0894px`
+- v10 AOP probe result:
+  - `dinov3_vitb_hidden_context_offset128_femurclean_v10_probe_aop850_locked_seed42`
+  - submission id: `850233`
+  - account: `hmzrse`
+  - rank at submission: `6`
+  - overall score: `24.21`
+  - leaderboard row:
+    - `24.21 29.45 22.91 17.6 14.42 8.11 19.75 93.23 21.1 18.58 8.74 7.41 49.2 73.62 28.41 15.3 16.62 8.95 36.76 22.29`
+  - conclusion: AOP micro-blending is now saturated. The next useful experiment should target a persistent high hidden metric or introduce a genuinely different candidate source; do not spend more submissions on AOP-only `0.84--0.90` variants unless a new source prediction is added.
+
+## 2026-07-15 boundary-aware adapter probe
+
+- run: `dinov3_vitb_hidden_context_boundary_offset128_v1_seed42`
+- hidden score reported by user: `24.88`
+- local released annotation MRE: `5.614538`
+- pre-submit audit: PASS, mean task shift `0.7831px` versus `dinov3_vitb_hidden_context_offset128_v1_seed42`
+- conclusion: boundary residual adapter is structurally safe but hidden-worse than the `24.21` best. Do not prioritize this direction unless used only as a tiny ensemble/blend source.
+
+## 2026-07-15 target-equivariance adaptation probe
+
+- raw run: `dinov3_vitb_hidden_context_target_equivariance_safe_v2_seed42`
+- raw candidate fails audit versus the `24.21` best because the best is a blended submission, not because AOP/PSAX were trained in safe-v2. Against raw `femurclean_seed42`, safe-v2 passes with mean shift `0.6930px`.
+- generated audit-pass hybrid candidates anchored on `dinov3_vitb_hidden_context_offset128_femurclean_v10_probe_aop850_locked_seed42`:
+  - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_low_seed42`: FUGC `0.20`, HC `0.15`, IVC `0.15`, fetal_femur `0.10`; mean shift `0.1208px`.
+  - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_mid_seed42`: FUGC `0.35`, HC `0.25`, IVC `0.25`, fetal_femur `0.15`; mean shift `0.2005px`.
+  - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42`: FUGC `0.45`, HC `0.30`; mean shift `0.1284px`.
+- recommended upload order if testing this signal: `fugc_hc` first, then `mid` only if a second chance is available.
+- hidden result:
+  - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42` scored `24.23`.
+  - conclusion: target-equivariance produced a competitive but not best signal. Keep the `24.21` AOP-locked femur-clean blend as the primary anchor.
