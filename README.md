@@ -106,12 +106,46 @@ Dedicated-head documentation:
 
 Current best public submission so far:
 
+- Run: `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030`
+- Overall score: `24.03`
+- Note: content-aware anatomical retrieval with ultrasound content-box geometry features on top of the FUGC-length-prior/IVC-strong anchor.
+
+Previous best public submission:
+
+- Run: `dinov3_vitb_hidden_context_ivc_anatomy_v2_strong_seed42`
+- CodaBench rank: `7`
+- Submission ID: `852036`
+- Overall score: `24.16`
+- Note: conservative IVC anatomy-only correction on top of `current_anchor_student_blends_v1/all_hard_light`.
+
+Previous best public submission:
+
+- Run: `current_anchor_student_blends_v1/all_hard_light`
+- Overall score: `24.18`
+- Note: small blend from the current-anchor pseudo-student into `A4C/AOP/HC/IVC/PLAX/PSAX`.
+
+Previous best public submission:
+
+- Run: `dinov3_vitb_hidden_context_roi_hcivcplax_v1_seed42`
+- CodaBench rank: `7`
+- Submission ID: `851212`
+- Overall score: `24.19`
+
+Earlier best public submission:
+
+- Run: `dinov3_vitb_hidden_context_offset128_femurclean_v10_probe_aop850_locked_seed42`
+- CodaBench rank: `6`
+- Submission ID: `850233`
+- Overall score: `24.21`
+
+Earlier best public submission:
+
 - Run: `dinov3_vitb_hidden_context_offset128_v1_femurclean_edgesnap_taskblend_v6_keepbestfemur_seed42`
 - CodaBench rank: `6`
 - Submission ID: `849816`
 - Overall score: `24.22`
 
-Previous best public submission:
+Earlier best public submission:
 
 - Run: `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v6_top2_seed42`
 - CodaBench rank: `7`
@@ -203,7 +237,7 @@ Current read of the results:
 - The current best direction is the `hidden_context` family: `vit_base_patch16_dinov3` with task-specific FPN, grouped split, baseline augmentation, `context_local_v1` adapters, and the hidden `A4C/HC/IVC/FUGC` refinement decoder.
 - The strongest result so far came from target-domain adaptation on the official validation distribution, not from broader decoder changes or stronger augmentation.
 - The first clearly positive architecture change after the `25.31` plateau is `offset128_v1`: it keeps the hidden-context family but uses `128x128` heatmaps and learned subpixel offset refinement for dense point tasks.
-- The best current public score is no longer from additional training. It comes from the `offset128_v1` anchor plus conservative image-edge snapping for safe boundary tasks and a focused audit-safe taskwise blend from prior specialist submissions.
+- The best current public score comes from the `offset128_v1` anchor plus conservative image-edge snapping, focused audit-safe taskwise blending, and a gated ROI refiner that accepted only safe IVC changes.
 - The `offset128_v3_hardtask_ft` branch strongly improved local validation but did not beat the hidden server score, so it should be treated as an over-adapted near-miss rather than a new anchor.
 - The next high-leverage test is not another weight soup. It is cardiac split-screen normalization: detected split-screen cardiac training rows are kept but cropped to the landmark-containing panel, matching the organizer statement that the test set has no split-screen images.
 - A small targeted measurement term can help slightly, but only when it is softened carefully. The stronger/default measurement variant regressed.
@@ -212,6 +246,13 @@ Comparable saved runs:
 
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
+| `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` | `NA` | `24.03` |
+| `current_anchor_student_blends_v1/all_hard_light` | `NA` | `24.18` |
+| `current_anchor_student_blends_v2/aop_lower` | `NA` | `24.19` |
+| `current_anchor_student_blends_v2/hcivc_higher` | `NA` | `24.19` |
+| `dinov3_vitb_hidden_context_roi_hcivcplax_v1_seed42` | `NA` | `24.19` |
+| `dinov3_vitb_hidden_context_roi_anchor_aopfa_v2_relaxed_seed42` | `NA` | `24.20` |
+| `current_anchor_student_blends_v1/hcivcplax_mid` | `NA` | `24.21` |
 | `dinov3_vitb_hidden_context_offset128_femurclean_v10_probe_aop850_locked_seed42` | `NA` | `24.21` |
 | `dinov3_vitb_hidden_context_offset128_v1_femurclean_edgesnap_taskblend_v6_keepbestfemur_seed42` | `NA` | `24.22` |
 | `dinov3_vitb_hidden_context_offset128_edgesnap_taskblend_focused_v6_top2_seed42` | `NA` | `24.27` |
@@ -226,6 +267,7 @@ Comparable saved runs:
 | `dinov3_vitb_hidden_context_offset128_v3_hardtask_ft_seed42` | `5.562717` | `24.87` |
 | `dinov3_vitb_hidden_context_offset128_soup_v1_a85` | `5.604717` | `24.79` |
 | `dinov3_vitb_hidden_context_offset128_soup_v1_a95` | `5.611312` | `24.79` |
+| `dinov3_vitb_hidden_context_multilayer_offset128_v1_seed42` | `NA` | `29.82` |
 | `dinov3_vitb_taskfpn_hidden_context_pseudo_hardtasks_round2_v1_seed42_local` | `NA` | `25.31` |
 | `dinov3_vitb_taskfpn_hidden_context_pseudo_hardtasks_v1_seed42` | `NA` | `25.32` |
 | `dinov3_vitb_taskfpn_hidden_context_local_fugc_fa_bn_v1` | `NA` | `25.37` |
@@ -785,6 +827,16 @@ Lower overall score is better. The table below lists the saved CodaBench leaderb
 | 2026-07-14 20:47 | 6 | 850233 | hmzrse | 24.21 | `dinov3_vitb_hidden_context_offset128_femurclean_v10_probe_aop850_locked_seed42` |
 | 2026-07-15 | - | - | - | 24.22 | `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_mid_seed42` |
 | 2026-07-15 | - | - | - | 24.23 | `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42` |
+| 2026-07-15 | - | - | - | 29.82 | `dinov3_vitb_hidden_context_multilayer_offset128_v1_seed42` |
 | 2026-07-15 | - | - | - | 24.88 | `dinov3_vitb_hidden_context_boundary_offset128_v1_seed42` |
+| 2026-07-15 15:27 | 7 | 851212 | saharch | 24.19 | `dinov3_vitb_hidden_context_roi_hcivcplax_v1_seed42` |
+| 2026-07-15 | - | - | - | 24.20 | `dinov3_vitb_hidden_context_roi_anchor_aopfa_v2_relaxed_seed42` |
+| 2026-07-15 | - | - | - | 24.21 | `current_anchor_student_blends_v1/hcivcplax_mid` |
+| 2026-07-15 | - | - | - | 24.18 | `current_anchor_student_blends_v1/all_hard_light` |
+| 2026-07-15 | - | - | - | 24.19 | `current_anchor_student_blends_v2/aop_lower` |
+| 2026-07-15 | - | - | - | 24.19 | `current_anchor_student_blends_v2/hcivc_higher` |
+| 2026-07-16 10:52 | 7 | 852036 | hmzrse | 24.16 | `dinov3_vitb_hidden_context_ivc_anatomy_v2_strong_seed42` |
+| 2026-07-16 | - | - | - | 24.21 | `dinov3_vitb_hidden_context_fugc_axis_anatomy_v2_medium_seed42` |
+| 2026-07-16 | - | - | - | 24.03 | `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` |
 
 </details>

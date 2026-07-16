@@ -104,6 +104,13 @@ def load_checkpoint_payload(checkpoint_path: str, device: torch.device):
     return checkpoint, {}
 
 
+def infer_num_domain_classes(checkpoint: dict) -> int:
+    for key, value in checkpoint.items():
+        if key == "domain_classifier.classifier.5.weight" and getattr(value, "ndim", 0) == 2:
+            return int(value.shape[0])
+    return 0
+
+
 class ValidationManifestDataset(Dataset):
     def __init__(self, manifest_path: str, input_size: int = 518):
         self.manifest_path = os.path.abspath(manifest_path)
@@ -200,8 +207,9 @@ def validate_predictions(predictions):
         seen.add(key)
 
 
-def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, bool, str, str, str, str, str, str, int]:
+def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, str, bool, str, str, str, str, str, str, int, tuple]:
     meta_encoder_name = checkpoint_meta.get("encoder_name")
+    meta_encoder_feature_mode = checkpoint_meta.get("encoder_feature_mode", "final")
     meta_use_fpn = checkpoint_meta.get("use_fpn")
     meta_fpn_mode = checkpoint_meta.get("fpn_mode", "shared")
     meta_fpn_type = checkpoint_meta.get("fpn_type", "fpn")
@@ -214,6 +222,7 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
     if meta_encoder_name is not None and meta_use_fpn is not None:
         return (
             str(meta_encoder_name),
+            str(meta_encoder_feature_mode),
             bool(meta_use_fpn),
             str(meta_fpn_mode),
             str(meta_fpn_type),
@@ -236,11 +245,11 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
     if checkpoint_has_fpn:
         if in_channels != 256:
             raise ValueError(f"Unexpected FPN head width in checkpoint: {in_channels}")
-        return "vit_base_patch14_dinov2.lvd142m", True, inferred_fpn_mode, "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", "final", True, inferred_fpn_mode, "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 384:
-        return "vit_small_patch14_dinov2.lvd142m", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_small_patch14_dinov2.lvd142m", "final", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     if in_channels == 768:
-        return "vit_base_patch14_dinov2.lvd142m", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", "final", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
     raise ValueError(f"Unsupported checkpoint head width: {in_channels}")
 
 
@@ -312,6 +321,12 @@ def main():
         help="Optional backbone override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
+        "--encoder-feature-mode",
+        default=None,
+        choices=("final", "multilayer_fusion_v1", "feature_pyramid_fusion_v1"),
+        help="Optional backbone feature extraction mode override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
         "--head-type",
         default=None,
         choices=("basic", "deep"),
@@ -326,13 +341,13 @@ def main():
     parser.add_argument(
         "--task-decoder-profile",
         default=None,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_aop_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_segment_specialist_v1", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--task-adapter-profile",
         default=None,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "context_local_stylemix_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "highres_texture_v1", "pixel_unet_v1", "hrnet_residual_v1", "encoder_task_context_local_v1", "encoder_task_hard_context_local_v1", "boundary_context_v1", "taskfilm_v1"),
         help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
@@ -393,6 +408,7 @@ def main():
     checkpoint, checkpoint_meta = load_checkpoint_payload(checkpoint_path, device)
     (
         inferred_encoder_name,
+        inferred_encoder_feature_mode,
         inferred_use_fpn,
         inferred_fpn_mode,
         inferred_fpn_type,
@@ -406,7 +422,11 @@ def main():
         checkpoint,
         checkpoint_meta,
     )
+    checkpoint_has_domain_classifier = any(key.startswith("domain_classifier.") for key in checkpoint.keys())
+    domain_adversarial = bool(checkpoint_meta.get("domain_adversarial", checkpoint_has_domain_classifier))
+    num_domain_classes = int(checkpoint_meta.get("num_domain_classes", infer_num_domain_classes(checkpoint)))
     encoder_name = args.encoder_name or inferred_encoder_name
+    encoder_feature_mode = args.encoder_feature_mode or inferred_encoder_feature_mode
     fpn_mode = args.fpn_mode or inferred_fpn_mode
     fpn_type = args.fpn_type or inferred_fpn_type
     head_type = args.head_type or inferred_head_type
@@ -421,6 +441,7 @@ def main():
             "inference",
             {
                 "encoder_name": encoder_name,
+                "encoder_feature_mode": encoder_feature_mode,
                 "use_fpn": use_fpn,
                 "fpn_mode": fpn_mode,
                 "fpn_type": fpn_type,
@@ -430,6 +451,7 @@ def main():
             },
         )
         encoder_name = str(profile_config["encoder_name"])
+        encoder_feature_mode = str(profile_config.get("encoder_feature_mode", encoder_feature_mode))
         use_fpn = bool(profile_config["use_fpn"])
         fpn_mode = str(profile_config["fpn_mode"])
         fpn_type = str(profile_config["fpn_type"])
@@ -454,6 +476,7 @@ def main():
 
     print(
         f"Checkpoint architecture: backbone={inferred_encoder_name}, "
+        f"encoder_feature_mode={inferred_encoder_feature_mode}, "
         f"fpn_mode={inferred_fpn_mode}, "
         f"fpn_type={inferred_fpn_type}, "
         f"head={inferred_head_type}, "
@@ -462,10 +485,12 @@ def main():
         f"task_adapter_profile={inferred_task_adapter_profile}, "
         f"input_size={inferred_input_size}, "
         f"heatmap_size={inferred_heatmap_size}, "
+        f"domain_adversarial={domain_adversarial}, "
         f"FPN={'ENABLED' if inferred_use_fpn else 'DISABLED'}"
     )
     print(
         f"Submission model config: backbone={encoder_name}, "
+        f"encoder_feature_mode={encoder_feature_mode}, "
         f"fpn_mode={fpn_mode}, "
         f"fpn_type={fpn_type}, "
         f"head={head_type}, "
@@ -483,6 +508,7 @@ def main():
     model = MultiTaskModelFactory(
         encoder_name=encoder_name,
         encoder_weights="pretrained",
+        encoder_feature_mode=encoder_feature_mode,
         task_configs=task_configs,
         heatmap_size=inferred_heatmap_size,
         use_fpn=use_fpn,
@@ -492,6 +518,8 @@ def main():
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
         task_adapter_profile=task_adapter_profile,
+        domain_adversarial=domain_adversarial,
+        num_domain_classes=num_domain_classes,
     ).to(device)
 
     model.load_state_dict(checkpoint)

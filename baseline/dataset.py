@@ -17,6 +17,33 @@ from utils import canonicalize_task_coords, letterbox_image_and_points
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 CARDIAC_SPLIT_SCREEN_TASK_IDS = {"A4C", "PSAX", "PLAX", "IVC"}
+FETAL_FEMUR_ORIENTATION_ANOMALY_BASENAMES = {
+    "Patient00757_Plane5_1_of_1.png",
+    "Patient00863_Plane5_1_of_2.png",
+    "Patient00863_Plane5_2_of_2.png",
+    "Patient01025_Plane5_1_of_1.png",
+    "Patient01035_Plane5_2_of_4.png",
+    "Patient01035_Plane5_4_of_4.png",
+    "Patient01130_Plane5_2_of_4.png",
+    "Patient01221_Plane5_2_of_2.png",
+    "Patient01246_Plane5_1_of_2.png",
+    "Patient01248_Plane5_1_of_1.png",
+    "Patient01249_Plane5_1_of_1.png",
+    "Patient01301_Plane5_1_of_2.png",
+    "Patient01301_Plane5_2_of_2.png",
+    "Patient01304_Plane5_2_of_2.png",
+    "Patient01475_Plane5_1_of_1.png",
+    "Patient01476_Plane5_1_of_1.png",
+    "Patient01477_Plane5_1_of_2.png",
+    "Patient01478_Plane5_1_of_1.png",
+    "Patient01480_Plane5_1_of_1.png",
+    "Patient01481_Plane5_1_of_1.png",
+    "Patient01605_Plane5_2_of_2.png",
+    "Patient01606_Plane5_2_of_2.png",
+    "Patient01607_Plane5_1_of_2.png",
+    "Patient01608_Plane5_1_of_1.png",
+    "Patient01609_Plane5_1_of_1.png",
+}
 
 
 class KeypointDataset(Dataset):
@@ -33,7 +60,9 @@ class KeypointDataset(Dataset):
         roi_crop_tasks: Optional[set[str]] = None,
         roi_context_range: Tuple[float, float] = (1.4, 2.0),
         roi_center_jitter: float = 0.0,
+        roi_anchor_json: Optional[str] = None,
         cardiac_split_screen_mode: str = "keep",
+        exclude_fetal_femur_orientation_anomalies: bool = True,
     ):
         super().__init__()
         self.data_root = data_root
@@ -45,7 +74,11 @@ class KeypointDataset(Dataset):
         self.roi_crop_tasks = roi_crop_tasks
         self.roi_context_range = roi_context_range
         self.roi_center_jitter = float(roi_center_jitter)
+        self.roi_anchor_predictions = self._load_roi_anchor_predictions(roi_anchor_json)
         self.cardiac_split_screen_mode = str(cardiac_split_screen_mode)
+        self.exclude_fetal_femur_orientation_anomalies = bool(
+            exclude_fetal_femur_orientation_anomalies
+        )
         self.csv_path = os.path.join(self.data_root, "csv")
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
@@ -65,6 +98,17 @@ class KeypointDataset(Dataset):
                 "No keypoint records found. Expect task_name == 'Regression' or task_id in "
                 f"{sorted(EXTRA_REGRESSION_TASK_IDS)}."
             )
+
+        if self.exclude_fetal_femur_orientation_anomalies:
+            anomaly_mask = self._fetal_femur_orientation_anomaly_mask(self.dataframe)
+            anomaly_count = int(anomaly_mask.sum())
+            if anomaly_count:
+                self.dataframe = self.dataframe[~anomaly_mask].reset_index(drop=True)
+                print(
+                    "Filtered out "
+                    f"{anomaly_count} fetal_femur orientation-anomaly samples "
+                    "listed by the challenge organizers."
+                )
 
         valid_indices = []
         missing_paths = []
@@ -89,8 +133,48 @@ class KeypointDataset(Dataset):
 
         print(f"Keypoint data loaded. Total samples: {len(self.dataframe)}")
 
+    @staticmethod
+    def _normalize_anchor_key(task_id: str, image_path: str) -> tuple[str, str]:
+        normalized = os.path.normpath(str(image_path)).replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part not in ("", ".")]
+        if parts and parts[0] == "images":
+            parts = parts[1:]
+        if parts and parts[0] == str(task_id):
+            return str(task_id), "/".join(parts)
+        return str(task_id), f"{task_id}/{os.path.basename(normalized)}"
+
+    @classmethod
+    def _load_roi_anchor_predictions(
+        cls,
+        roi_anchor_json: Optional[str],
+    ) -> dict[tuple[str, str], np.ndarray]:
+        if not roi_anchor_json:
+            return {}
+        if not os.path.isfile(roi_anchor_json):
+            raise FileNotFoundError(f"ROI anchor JSON not found: {roi_anchor_json}")
+        with open(roi_anchor_json, "r", encoding="utf-8") as handle:
+            predictions = json.load(handle)
+        anchors: dict[tuple[str, str], np.ndarray] = {}
+        for item in predictions:
+            task_id = str(item["task_id"])
+            coords = np.asarray(item["predicted_points_normalized"], dtype=np.float32)
+            coords = canonicalize_task_coords(coords, task_id).reshape(-1, 2)
+            key = cls._normalize_anchor_key(task_id, str(item["image_path"]))
+            anchors[key] = coords
+            anchors[(task_id, os.path.basename(str(item["image_path"])))] = coords
+        print(f"Loaded ROI anchor predictions: {len(predictions)} rows from {roi_anchor_json}")
+        return anchors
+
     def __len__(self) -> int:
         return len(self.dataframe)
+
+    @staticmethod
+    def _fetal_femur_orientation_anomaly_mask(dataframe: pd.DataFrame) -> pd.Series:
+        task_ids = dataframe["task_id"].astype(str)
+        basenames = dataframe["image_path"].astype(str).map(os.path.basename)
+        return task_ids.eq("fetal_femur") & basenames.isin(
+            FETAL_FEMUR_ORIENTATION_ANOMALY_BASENAMES
+        )
 
     def _resolve_image_path(self, rel_path: str) -> Optional[str]:
         rel_norm = os.path.normpath(rel_path)
@@ -132,10 +216,37 @@ class KeypointDataset(Dataset):
             return True
         return str(task_id) in self.roi_crop_tasks
 
-    def _apply_roi_crop(self, image: np.ndarray, coords_px: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        valid_coords = coords_px[np.isfinite(coords_px).all(axis=1)]
+    def _lookup_roi_anchor_points(
+        self,
+        task_id: str,
+        image_path: str,
+        image_width: int,
+        image_height: int,
+        expected_points: int,
+    ) -> Optional[np.ndarray]:
+        if not self.roi_anchor_predictions:
+            return None
+        key = self._normalize_anchor_key(task_id, image_path)
+        anchor = self.roi_anchor_predictions.get(key)
+        if anchor is None:
+            anchor = self.roi_anchor_predictions.get((str(task_id), os.path.basename(str(image_path))))
+        if anchor is None or len(anchor) != expected_points:
+            return None
+        anchor_px = anchor.copy()
+        anchor_px[:, 0] *= max(float(image_width - 1), 1.0)
+        anchor_px[:, 1] *= max(float(image_height - 1), 1.0)
+        return anchor_px.astype(np.float32)
+
+    def _apply_roi_crop(
+        self,
+        image: np.ndarray,
+        coords_px: np.ndarray,
+        reference_coords_px: Optional[np.ndarray] = None,
+    ) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        crop_reference = reference_coords_px if reference_coords_px is not None else coords_px
+        valid_coords = crop_reference[np.isfinite(crop_reference).all(axis=1)]
         if len(valid_coords) == 0:
-            return image, coords_px
+            return image, coords_px, reference_coords_px
 
         image_h, image_w = image.shape[:2]
         x_min = float(valid_coords[:, 0].min())
@@ -165,7 +276,12 @@ class KeypointDataset(Dataset):
         cropped_coords = coords_px.copy()
         cropped_coords[:, 0] -= float(x0)
         cropped_coords[:, 1] -= float(y0)
-        return cropped_image, cropped_coords
+        cropped_reference = None
+        if reference_coords_px is not None:
+            cropped_reference = reference_coords_px.copy()
+            cropped_reference[:, 0] -= float(x0)
+            cropped_reference[:, 1] -= float(y0)
+        return cropped_image, cropped_coords, cropped_reference
 
     def _should_crop_cardiac_split_screen(self, record, task_id: str) -> bool:
         if self.cardiac_split_screen_mode != "crop_panel":
@@ -294,8 +410,21 @@ class KeypointDataset(Dataset):
         if self._should_crop_cardiac_split_screen(record, task_id):
             image, label_points = self._apply_cardiac_split_screen_panel_crop(image, label_points)
 
+        anchor_points = None
         if self._should_apply_roi_crop(task_id):
-            image, label_points = self._apply_roi_crop(image, label_points)
+            image_h, image_w = image.shape[:2]
+            anchor_points = self._lookup_roi_anchor_points(
+                str(task_id),
+                str(record["image_path"]),
+                image_width=image_w,
+                image_height=image_h,
+                expected_points=num_points,
+            )
+            image, label_points, anchor_points = self._apply_roi_crop(
+                image,
+                label_points,
+                reference_coords_px=anchor_points,
+            )
 
         original_height, original_width = image.shape[:2]
         label_original = label_points.reshape(-1).astype(np.float32)
@@ -305,12 +434,32 @@ class KeypointDataset(Dataset):
             coords_px=label_points,
             input_size=self.input_size,
         )
-        image, transformed_points = self._apply_transforms(image, transformed_points)
+        transformed_anchor = None
+        if anchor_points is not None:
+            _, transformed_anchor, _ = letterbox_image_and_points(
+                image=np.zeros((original_height, original_width, 3), dtype=np.uint8),
+                coords_px=anchor_points,
+                input_size=self.input_size,
+            )
+            combined_points = np.concatenate([transformed_points, transformed_anchor], axis=0)
+            image, combined_points = self._apply_transforms(image, combined_points)
+            transformed_points = combined_points[:num_points]
+            transformed_anchor = combined_points[num_points:]
+        else:
+            image, transformed_points = self._apply_transforms(image, transformed_points)
         transformed_label = transformed_points.reshape(-1).astype(np.float32)
+        anchor_train_label = (
+            transformed_anchor.reshape(-1).astype(np.float32)
+            if transformed_anchor is not None
+            else transformed_label.copy()
+        )
 
         transformed_label[0::2] /= max(float(self.input_size - 1), 1.0)
         transformed_label[1::2] /= max(float(self.input_size - 1), 1.0)
         transformed_label = np.clip(transformed_label, 0.0, 1.0)
+        anchor_train_label[0::2] /= max(float(self.input_size - 1), 1.0)
+        anchor_train_label[1::2] /= max(float(self.input_size - 1), 1.0)
+        anchor_train_label = np.clip(anchor_train_label, 0.0, 1.0)
 
         label_original[0::2] /= max(float(original_width - 1), 1.0)
         label_original[1::2] /= max(float(original_height - 1), 1.0)
@@ -324,6 +473,8 @@ class KeypointDataset(Dataset):
             "image": image,
             "label": final_label,
             "train_label": torch.from_numpy(transformed_label).float(),
+            "anchor_train_label": torch.from_numpy(anchor_train_label).float(),
+            "has_anchor_label": torch.tensor(transformed_anchor is not None, dtype=torch.bool),
             "heatmap": final_heatmaps,
             "task_id": task_id,
             "meta": meta,

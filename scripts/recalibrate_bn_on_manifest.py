@@ -30,6 +30,7 @@ from baseline.model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 def _resolve_model_config(args, checkpoint_state, checkpoint_meta):
     (
         inferred_encoder_name,
+        inferred_encoder_feature_mode,
         inferred_use_fpn,
         inferred_fpn_mode,
         inferred_fpn_type,
@@ -42,6 +43,7 @@ def _resolve_model_config(args, checkpoint_state, checkpoint_meta):
     ) = infer_model_config_from_checkpoint(checkpoint_state, checkpoint_meta)
 
     encoder_name = args.encoder_name or inferred_encoder_name
+    encoder_feature_mode = inferred_encoder_feature_mode
     use_fpn = inferred_use_fpn if args.use_fpn is None else args.use_fpn
     fpn_mode = args.fpn_mode or inferred_fpn_mode
     fpn_type = args.fpn_type or inferred_fpn_type
@@ -58,6 +60,7 @@ def _resolve_model_config(args, checkpoint_state, checkpoint_meta):
             "inference",
             {
                 "encoder_name": encoder_name,
+                "encoder_feature_mode": encoder_feature_mode,
                 "use_fpn": use_fpn,
                 "fpn_mode": fpn_mode,
                 "fpn_type": fpn_type,
@@ -67,6 +70,7 @@ def _resolve_model_config(args, checkpoint_state, checkpoint_meta):
             },
         )
         encoder_name = str(profile_config["encoder_name"])
+        encoder_feature_mode = str(profile_config.get("encoder_feature_mode", encoder_feature_mode))
         use_fpn = bool(profile_config["use_fpn"])
         fpn_mode = str(profile_config["fpn_mode"])
         fpn_type = str(profile_config["fpn_type"])
@@ -76,6 +80,7 @@ def _resolve_model_config(args, checkpoint_state, checkpoint_meta):
 
     return {
         "encoder_name": encoder_name,
+        "encoder_feature_mode": encoder_feature_mode,
         "use_fpn": use_fpn,
         "fpn_mode": fpn_mode,
         "fpn_type": fpn_type,
@@ -133,6 +138,8 @@ def main():
             "hidden_hc_ivc_refine_v1",
             "hidden_a4c_hc_ivc_refine_v1",
             "hidden_a4c_hc_ivc_fugc_refine_v1",
+            "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1",
+            "hidden_a4c_hc_ivc_fugc_segment_specialist_v1",
             "hidden_a4c_hc_ivc_plax_refine_v1",
             "hidden_a4c_hc_ivc_femur_refine_v1",
             "geometry_v1",
@@ -162,6 +169,7 @@ def main():
     model = MultiTaskModelFactory(
         encoder_name=model_config["encoder_name"],
         encoder_weights=None,
+        encoder_feature_mode=model_config.get("encoder_feature_mode", "final"),
         task_configs=task_configs,
         use_fpn=model_config["use_fpn"],
         fpn_mode=model_config["fpn_mode"],

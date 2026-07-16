@@ -44,6 +44,11 @@ def main() -> None:
         action="store_true",
         help="Copy training CSVs into the pseudo root instead of symlinking them.",
     )
+    parser.add_argument(
+        "--pseudo-only",
+        action="store_true",
+        help="Do not include original training CSVs; build a dataset root containing only pseudo-labeled validation rows.",
+    )
     args = parser.parse_args()
 
     base_data_root = Path(args.base_data_root).resolve()
@@ -62,7 +67,9 @@ def main() -> None:
     (output_root / "csv").mkdir(parents=True, exist_ok=True)
     (output_root / "manifests").mkdir(parents=True, exist_ok=True)
 
-    if args.copy_train_csv:
+    if args.pseudo_only:
+        pass
+    elif args.copy_train_csv:
         shutil.copytree(base_data_root / "csv", output_root / "csv", dirs_exist_ok=True)
     else:
         for csv_file in sorted((base_data_root / "csv").glob("*.csv")):

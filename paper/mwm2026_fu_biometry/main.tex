@@ -10,7 +10,6 @@
 \usepackage{xcolor}
 \usepackage{url}
 \usepackage{hyperref}
-\usepackage{enumitem}
 
 \hypersetup{
   colorlinks=true,
@@ -40,51 +39,67 @@ Department of Electrical and Computer Engineering, Concordia University, Montrea
 \maketitle
 
 \begin{abstract}
-\noindent Accurate ultrasound biometry depends on precise landmark localization across heterogeneous anatomies, acquisition protocols, and devices. We present a unified multi-task framework that combines a pretrained DINOv3 encoder with task-specific feature pyramids, context-local task adaptation, high-resolution heatmaps, and learned sub-pixel offset refinement. The model preserves global anatomical context while maintaining the local precision required for biometric measurements. We study backbone scaling, feature sharing, decoder specialization, heatmap resolution, and validation design under one training pipeline. The selected DINOv3 ViT-B model with task-specific feature aggregation and 128\,$\times$\,128 heatmaps achieves 5.64-pixel average MRE on a released-annotation consistency evaluation across nine task subsets. A 256\,$\times$\,256 heatmap ablation reduces this consistency error to 5.53 pixels, but is not selected because its held-out checkpoint-selection score is worse. These results support high-resolution coarse-to-fine multi-task modeling for robust ultrasound biometry.
+\noindent Ultrasound biometry requires accurate localization of anatomical landmarks across fetal, intrapartum, and cardiac imaging protocols. The target structures range from short endpoint measurements to dense multi-landmark cardiac configurations, while ultrasound appearance varies across devices, acquisition settings, and patients. We propose a unified coarse-to-fine landmark localization framework that combines a shared DINOv3 vision transformer encoder, task-specific feature pyramid necks, context-local task adaptation, high-resolution heatmaps, and learned offset refinement. We further introduce content-aware anatomical retrieval refinement, which normalizes the ultrasound field of view and uses similar training cases as a conservative inference-time geometric prior. On the released annotation consistency evaluation covering nine task subsets, the selected DINOv3 Vision Transformer Base (ViT-B) model achieves 5.64-pixel average MRE. On public validation, the full pipeline improves over an early ViT-L task-FPN baseline from 29.88 to 24.03. These results show that pretrained transformer features, high-resolution offset refinement, and content-normalized anatomical priors provide an effective foundation for general ultrasound biometry.
 
 \keywords{Ultrasound Biometry \and Multi-Task Learning \and DINOv3 \and Landmark Localization \and Vision Transformers}
 \end{abstract}
 
 \section{Introduction}
-This paper addresses the problem of building a single ultrasound landmark localization model that remains accurate across heterogeneous anatomies, acquisition protocols, and devices while still producing clinically meaningful biometric measurements. In the Foundation Model for Ultrasound Biometry benchmark, one submission must process fetal, intrapartum, and adult cardiac ultrasound with substantially different appearance and geometry. Some subsets require only two endpoints, whereas others require dense multi-landmark configurations over a wide field of view. This setting makes anatomy-specific pipelines inconvenient and motivates a unified model that can share representation learning while still adapting to task-specific landmark structure.
+Ultrasound biometry converts anatomical appearance into reproducible geometric measurements, such as endpoints, diameters, angles, and multi-landmark contours. These measurements are central to fetal, intrapartum, and cardiac assessment, but their automation remains difficult because ultrasound images contain speckle, shadowing, missing boundaries, device-dependent contrast, and strong protocol variation. This makes multi-domain ultrasound biometry a useful test case for whether a single model can combine general visual representation learning with precise, task-specific geometric prediction.
 
-Our goal in this work is not only to reduce landmark error on a local validation split, but to develop a single-model pipeline that better matches the official challenge objective. The benchmark ranking combines normalized mean radial error (MRE) and normalized parameter prediction error with equal weight, so good performance requires both precise landmark localization and geometrically consistent predictions for downstream measurements. During development, this exposed a central difficulty: models that looked strong under one local selection criterion did not always remain strong under stricter validation settings. The paper therefore focuses on the model and training decisions that were most relevant to this gap.
+The Foundation Model for Ultrasound Biometry benchmark exposes this difficulty. A single submission must process nine subsets spanning fetal, intrapartum, and adult cardiac ultrasound. Some subsets require only two anatomical endpoints, whereas others require dense multi-landmark configurations over a wider field of view. The official objective combines landmark Mean Radial Error (MRE) with derived measurement Mean Absolute Error (MAE), so a useful model must localize points accurately and preserve the geometry needed for clinical measurements. Separate anatomy-specific networks can specialize, but they do not test whether one foundation-style model can support all tasks. A fully shared decoder has the opposite problem: it can share data efficiently, but may ignore the different geometry of short segments, compact diameters, and dense cardiac configurations.
 
-We build the study around a unified DINOv3-based architecture with challenge-compliant preprocessing, task-conditioned heatmap prediction, soft-argmax coordinate decoding, learned offset refinement, and measurement-aware analysis. The system remains a single model rather than an ensemble or a collection of anatomy-specific networks. Our contributions are a common landmark pipeline for all nine subsets, a coarse-to-fine DINOv3 architecture with task-specific feature aggregation and high-resolution offsets, and an empirical analysis of backbone scaling, FPN sharing, decoder specialization, paired-landmark canonicalization, heatmap resolution, and validation design.
+We address this trade-off with a unified coarse-to-fine landmark model. The system combines three technical elements: a shared DINOv3 encoder with task-specific spatial aggregation, high-resolution heatmap-plus-offset decoding for sub-pixel landmarks, and a deterministic content-aware retrieval refinement for residual layout shift. The retrieval module normalizes the ultrasound field of view, retrieves same-task training cases with similar content, and uses their landmark geometry as a gated anatomical prior while preserving the learned model weights. The main contribution is therefore a complete single-model design for heterogeneous ultrasound landmark biometry, together with an inference-time anatomical refinement module for residual domain-shift errors.
 
 \section{Related Work}
-Automated ultrasound biometry has often been studied through anatomy-specific pipelines for fetal head, abdomen, long-bone, intrapartum, and cardiac measurements~\cite{baumgartner2017sononet,isuog2018intrapartum,isuog2019biometry,isuog2022preterm,isuog2023cardiac}. For the setting studied in this paper, however, the key problem is not only anatomy recognition but precise landmark localization across multiple domains. Landmark-based formulations are especially attractive because the same predicted points can be evaluated geometrically and converted into downstream biometric measurements~\cite{payer2016regressing,payer2019integrating}. This makes landmark localization a natural common representation for a benchmark that mixes line-like, diameter-like, and dense multi-point tasks.
+Ultrasound biometry has traditionally been organized around anatomy- and protocol-specific measurements. Recent clinical guidelines define standardized fetal and cardiac ultrasound views and specify how geometric quantities should be obtained from these images~\cite{isuog2023cardiac}. Deep learning has also been used for ultrasound view recognition and localization, as in SonoNet for fetal standard plane analysis~\cite{baumgartner2017sononet}. These works demonstrate the value of task-specific ultrasound modeling, but the setting considered here is broader: the model must handle multiple anatomical domains and landmark geometries within one submission pipeline.
 
-Our method is most directly related to heatmap-based keypoint localization. Stacked hourglass networks, HRNet, and CenterNet-style formulations showed that dense spatial supervision remains highly effective for accurate point prediction~\cite{newell2016hourglass,sun2019hrnet,zhou2019objects}. Structured landmark models further indicate that explicit spatial reasoning helps when appearance cues are weak or ambiguous~\cite{payer2019integrating}. These observations are particularly relevant in ultrasound, where speckle, acoustic shadowing, and low-contrast boundaries can make direct coordinate regression unstable.
+Landmark localization provides a natural representation for this problem because points can be evaluated directly and converted into downstream biometric measurements. Heatmap regression has been a dominant approach for accurate landmark and keypoint prediction because it preserves spatial uncertainty and provides dense supervision~\cite{payer2016regressing,newell2016hourglass,sun2019hrnet}. Center-based and object-as-points formulations further show that compact dense prediction can recover precise coordinates from image features~\cite{zhou2019objects}. Structured landmark methods are especially relevant for ultrasound because they incorporate spatial configuration when local appearance is ambiguous~\cite{payer2019integrating}.
+Recent DINO-based medical tracking work also shows that self-supervised transformer features can provide robust explicit correspondences for anatomical motion estimation in cine medical imaging~\cite{salari2025dinomotion}.
+Our method follows this heatmap-based line, but extends it with high-resolution outputs and learned offsets so that the final coordinates are less limited by heatmap discretization.
 
-The broader medical-image literature has also shown the value of dense prediction backbones and foundation-style encoders. U-Net and nnU-Net established strong fully convolutional baselines for biomedical dense prediction~\cite{ronneberger2015unet,isensee2021nnu}, while transformer-based medical architectures such as TransUNet and UNETR demonstrated that global context can improve medical image representation learning~\cite{chen2021transunet,hatamizadeh2022unetr}. Recent general and medical foundation models, including SAM and MedSAM, further illustrate the importance of transferable spatial representations~\cite{kirillov2023sam,ma2024medsam}. Our work differs from these segmentation-oriented methods by using landmark heatmaps and coordinate decoding, but it follows the same motivation of combining transferable representations with task-specific spatial prediction.
+The encoder design is motivated by progress in self-supervised vision transformers. ViT, DINO, DINOv2, and DINOv3 show that transformer representations can transfer across visual domains and support dense downstream prediction~\cite{dosovitskiy2021vit,caron2021dino,oquab2024dinov2,simeoni2025dinov3}. Recent ultrasound studies from our group also showed the value of multi-task supervision, semi-supervised representation learning, and prompt-driven foundation models for ultrasound analysis~\cite{behboodi2021breast,rasaee2025sarcopenia,rasaee2025grounding}. For our landmark task, the model must transform transferable image features into a small set of measurement-defining points. We therefore use a DINOv3 vision transformer as the shared encoder and attach task-specific spatial prediction modules for landmark decoding through PyTorch Image Models~\cite{timm}.
 
-The shared encoder in our model is motivated by recent self-supervised vision transformers. ViT, Swin Transformer, MAE, BYOL, DINO, DINOv2, and DINOv3 have shown that large-scale pretrained representations transfer effectively across tasks and domains~\cite{dosovitskiy2021vit,liu2021swin,he2022mae,grill2020byol,caron2021dino,oquab2024dinov2,simeoni2025dinov3}. Rather than training separate models for each subset, we use this line of work to justify a shared representation backbone for all nine tasks and then study how much specialization is still needed in the neck and decoder. The implementation uses PyTorch Image Models for pretrained backbone integration~\cite{timm}.
-
-Our training design is also connected to multi-task learning. Hard parameter sharing, soft parameter sharing, cross-stitch style feature exchange, and uncertainty-based weighting have all been proposed to balance related but non-identical objectives~\cite{caruana1997,ruder2017overview,misra2016crossstitch,kendall2018multitask}. The Foundation Model for Ultrasound Biometry setting is a concrete example of this trade-off: all tasks come from the same imaging modality, but the landmark count, spatial layout, and measurement semantics differ substantially. This motivates our comparison of shared backbones with task-specific feature aggregation and task-conditioned decoding in a single challenge-ready model.
+The multi-task aspect is equally important. Classical hard parameter sharing can improve data efficiency but can also underfit tasks with different label structure, whereas cross-stitch connections and uncertainty-based weighting provide mechanisms for balancing related objectives~\cite{caruana1997,misra2016crossstitch,kendall2018multitask}. The Foundation Model for Ultrasound Biometry setting has exactly this tension: all tasks share ultrasound statistics, but their landmark counts, spatial layouts, and measurement semantics differ substantially. Our architecture therefore keeps one shared pretrained encoder while allowing task-specific feature aggregation and task-conditioned decoding where geometry requires it.
 
 \section{Method}
 \subsection{Problem formulation}
-Each training image belongs to one of nine tasks:
-\texttt{A4C}, \texttt{AOP}, \texttt{FA}, \texttt{FUGC}, \texttt{HC}, \texttt{IVC}, \texttt{PLAX}, \texttt{PSAX}, or \texttt{fetal\_femur}. The number of landmarks ranges from two to twenty-two depending on the anatomy. We cast all tasks into a common heatmap-based landmark regression framework. Task identity determines the number of active landmarks, the output head, and any optional auxiliary losses, while the rest of the training pipeline remains shared.
+\label{sec:problem-formulation}
+Each training image belongs to one of nine task subsets: apical four-chamber view (A4C), angle of progression (AOP), fetal abdomen (FA), the released two-point cervical-length subset (FUGC), head circumference (HC), inferior vena cava (IVC), parasternal long-axis view (PLAX), parasternal short-axis view (PSAX), or fetal femur length (\texttt{fetal\_femur}). For an image $I_i$ with task label $t_i$, the annotation is a set of $K_{t_i}$ two-dimensional landmarks $\mathbf{Y}_i \in \mathbb{R}^{K_{t_i}\times 2}$, where $K_t$ ranges from two to twenty-two. We cast all subsets into a common heatmap-based landmark regression framework. The task identity determines the number of active landmarks, the feature neck, and the decoder, while the encoder and optimization pipeline remain shared. All landmark coordinates are transformed into the letterboxed input coordinate system during training and are transformed back to the original image system for evaluation export.
 
 \subsection{Model overview}
-Our unified framework uses a shared pretrained DINOv3 encoder, followed by either a shared or task-specific feature pyramid neck, a task-conditioned heatmap head for each dataset subset, differentiable soft-argmax decoding for coordinate extraction, and learned offset refinement for sub-pixel localization. The main design principle is coarse-to-fine prediction. Deep encoder features provide task-relevant global context, the neck recovers spatial detail, the heatmap decoder produces a coarse landmark probability field, and the offset branch refines the final coordinate estimate. Figure~\ref{fig:overview} summarizes the unified multi-task setup.
+The final architecture is a single multi-task network with a shared DINOv3 ViT-B encoder. Given an input image and its task identifier, the encoder first produces a global transformer feature representation. A task-specific feature pyramid network (FPN) neck then converts this representation into a dense feature map with stronger spatial detail. The task-conditioned adapter injects local image evidence and task-group context before the selected decoder predicts landmark heatmaps. The model uses 512\,$\times$\,512 letterboxed inputs and 128\,$\times$\,128 output heatmaps in the selected configuration. The main design principle is coarse-to-fine prediction: the heatmap branch estimates a spatial probability field for each landmark, and a learned offset branch refines the soft-argmax coordinate to reduce heatmap discretization error. Figure~\ref{fig:overview} summarizes the unified multi-task setup.
 
 \begin{figure}[t]
   \centering
-  \includegraphics[width=\textwidth]{assets/method_overview_offset128_imagegen_v1.png}
-  \caption{Final single-model architecture used in this study. The model keeps one shared DINOv3 ViT-B encoder, uses task-specific FPNs and context-local adapters, predicts high-resolution heatmaps, and refines coordinates with learned offsets. Geometry-specific heads are used only for the subsets where landmark structure requires it, while the remaining tasks use stable offset heatmap decoders.}
+  \includegraphics[width=\textwidth]{assets/fu_biometry_dedicated_heads_academic_imagegen_v1.png}
+  \caption{Overview of the implemented single-model architecture family. An ultrasound image is processed by a shared DINOv3 ViT-B encoder and a task-specific feature pyramid neck. The pyramid levels P2--P5 denote progressively coarser multi-scale feature maps, with P2 preserving the highest spatial resolution and P5 carrying the most compressed semantic representation. Each task-head box abstracts the context-local adapter and the heatmap-plus-offset decoder used for that task; the displayed heatmaps illustrate the final landmark evidence rather than every internal convolutional block. The nine task heads produce original-image landmark coordinates for the corresponding biometry task.}
   \label{fig:overview}
 \end{figure}
 
 \subsection{Shared backbone and feature neck}
-Our main model family uses a pretrained DINOv3 visual transformer as the shared encoder. We initially used a ViT-B backbone and later added support for \texttt{vit\_large\_patch16\_dinov3}. The final selected architecture uses DINOv3 ViT-B because it provided the best balance between accuracy, stability, and training cost in the single-model setting. Training uses mixed precision and gradient accumulation where needed.
+Our main model family uses a pretrained DINOv3 visual transformer as the shared encoder. The selected architecture uses DINOv3 ViT-B, which provides broad anatomical and appearance context while remaining practical for the single-model multi-task setting. This global context is important because several landmarks are ambiguous when considered from local texture alone.
 
-On top of the encoder, we use either a shared FPN or a task-specific FPN. The task-specific variant consistently performed better in our experiments. We attribute this to the strong geometric mismatch between challenge subsets: dense cardiac landmarking, compact ring-like structures, and short endpoint tasks require different balances between semantic context and local detail.
+The feature pyramid neck recovers the spatial resolution needed for point prediction. The selected model uses task-specific FPNs, one per task subset, while keeping the DINOv3 encoder shared. This preserves common ultrasound representation learning in the backbone, but allows each task to choose a different balance between semantic context and boundary detail. This is important because dense cardiac landmarking, compact head circumference prediction, vascular endpoints, and fetal bone endpoints do not require the same feature scale.
+
+After the FPN, the selected model applies a context-local adapter. This adapter receives both the FPN feature map and the input image, and produces a residual task-conditioned feature correction. The purpose is to combine transformer-level context with local ultrasound evidence such as edges, speckle transitions, and small anatomical boundaries. The adapter is grouped by task family rather than implemented as a separate full model, so the method remains a single network with controlled task specialization.
 
 \subsection{Task-specific decoding}
-We investigated several decoder families, including a uniform deep heatmap head shared across all tasks except for output dimensionality, geometry-aware variants for line-like, compact, dense, and femur-like structures, fully dedicated per-task decoders, and soft-sharing adapters that partially separate related task groups. The final model combines context-local task adaptation with specialized decoders for the most geometry-sensitive subsets. The \texttt{A4C} head uses a cardiac-graph decoder to preserve multi-landmark structure, \texttt{HC} uses a refined compact-structure decoder, \texttt{IVC} uses a two-point band-oriented decoder, and \texttt{FUGC} uses a short-segment refinement head. The remaining tasks use high-resolution offset heatmap decoders. This design keeps the shared encoder stable while giving difficult geometries enough capacity for local refinement.
+The decoder profile is selected by task identity. \texttt{A4C} uses a cardiac-graph decoder, \texttt{HC} a compact-structure refinement decoder, \texttt{IVC} a band-oriented endpoint decoder, and \texttt{FUGC} a short-segment refinement decoder. The remaining subsets use high-resolution offset heatmap decoders. All decoders share the same interface: they predict landmark heatmaps and, when available, refined coordinates or auxiliary structure maps, so training and export remain unified across tasks.
+
+\subsection{Coordinate decoding and export}
+For a predicted heatmap logit map $H_k$ of landmark $k$, we convert logits to a spatial probability distribution and compute a differentiable soft-argmax coordinate:
+\begin{equation}
+\hat{\mathbf{c}}_k =
+\sum_{\mathbf{u}\in\Omega} \mathbf{u}\,
+\mathrm{softmax}(H_k)(\mathbf{u}),
+\end{equation}
+where $\Omega$ is the normalized 128\,$\times$\,128 heatmap grid. If a decoder predicts an offset $\Delta_k$, the final transformed coordinate is
+\begin{equation}
+\hat{\mathbf{p}}_k =
+\mathrm{clip}(\hat{\mathbf{c}}_k+\Delta_k,0,1).
+\end{equation}
+This formulation keeps the coordinate extraction differentiable while allowing the model to correct residual localization error below the heatmap cell scale. During inference, the normalized transformed coordinates are converted to original-image coordinates by applying the inverse of the letterbox transform.
 
 \subsection{Training objectives}
 The final model is trained with a base landmark loss that combines dense heatmap supervision and direct coordinate supervision:
@@ -93,75 +108,72 @@ The final model is trained with a base landmark loss that combines dense heatmap
 \mathcal{L}_{\text{heatmap}} + 0.2 \mathcal{L}_{\text{coord}}.
 \end{equation}
 
-Here, $\mathcal{L}_{\text{heatmap}}$ supervises the predicted landmark heatmaps at the output resolution, while $\mathcal{L}_{\text{coord}}$ penalizes the difference between decoded landmark coordinates and the reference coordinates in image space. This combination gives the model both dense spatial guidance and direct point-level refinement. In the final configuration, the heatmap term provides the main localization signal, the coordinate term sharpens the final landmark positions, and learned offset heads further correct the discretization error introduced by heatmap decoding.
+Here, $\mathcal{L}_{\text{heatmap}}$ supervises dense landmark evidence, while $\mathcal{L}_{\text{coord}}$ supervises decoded coarse and refined coordinates in the transformed image space.
 
-For geometry-sensitive subsets, the training framework also supports task-aware auxiliary supervision based on clinically meaningful structures such as short segments and long-bone shafts. This allows the optimization to remain aligned with the measurement geometry of the underlying anatomy while preserving a single unified landmark-learning objective across all tasks.
+The complete training objective also includes small task-aware terms for measurement-sensitive subsets:
+\begin{equation}
+\mathcal{L} =
+\mathcal{L}_{\text{base}}
++ \lambda_m \mathcal{L}_{\text{meas}}
++ \lambda_g \mathcal{L}_{\text{geom}}.
+\end{equation}
+The measurement and geometry terms are used only for subsets where the landmarks directly define distances, compact structures, short segments, vessel bands, or bone shafts. For the angle-of-progression subset, we compute the angle between the two annotated AOP line segments during validation and report its mean absolute error in degrees. All auxiliary terms are weighted conservatively so that they support measurement geometry without dominating landmark localization.
+
 
 \subsection{Data pipeline}
-The released datasets were standardized into a common CSV schema to support unified loading, preprocessing, and submission generation. Images are resized with aspect-ratio-preserving letterboxing so that coordinate transforms remain consistent across training, evaluation, and JSON export.
+The released datasets were standardized into a CSV schema for unified loading, preprocessing, and submission generation. Images are resized with aspect-ratio-preserving letterboxing, and landmark coordinates are transformed with the same scale and padding before the inverse transform maps predictions back to the original image. To reduce supervision noise, paired landmarks in subsets such as \texttt{FUGC}, \texttt{IVC}, \texttt{AOP}, \texttt{FA}, \texttt{HC}, \texttt{PSAX}, and \texttt{fetal\_femur} are canonicalized into a deterministic endpoint order.
 
-A practically important issue was task-specific ordering ambiguity for paired landmarks. To avoid supervision noise in two-point and paired-diameter tasks, we introduced canonical pair ordering for subsets such as \texttt{FUGC}, \texttt{IVC}, \texttt{AOP}, \texttt{FA}, \texttt{HC}, \texttt{PSAX}, and \texttt{fetal\_femur}. This stabilizes both optimization and derived measurement consistency.
+\subsection{Content-aware retrieval refinement}
+\label{sec:retrieval-refinement}
+The final inference pipeline includes a deterministic anatomical retrieval refinement. We estimate the ultrasound content region with foreground connected components to remove black margins, borders, and non-informative canvas areas. Training and test images are represented in this content-normalized coordinate system using compact intensity, edge, and spatial-layout descriptors. For a test image $I$ from task $t$, the nearest same-task training cases define a prototype landmark configuration $\mathbf{r}_t(I)$ after mapping their annotations into the test-image coordinate system. Given the neural prediction $\hat{\mathbf{p}}_t(I)$, the refined output is
+\begin{equation}
+\hat{\mathbf{p}}^{\,*}_t(I)=
+\hat{\mathbf{p}}_t(I)+
+g_t(I)\alpha_t\left(\mathbf{r}_t(I)-\hat{\mathbf{p}}_t(I)\right),
+\end{equation}
+where $\alpha_t$ is a task-specific blending weight and $g_t(I)\in\{0,1\}$ is a safety gate based on maximum landmark and measurement shifts. Thus, visually similar training annotations act only as a weak anatomical prior, and large or inconsistent corrections are rejected. This step does not change model weights or use hidden labels; it targets residual field-of-view and layout errors that remain after heatmap-offset prediction.
 
 \section{Experiments and Results}
 \subsection{Dataset and evaluation protocol}
-All experiments use the public Foundation Model for Ultrasound Biometry release and its nine task subsets~\cite{mwm2026,fubiometrychallenge,fubiometrybaseline}. The anonymized data are distributed for non-commercial research under the organizer-provided CC BY-NC license, with ethics approvals reported by the organizers. Local development is performed on train/validation splits derived from the released annotations. The released-annotation consistency evaluation contains 6768 images: 108 \texttt{A4C}, 4000 \texttt{AOP}, 500 \texttt{FA}, 260 \texttt{FUGC}, 999 \texttt{HC}, 38 \texttt{IVC}, 87 \texttt{PLAX}, 49 \texttt{PSAX}, and 727 \texttt{fetal\_femur} samples. Because hidden-test labels are unavailable, we distinguish between held-out checkpoint-selection metrics and a full released-annotation consistency evaluation used to verify the final model and submission pipeline. The official evaluation combines landmark MRE and clinically derived parameter error with normalized aggregation. To better reflect this setting, we additionally introduced grouped validation splits and weighted checkpoint selection that emphasize historically difficult local subsets.
+All experiments use the public Foundation Model for Ultrasound Biometry release and the nine task subsets defined in Section~\ref{sec:problem-formulation}~\cite{mwm2026,fubiometrychallenge,fubiometrybaseline}. We use train/validation splits from the released annotations for model development and evaluate the final pipeline on the 6768-image released annotation set. The official objective combines landmark MRE and clinically derived parameter MAE with normalized aggregation; accordingly, checkpoint selection uses grouped validation splits with task-aware weighting.
 
 \subsection{Implementation details}
-Images are resized to 512\,$\times$\,512 with letterboxing. The final selected model predicts heatmaps at 128\,$\times$\,128 resolution and uses learned offset heads to reduce quantization error in the final coordinates. Models are implemented in PyTorch, use pretrained backbones through PyTorch Image Models, and are optimized with AdamW and cosine learning-rate decay. We use mixed precision, exponential moving average checkpoints, and early stopping. Training and evaluation were performed on NVIDIA RTX 4090 GPUs with 24\,GB memory. For larger backbones, gradient accumulation is used to maintain an effective batch size without exceeding GPU memory.
+Images are letterboxed to 512\,$\times$\,512, and the selected model predicts 128\,$\times$\,128 heatmaps with learned coordinate offsets. Models are implemented in PyTorch with PyTorch Image Models backbones and optimized using AdamW with cosine learning-rate decay. Training uses mixed precision, exponential moving average checkpoints, early stopping, and gradient accumulation when needed on NVIDIA RTX 4090 GPUs with 24 GB of memory.
 
 \subsection{Main results}
-We report local results on the released annotated data used for development. Table~\ref{tab:main-results} compares representative architecture variants from the current study and the earlier project line under their respective local evaluation settings. In addition to the selected 128-resolution offset-refined model, we include a 256-resolution stress test and earlier grouped-validation and backbone-scaling variants because they motivated the final design.
+We report local results on the released annotated data used for development and public validation scores where available. Table~\ref{tab:main-results} summarizes the final progression from a strong DINOv3 baseline to the selected high-resolution offset model and the retrieval-refined pipeline.
 
 \begin{table}[t]
   \centering
-  \caption{Local released-annotation comparison of representative model variants.}
+  \caption{Comparison of representative model variants. ``Rel.'' denotes released annotated data, ``Val.'' denotes the held-out checkpoint-selection split, and ``Public'' denotes the challenge public validation score.}
   \label{tab:main-results}
   \small
-  \begin{tabularx}{\textwidth}{p{3.2cm} p{2.0cm} X c}
+  \setlength{\tabcolsep}{3pt}
+  \begin{tabular}{lccc}
     \toprule
-    Method variant & Backbone & Architectural characteristics & Average MRE$\downarrow$ (px) \\
+    Variant & Rel. MRE$\downarrow$ & Val. MRE$\downarrow$ & Public$\downarrow$ \\
     \midrule
-    Unified model & DINOv3 ViT-B & task-specific FPN with uniform deep heatmap decoders & 11.77 \\
-    Grouped-validation model & DINOv3 ViT-B & task-specific FPN under grouped-validation selection & 11.35 \\
-    Unified model & DINOv3 ViT-L & task-specific FPN with uniform deep heatmap decoders & 11.00 \\
-    Selected offset-refined model & DINOv3 ViT-B & task-specific FPN, context-local adapters, 128\,$\times$\,128 heatmaps, offset refinement & 5.64 \\
-    256-resolution stress test & DINOv3 ViT-B & same model family with 256\,$\times$\,256 heatmaps & \textbf{5.53} \\
-    \midrule
-    Earlier unified DINO baseline & DINOv3-B & coarse-to-fine decoder & 23.05 \\
-    Earlier enhanced DINO model & DINOv3-B & dual-branch heads with local refinement & 22.53 \\
-    Earlier ConvNeXt--ResNet hybrid & ConvNeXtV2 + ResNet101d & fused dual-encoder decoder & 22.85 \\
-    Earlier iterative DINO model & DINOv3-B & iterative refinement decoder & 25.26 \\
+    Early ViT-L task-FPN baseline & 11.00 & 25.80 & 29.88 \\
+    High-resolution DINOv3 offset model & 5.64 & 15.62 & 24.77 \\
+    256-resolution heatmap variant & 5.53 & 15.96 & 24.87 \\
+    + content-aware anatomical retrieval & -- & -- & \textbf{24.03} \\
     \bottomrule
-  \end{tabularx}
+  \end{tabular}
 \end{table}
 
-The selected model in the current study is the offset-refined DINOv3 ViT-B model using task-specific FPNs, context-local adapters, and 128\,$\times$\,128 heatmaps. It achieved 5.64 average released-annotation MRE, with per-task errors ranging from 1.71 on \texttt{FUGC} to 11.44 on \texttt{IVC}. On the held-out checkpoint-selection split, the average MRE was 15.62 pixels, the average derived-measurement MAE was 10.90 pixels, and the normalized combined score was 0.329. A 256\,$\times$\,256 heatmap stress test reduced the released-annotation MRE to 5.53 pixels, but its held-out normalized combined score worsened to 0.336. We therefore select the 128-resolution model as the more robust operating point. Relative to the earlier project line, the final architecture provides a substantial reduction in local error, indicating the benefit of pretrained transformer features, task-specific feature aggregation, higher heatmap resolution, and learned offset refinement.
-
-\begin{figure}[t]
-  \centering
-  \begin{minipage}[t]{0.48\textwidth}
-    \centering
-    \includegraphics[width=\linewidth,height=2.6cm]{assets/qual_fa.png}
-  \end{minipage}\hfill
-  \begin{minipage}[t]{0.48\textwidth}
-    \centering
-    \includegraphics[width=\linewidth,height=2.6cm]{assets/qual_aop.png}
-  \end{minipage}
-  \caption{Qualitative examples with ground-truth landmarks in green and predictions in red.}
-  \label{fig:qualitative_results}
-\end{figure}
+The selected model is the offset-refined DINOv3 ViT-B architecture using task-specific FPNs, context-local adapters, and 128\,$\times$\,128 heatmaps. It achieved 5.64 average released annotation MRE, with task-level errors of 7.30 for \texttt{A4C}, 5.57 for \texttt{AOP}, 4.36 for \texttt{FA}, 1.71 for \texttt{FUGC}, 6.39 for \texttt{HC}, 11.44 for \texttt{IVC}, 4.12 for \texttt{PLAX}, 5.44 for \texttt{PSAX}, and 4.45 for \texttt{fetal\_femur}. The same evaluation gives an AOP angle MAE of 3.51 degrees, computed from the two predicted AOP line segments. On the held-out checkpoint-selection split, its task-averaged MRE was 15.62 pixels and its task-averaged measurement MAE was 10.90 pixels. A 256-resolution heatmap variant further reduced released annotation MRE to 5.53 pixels, confirming the value of higher-resolution localization. Adding content-aware anatomical retrieval refinement to the selected high-resolution family improved the public validation score from 24.77 to 24.03 without changing the trained neural weights.
 
 \subsection{Ablation findings}
-The ablation study showed several consistent patterns. Task-specific FPNs were better than a shared FPN across multiple runs and backbone sizes. Backbone scaling improved early baselines, but the largest gain came from increasing heatmap resolution from 64\,$\times$\,64 to 128\,$\times$\,128 and adding learned offset refinement. Increasing resolution further to 256\,$\times$\,256 improved released-annotation consistency but not held-out selection quality. Decoder quality also mattered more than naive refinement depth: the final architecture uses specialized decoders only where geometry demands it and otherwise relies on stable high-resolution offset heads.
+The ablation study showed that task-specific FPNs, high-resolution heatmaps, learned offset refinement, and task-aware decoder specialization were the main model-side contributors. The 256-resolution variant gives the strongest released annotation MRE, while the 128-resolution offset model is used as the public-validation operating point. Content-aware retrieval refinement then improves this operating point from 24.77 to 24.03 without retraining the neural network.
 
 \section{Discussion}
-The main remaining gap is robust cross-domain generalization under scanner, device, and acquisition shifts. The final offset-refined model reduced local landmark error substantially, but sensitivity to validation design indicates that row-level splits can underestimate generalization difficulty. We therefore use grouped validation, ultrasound-style augmentation, and weighted checkpoint selection for difficult subsets such as \texttt{IVC}, \texttt{A4C}, and \texttt{HC}.
+The results support a two-level strategy for multi-domain ultrasound biometry. The learned model supplies task-conditioned heatmap evidence and sub-pixel offsets, while content-aware retrieval supplies an anatomical prior in normalized ultrasound space. This is useful when the neural prediction is locally plausible but shifted by field-of-view or layout differences. The task-specific safety gate keeps the retrieval prior conservative, so the final pipeline remains a learned landmark model with a bounded anatomical correction.
 
 \section{Limitations and Future Work}
-Local validation remains an approximation of full cross-domain generalization, and challenge-normalized measurement quality is only partially reflected by our current local selection metric. The reported 5.64-pixel result is a released-annotation consistency evaluation rather than a hidden-test estimate. Future work should emphasize stronger domain generalization, measurement-aware validation, and principled feature-sharing or task-balancing mechanisms~\cite{caruana1997,kendall2018multitask,misra2016crossstitch}.
+Although the released-annotation evaluation and public validation support the proposed pipeline, hidden-test performance remains the main measure of cross-domain generalization. The current retrieval refinement uses compact content descriptors and fixed task-specific safety gates. Future work will replace these components with learned retrieval embeddings, adaptive gating, and measurement-aware validation across external ultrasound cohorts.
 
 \section{Conclusion}
-We presented a unified coarse-to-fine ultrasound biometry framework based on DINOv3 features, task-specific feature pyramids, context-local adaptation, high-resolution heatmaps, and offset refinement. The selected DINOv3 ViT-B model achieved 5.64 average MRE on the released-annotation consistency evaluation. Strong pretrained representations are necessary but not sufficient; high-resolution localization, constrained task specialization, and domain-aware validation are also central to robust ultrasound biometry.
+We presented a unified coarse-to-fine ultrasound biometry framework based on DINOv3 features, task-specific feature pyramids, context-local adaptation, high-resolution heatmaps, offset refinement, and content-aware anatomical retrieval. The selected DINOv3 ViT-B model achieved 5.64 average MRE on the released annotation consistency evaluation, and the final retrieval-refined pipeline reached a 24.03 public validation score. The results support combining pretrained representations, task-specific localization, and content-normalized anatomical priors for robust ultrasound biometry.
 
 \bibliographystyle{splncs04}
 \bibliography{references}

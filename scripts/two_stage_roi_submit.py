@@ -104,6 +104,7 @@ def load_submission_model(
     checkpoint, checkpoint_meta = load_checkpoint_payload(checkpoint_path, device)
     (
         inferred_encoder_name,
+        inferred_encoder_feature_mode,
         inferred_use_fpn,
         inferred_fpn_mode,
         inferred_fpn_type,
@@ -117,6 +118,7 @@ def load_submission_model(
 
     config = {
         "encoder_name": encoder_name or inferred_encoder_name,
+        "encoder_feature_mode": inferred_encoder_feature_mode,
         "use_fpn": inferred_use_fpn,
         "fpn_mode": fpn_mode or inferred_fpn_mode,
         "fpn_type": fpn_type or inferred_fpn_type,
@@ -130,6 +132,7 @@ def load_submission_model(
     model = MultiTaskModelFactory(
         encoder_name=str(config["encoder_name"]),
         encoder_weights="pretrained",
+        encoder_feature_mode=str(config.get("encoder_feature_mode", "final")),
         task_configs=task_configs,
         heatmap_size=inferred_heatmap_size,
         use_fpn=bool(config["use_fpn"]),
@@ -265,6 +268,7 @@ def main():
             "hidden_hc_ivc_refine_v1",
             "hidden_a4c_hc_ivc_refine_v1",
             "hidden_a4c_hc_ivc_fugc_refine_v1",
+            "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1",
             "hidden_a4c_hc_ivc_plax_refine_v1",
             "hidden_a4c_hc_ivc_femur_refine_v1",
             "hidden_a4cv2_hc_ivc_fugc_refine_v1",

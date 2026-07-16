@@ -23,6 +23,7 @@ from model_factory import MultiTaskModelFactory
 from model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 from utils import (
     build_line_mask_from_transformed_coords,
+    compute_aop_angle_loss,
     compute_combined_score,
     compute_dataset_specific_loss,
     compute_femur_shaft_loss,
@@ -48,6 +49,7 @@ DATA_ROOT_PATH = "data"
 OUTPUT_DIR = "output"
 ENCODER = "vit_base_patch16_dinov3"
 ENCODER_WEIGHTS = "pretrained"
+ENCODER_FEATURE_MODE = "final"
 RANDOM_SEED = 42
 VAL_SPLIT = 0.2
 CHECKPOINT_SCORE_NAME = "Combined score"
@@ -386,6 +388,81 @@ def _freeze_for_targeted_finetune(
     if freeze_other_heads and target_task_ids:
         for task_id, head in model.heads.items():
             _set_module_requires_grad(head, task_id in target_task_ids)
+
+
+def _freeze_except_highres_texture_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    adapter = getattr(model, "context_local_adapters", None)
+    if adapter is None:
+        raise ValueError("--train-highres-texture-only requires a high-resolution texture adapter profile.")
+
+    trainable_prefixes = (
+        "texture_stem.",
+        "texture_enc1.",
+        "texture_enc2.",
+        "texture_enc3.",
+        "texture_pyramid_fusion.",
+        "group_texture_blocks.",
+        "highres_refine.",
+        "texture_fusion.",
+        "global_texture_gate",
+        "group_texture_gates.",
+        "hrnet_encoder.",
+        "hrnet_projections.",
+        "hrnet_layer_logits",
+        "hrnet_refine.",
+        "hrnet_fusion.",
+        "global_hrnet_gate",
+        "group_hrnet_gates.",
+    )
+    enabled = 0
+    for name, param in adapter.named_parameters():
+        if name.startswith(trainable_prefixes):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError("No high-resolution texture branch parameters were found to train.")
+
+
+def _freeze_except_boundary_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    adapter = getattr(model, "context_local_adapters", None)
+    if adapter is None:
+        raise ValueError("--train-boundary-branch-only requires a boundary-context adapter profile.")
+
+    trainable_prefixes = (
+        "boundary_stem.",
+        "boundary_fusion.",
+        "global_boundary_gate",
+        "group_boundary_gates.",
+    )
+    enabled = 0
+    for name, param in adapter.named_parameters():
+        if name.startswith(trainable_prefixes):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError("No boundary branch parameters were found to train.")
+
+
+def _freeze_except_encoder_task_adapter(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    adapter = getattr(model, "encoder_task_adapters", None)
+    if adapter is None:
+        raise ValueError("--train-encoder-task-adapter-only requires an encoder task adapter profile.")
+
+    enabled = 0
+    for param in adapter.parameters():
+        param.requires_grad = True
+        enabled += param.numel()
+    if enabled == 0:
+        raise ValueError("No encoder task adapter parameters were found to train.")
 
 
 def _collect_trainable_params(module: torch.nn.Module | None):
@@ -754,6 +831,7 @@ def main(
     early_stopping_min_delta: float = 0.0,
     output_dir: str = OUTPUT_DIR,
     encoder_name: str = ENCODER,
+    encoder_feature_mode: str = ENCODER_FEATURE_MODE,
     input_size: int = INPUT_SIZE,
     heatmap_size: tuple[int, int] = HEATMAP_SIZE,
     heatmap_sigma: float = HEATMAP_SIGMA,
@@ -773,6 +851,10 @@ def main(
     fugc_segment_loss_weight: float = FUGC_SEGMENT_LOSS_WEIGHT,
     ivc_band_loss_weight: float = IVC_BAND_LOSS_WEIGHT,
     structure_loss_weight: float = STRUCTURE_LOSS_WEIGHT,
+    aop_angle_loss_weight: float = 0.0,
+    teacher_checkpoint: str | None = None,
+    teacher_consistency_weight: float = 0.0,
+    teacher_consistency_tasks: set[str] | None = None,
     task_loss_weight_overrides: dict[str, float] | None = None,
     sampler_task_weight_overrides: dict[str, float] | None = None,
     use_ema: bool = True,
@@ -782,12 +864,20 @@ def main(
     roi_context_min: float = ROI_CONTEXT_RANGE[0],
     roi_context_max: float = ROI_CONTEXT_RANGE[1],
     roi_center_jitter: float = 0.0,
+    roi_anchor_json: str | None = None,
+    anchor_consistency_weight: float = 0.0,
+    anchor_consistency_tasks: set[str] | None = None,
     grad_accum_steps: int = 1,
     use_amp: bool = True,
     freeze_encoder: bool = False,
     freeze_fpn: bool = False,
     freeze_adapters: bool = False,
     freeze_other_heads: bool = False,
+    train_highres_texture_only: bool = False,
+    train_boundary_branch_only: bool = False,
+    train_encoder_task_adapter_only: bool = False,
+    domain_adversarial_weight: float = 0.0,
+    domain_adversarial_lambda: float = 1.0,
     split_mode: str = SPLIT_MODE,
     augmentation_profile: str = AUGMENTATION_PROFILE,
     checkpoint_task_weight_overrides: dict[str, float] | None = None,
@@ -801,6 +891,7 @@ def main(
             "train",
             {
                 "encoder_name": encoder_name,
+                "encoder_feature_mode": encoder_feature_mode,
                 "input_size": input_size,
                 "heatmap_size": list(heatmap_size),
                 "heatmap_sigma": heatmap_sigma,
@@ -824,9 +915,13 @@ def main(
                 "fugc_segment_loss_weight": fugc_segment_loss_weight,
                 "ivc_band_loss_weight": ivc_band_loss_weight,
                 "structure_loss_weight": structure_loss_weight,
+                "aop_angle_loss_weight": aop_angle_loss_weight,
+                "domain_adversarial_weight": domain_adversarial_weight,
+                "domain_adversarial_lambda": domain_adversarial_lambda,
             },
         )
         encoder_name = str(profile_config["encoder_name"])
+        encoder_feature_mode = str(profile_config.get("encoder_feature_mode", encoder_feature_mode))
         input_size = int(profile_config["input_size"])
         if profile_config.get("heatmap_size"):
             profile_heatmap_size = profile_config["heatmap_size"]
@@ -861,6 +956,9 @@ def main(
         fugc_segment_loss_weight = float(profile_config["fugc_segment_loss_weight"])
         ivc_band_loss_weight = float(profile_config["ivc_band_loss_weight"])
         structure_loss_weight = float(profile_config["structure_loss_weight"])
+        aop_angle_loss_weight = float(profile_config.get("aop_angle_loss_weight", aop_angle_loss_weight))
+        domain_adversarial_weight = float(profile_config.get("domain_adversarial_weight", domain_adversarial_weight))
+        domain_adversarial_lambda = float(profile_config.get("domain_adversarial_lambda", domain_adversarial_lambda))
 
     metric_column = "MRE (pixels)"
     metric_label_map = {
@@ -876,6 +974,7 @@ def main(
     log_dir = os.path.join(output_dir, "log")
     metrics_dir = os.path.join(output_dir, "metrics")
     checkpoints_dir = os.path.join(output_dir, "checkpoints")
+    splits_dir = os.path.join(output_dir, "splits")
     tensorboard_dir = os.path.join(output_dir, "tensorboard", run_id)
     model_save_path = os.path.join(checkpoints_dir, "best_model.pth")
     log_save_path = os.path.join(log_dir, f"training_{run_id}.log")
@@ -884,6 +983,7 @@ def main(
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(metrics_dir, exist_ok=True)
     os.makedirs(checkpoints_dir, exist_ok=True)
+    os.makedirs(splits_dir, exist_ok=True)
     os.makedirs(tensorboard_dir, exist_ok=True)
 
     # Setup logger
@@ -902,6 +1002,11 @@ def main(
         if init_checkpoint_meta:
             if encoder_name == ENCODER and init_checkpoint_meta.get("encoder_name"):
                 encoder_name = str(init_checkpoint_meta["encoder_name"])
+            if (
+                encoder_feature_mode == ENCODER_FEATURE_MODE
+                and init_checkpoint_meta.get("encoder_feature_mode")
+            ):
+                encoder_feature_mode = str(init_checkpoint_meta["encoder_feature_mode"])
             if head_type == HEAD_TYPE and init_checkpoint_meta.get("head_type"):
                 head_type = str(init_checkpoint_meta["head_type"])
             if task_head_profile == TASK_HEAD_PROFILE and init_checkpoint_meta.get("task_head_profile"):
@@ -937,6 +1042,7 @@ def main(
     logger.info(f"Model profile: {model_profile if model_profile is not None else 'manual'}")
     logger.info(f"Random seed: {random_seed}")
     logger.info(f"Encoder: {encoder_name}")
+    logger.info(f"Encoder feature mode: {encoder_feature_mode}")
     logger.info(f"Input size: {input_size}")
     logger.info(f"Head type: {head_type}")
     logger.info(f"Task head profile: {task_head_profile}")
@@ -956,18 +1062,36 @@ def main(
     logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
     logger.info(f"IVC band loss weight: {ivc_band_loss_weight:.6f}")
     logger.info(f"Structure map loss weight: {structure_loss_weight:.6f}")
+    logger.info(f"AOP angle loss weight: {aop_angle_loss_weight:.6f}")
+    logger.info(f"Teacher checkpoint: {teacher_checkpoint if teacher_checkpoint else 'none'}")
+    logger.info(f"Teacher consistency weight: {teacher_consistency_weight:.6f}")
+    logger.info(
+        "Teacher consistency tasks: "
+        f"{sorted(teacher_consistency_tasks) if teacher_consistency_tasks else 'all-enabled'}"
+    )
     logger.info(f"EMA: {'ENABLED' if use_ema else 'DISABLED'}")
     logger.info(f"EMA decay: {ema_decay:.6f}")
     logger.info(f"Train ROI crop: {'ENABLED' if train_roi_crop else 'DISABLED'}")
     logger.info(f"ROI crop tasks: {sorted(roi_crop_tasks) if roi_crop_tasks else 'all-enabled-tasks'}")
     logger.info(f"ROI context range: ({roi_context_min:.3f}, {roi_context_max:.3f})")
     logger.info(f"ROI center jitter: {roi_center_jitter:.3f}")
+    logger.info(f"ROI anchor JSON: {roi_anchor_json if roi_anchor_json else 'none'}")
+    logger.info(f"Anchor consistency weight: {anchor_consistency_weight:.6f}")
+    logger.info(
+        "Anchor consistency tasks: "
+        f"{sorted(anchor_consistency_tasks) if anchor_consistency_tasks else 'all-enabled'}"
+    )
     logger.info(f"Grad accumulation steps: {grad_accum_steps}")
     logger.info(f"AMP: {'ENABLED' if (use_amp and device.type == 'cuda') else 'DISABLED'}")
     logger.info(f"Freeze encoder: {freeze_encoder}")
     logger.info(f"Freeze FPN: {freeze_fpn}")
     logger.info(f"Freeze adapters: {freeze_adapters}")
     logger.info(f"Freeze other heads: {freeze_other_heads}")
+    logger.info(f"Train high-res texture branch only: {train_highres_texture_only}")
+    logger.info(f"Train boundary branch only: {train_boundary_branch_only}")
+    logger.info(f"Train encoder task adapter only: {train_encoder_task_adapter_only}")
+    logger.info(f"Domain adversarial weight: {domain_adversarial_weight:.6f}")
+    logger.info(f"Domain adversarial GRL lambda: {domain_adversarial_lambda:.6f}")
     logger.info(f"Split mode: {split_mode}")
     logger.info(f"Augmentation profile: {augmentation_profile}")
     logger.info(f"Checkpoint score mode: {checkpoint_score_mode}")
@@ -1086,6 +1210,7 @@ def main(
         roi_crop_tasks=roi_crop_tasks,
         roi_context_range=(roi_context_min, roi_context_max),
         roi_center_jitter=roi_center_jitter,
+        roi_anchor_json=roi_anchor_json,
         cardiac_split_screen_mode=cardiac_split_screen_mode,
     )
     train_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
@@ -1100,6 +1225,14 @@ def main(
             "No training samples remain after applying train task filter. "
             f"Requested task IDs: {train_task_ids}"
         )
+    train_split_path = os.path.join(splits_dir, "train_split.csv")
+    val_split_path = os.path.join(splits_dir, "val_split.csv")
+    train_split_df = temp_dataset.dataframe.iloc[train_indices].reset_index(drop=True)
+    val_split_df = temp_dataset.dataframe.iloc[val_indices].reset_index(drop=True)
+    train_split_df.to_csv(train_split_path, index=False)
+    val_split_df.to_csv(val_split_path, index=False)
+    logger.info(f"Train split saved to: {train_split_path}")
+    logger.info(f"Validation split saved to: {val_split_path}")
 
     val_dataset = KeypointDataset(
         data_root=data_root,
@@ -1107,7 +1240,11 @@ def main(
         heatmap_size=heatmap_size,
         sigma=heatmap_sigma,
         input_size=input_size,
-        roi_crop=False,
+        roi_crop=train_roi_crop,
+        roi_crop_tasks=roi_crop_tasks,
+        roi_context_range=(roi_context_min, roi_context_max),
+        roi_center_jitter=0.0,
+        roi_anchor_json=roi_anchor_json,
         cardiac_split_screen_mode=cardiac_split_screen_mode,
     )
     val_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
@@ -1121,6 +1258,24 @@ def main(
     )
 
     train_subset.dataframe = train_dataset.dataframe.iloc[train_indices].reset_index(drop=True)
+    domain_label_to_idx: dict[str, int] = {}
+    if float(domain_adversarial_weight) > 0.0:
+        domain_labels = sorted(
+            {
+                str(label)
+                for label in train_subset.dataframe.get("pseudo_domain", [])
+                if str(label) != "unknown"
+            }
+        )
+        if len(domain_labels) < 2:
+            logger.warning(
+                "Domain adversarial training requested, but fewer than two pseudo-domain labels "
+                "were found in the training split. Disabling the adversarial branch."
+            )
+            domain_adversarial_weight = 0.0
+        else:
+            domain_label_to_idx = {label: idx for idx, label in enumerate(domain_labels)}
+            logger.info(f"Pseudo-domain classes: {domain_label_to_idx}")
 
     train_sampler = KeypointUniformSampler(
         train_subset,
@@ -1153,10 +1308,13 @@ def main(
         use_fpn=use_fpn,
         fpn_mode=fpn_mode,
         fpn_type=fpn_type,
+        encoder_feature_mode=encoder_feature_mode,
         head_type=head_type,
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
         task_adapter_profile=task_adapter_profile,
+        domain_adversarial=float(domain_adversarial_weight) > 0.0,
+        num_domain_classes=len(domain_label_to_idx),
     ).to(device)
     if init_checkpoint is not None:
         state_dict, checkpoint_meta = _load_checkpoint_payload(init_checkpoint, device)
@@ -1176,6 +1334,40 @@ def main(
         if checkpoint_meta:
             logger.info(f"Init checkpoint meta: {checkpoint_meta}")
 
+    teacher_model = None
+    enabled_teacher_task_ids = set(teacher_consistency_tasks) if teacher_consistency_tasks is not None else None
+    enabled_anchor_task_ids = set(anchor_consistency_tasks) if anchor_consistency_tasks is not None else None
+    if teacher_checkpoint is not None and float(teacher_consistency_weight) > 0.0:
+        teacher_checkpoint = os.path.abspath(teacher_checkpoint)
+        teacher_model = MultiTaskModelFactory(
+            encoder_name=encoder_name,
+            encoder_weights=ENCODER_WEIGHTS,
+            task_configs=task_configs,
+            heatmap_size=heatmap_size,
+            use_fpn=use_fpn,
+            fpn_mode=fpn_mode,
+            fpn_type=fpn_type,
+            encoder_feature_mode=encoder_feature_mode,
+            head_type=head_type,
+            task_head_profile=task_head_profile,
+            task_decoder_profile=task_decoder_profile,
+            task_adapter_profile=task_adapter_profile,
+        ).to(device)
+        teacher_state_dict, teacher_meta = _load_checkpoint_payload(teacher_checkpoint, device)
+        load_result, skipped_keys, missing_after_match = _load_matching_state_dict(teacher_model, teacher_state_dict)
+        if skipped_keys or missing_after_match or load_result.missing_keys or load_result.unexpected_keys:
+            raise RuntimeError(
+                "Teacher checkpoint is not architecture-compatible. "
+                f"skipped={len(skipped_keys)}, missing_after_match={len(missing_after_match)}, "
+                f"missing={len(load_result.missing_keys)}, unexpected={len(load_result.unexpected_keys)}"
+            )
+        teacher_model.eval()
+        for param in teacher_model.parameters():
+            param.requires_grad = False
+        logger.info(f"Loaded frozen teacher checkpoint: {teacher_checkpoint}")
+        if teacher_meta:
+            logger.info(f"Teacher checkpoint meta: {teacher_meta}")
+
     _freeze_for_targeted_finetune(
         model=model,
         train_task_ids=train_task_ids,
@@ -1184,6 +1376,12 @@ def main(
         freeze_adapters=freeze_adapters,
         freeze_other_heads=freeze_other_heads,
     )
+    if train_highres_texture_only:
+        _freeze_except_highres_texture_branch(model)
+    if train_boundary_branch_only:
+        _freeze_except_boundary_branch(model)
+    if train_encoder_task_adapter_only:
+        _freeze_except_encoder_task_adapter(model)
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(
@@ -1204,6 +1402,10 @@ def main(
             task_fpn_params = _collect_trainable_params(task_fpn)
             if task_fpn_params:
                 param_groups.append({"params": task_fpn_params, "lr": learning_rate * 2.0})
+    if getattr(model, "encoder_task_adapters", None) is not None:
+        adapter_params = _collect_trainable_params(model.encoder_task_adapters)
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
     if getattr(model, "soft_adapters", None) is not None:
         adapter_params = _collect_trainable_params(model.soft_adapters)
         if adapter_params:
@@ -1228,6 +1430,10 @@ def main(
         adapter_params = _collect_trainable_params(model.task_film_adapters)
         if adapter_params:
             param_groups.append({"params": adapter_params, "lr": learning_rate * 5.0})
+    if getattr(model, "domain_classifier", None) is not None:
+        domain_params = _collect_trainable_params(model.domain_classifier)
+        if domain_params:
+            param_groups.append({"params": domain_params, "lr": learning_rate * 5.0})
     for task_id, head in model.heads.items():
         head_params = _collect_trainable_params(head)
         if head_params:
@@ -1285,9 +1491,14 @@ def main(
                         target_coords = torch.stack([batch["train_label"][i] for i in task_indices], 0).to(device)
                         pred_coords_transformed = softargmax_heatmaps_to_transformed_coords(pred_logits)
                         refined_coords_transformed = aux_outputs.get("refined_coords_transformed")
+                        axis_coords_transformed = aux_outputs.get("axis_coords_transformed")
                         target_coords_transformed = target_coords.clone()
                         coord_loss = F.l1_loss(pred_coords_transformed, target_coords_transformed)
-                        if refined_coords_transformed is not None:
+                        if refined_coords_transformed is not None and axis_coords_transformed is not None:
+                            refined_coord_loss = F.l1_loss(refined_coords_transformed, target_coords_transformed)
+                            axis_coord_loss = F.l1_loss(axis_coords_transformed, target_coords_transformed)
+                            coord_loss = 0.35 * coord_loss + 0.50 * refined_coord_loss + 0.15 * axis_coord_loss
+                        elif refined_coords_transformed is not None:
                             refined_coord_loss = F.l1_loss(refined_coords_transformed, target_coords_transformed)
                             coord_loss = 0.4 * coord_loss + 0.6 * refined_coord_loss
                         heatmap_loss = F.mse_loss(pred_heatmaps, task_heatmaps)
@@ -1335,12 +1546,98 @@ def main(
                                 target_coords_transformed,
                                 heatmap_size=heatmap_size,
                             )
+                        aop_angle_loss = pred_logits.new_tensor(0.0)
+                        if current_task_id == "AOP" and float(aop_angle_loss_weight) > 0.0:
+                            aop_angle_loss = compute_aop_angle_loss(
+                                pred_coords_original,
+                                target_coords_original,
+                                [batch["meta"][i] for i in task_indices],
+                            )
                         structure_map_loss = compute_structure_map_loss(
                             aux_outputs.get("structure_logits"),
                             target_coords_transformed,
                             heatmap_size=heatmap_size,
                             task_id=current_task_id,
                         )
+                        anchor_consistency_loss = pred_logits.new_tensor(0.0)
+                        if (
+                            float(anchor_consistency_weight) > 0.0
+                            and "anchor_train_label" in batch
+                            and "has_anchor_label" in batch
+                            and (
+                                enabled_anchor_task_ids is None
+                                or current_task_id in enabled_anchor_task_ids
+                            )
+                        ):
+                            anchor_coords = batch["anchor_train_label"][task_indices].to(device)
+                            anchor_mask = batch["has_anchor_label"][task_indices].to(device).bool()
+                            if bool(anchor_mask.any()):
+                                student_coords = (
+                                    refined_coords_transformed
+                                    if refined_coords_transformed is not None
+                                    else pred_coords_transformed
+                                )
+                                anchor_consistency_loss = F.smooth_l1_loss(
+                                    student_coords[anchor_mask],
+                                    anchor_coords[anchor_mask],
+                                )
+                        teacher_consistency_loss = pred_logits.new_tensor(0.0)
+                        if (
+                            teacher_model is not None
+                            and float(teacher_consistency_weight) > 0.0
+                            and (
+                                enabled_teacher_task_ids is None
+                                or current_task_id in enabled_teacher_task_ids
+                            )
+                        ):
+                            with torch.no_grad():
+                                teacher_output = teacher_model(
+                                    task_images,
+                                    task_id=current_task_id,
+                                    return_prior=True,
+                                )
+                                teacher_aux_outputs = {}
+                                if len(teacher_output) == 3:
+                                    teacher_logits, _, teacher_aux_outputs = teacher_output
+                                else:
+                                    teacher_logits, _ = teacher_output
+                                teacher_coords = teacher_aux_outputs.get("refined_coords_transformed")
+                                if teacher_coords is None:
+                                    teacher_coords = softargmax_heatmaps_to_transformed_coords(teacher_logits)
+                            student_coords = (
+                                refined_coords_transformed
+                                if refined_coords_transformed is not None
+                                else pred_coords_transformed
+                            )
+                            teacher_consistency_loss = F.smooth_l1_loss(student_coords, teacher_coords.detach())
+                        domain_adversarial_loss = pred_logits.new_tensor(0.0)
+                        if (
+                            float(domain_adversarial_weight) > 0.0
+                            and domain_label_to_idx
+                            and getattr(model, "domain_classifier", None) is not None
+                        ):
+                            domain_targets = [
+                                domain_label_to_idx.get(str(batch["pseudo_domain"][i]), -1)
+                                for i in task_indices
+                            ]
+                            valid_domain_indices = [
+                                local_idx
+                                for local_idx, domain_target in enumerate(domain_targets)
+                                if domain_target >= 0
+                            ]
+                            if valid_domain_indices:
+                                domain_input = task_images[valid_domain_indices]
+                                domain_target = torch.tensor(
+                                    [domain_targets[local_idx] for local_idx in valid_domain_indices],
+                                    device=device,
+                                    dtype=torch.long,
+                                )
+                                domain_logits = model.domain_logits(
+                                    domain_input,
+                                    task_id=current_task_id,
+                                    grl_lambda=domain_adversarial_lambda,
+                                )
+                                domain_adversarial_loss = F.cross_entropy(domain_logits, domain_target)
                         base_loss = (
                             heatmap_loss
                             + 0.2 * coord_loss
@@ -1350,6 +1647,10 @@ def main(
                             + fugc_segment_loss_weight * fugc_segment_loss
                             + ivc_band_loss_weight * ivc_band_loss
                             + structure_loss_weight * structure_map_loss
+                            + aop_angle_loss_weight * aop_angle_loss
+                            + anchor_consistency_weight * anchor_consistency_loss
+                            + teacher_consistency_weight * teacher_consistency_loss
+                            + domain_adversarial_weight * domain_adversarial_loss
                         )
                         task_weight = float(effective_task_loss_weights.get(current_task_id, 1.0))
                         loss = base_loss * task_weight
@@ -1512,6 +1813,18 @@ def main(
                             float(row["Normalized Measurement MAE"]),
                             epoch + 1,
                         )
+                    if "Angle MAE (degrees)" in row and not np.isnan(row["Angle MAE (degrees)"]):
+                        writer.add_scalar(
+                            f"val/angle_mae_degrees/{row['Task ID']}",
+                            float(row["Angle MAE (degrees)"]),
+                            epoch + 1,
+                        )
+                    if "Normalized Angle MAE" in row and not np.isnan(row["Normalized Angle MAE"]):
+                        writer.add_scalar(
+                            f"val/normalized_angle_mae/{row['Task ID']}",
+                            float(row["Normalized Angle MAE"]),
+                            epoch + 1,
+                        )
             writer.add_scalar("val/mre_pixels_mean", selected_val_mre, epoch + 1)
             writer.add_scalar("val/combined_score", selected_val_score, epoch + 1)
             if np.isfinite(selected_val_normalized_mre):
@@ -1560,6 +1873,7 @@ def main(
                     "state_dict": ema.shadow if ema is not None else model.state_dict(),
                         "meta": {
                             "encoder_name": encoder_name,
+                            "encoder_feature_mode": encoder_feature_mode,
                             "use_fpn": use_fpn,
                             "fpn_mode": fpn_mode,
                             "fpn_type": fpn_type,
@@ -1580,6 +1894,22 @@ def main(
                             "fugc_segment_loss_weight": fugc_segment_loss_weight,
                             "ivc_band_loss_weight": ivc_band_loss_weight,
                             "structure_loss_weight": structure_loss_weight,
+                            "aop_angle_loss_weight": aop_angle_loss_weight,
+                            "domain_adversarial": float(domain_adversarial_weight) > 0.0,
+                            "domain_adversarial_weight": domain_adversarial_weight,
+                            "domain_adversarial_lambda": domain_adversarial_lambda,
+                            "num_domain_classes": len(domain_label_to_idx),
+                            "domain_label_to_idx": domain_label_to_idx,
+                            "teacher_checkpoint": teacher_checkpoint,
+                            "teacher_consistency_weight": teacher_consistency_weight,
+                            "teacher_consistency_tasks": (
+                                sorted(enabled_teacher_task_ids) if enabled_teacher_task_ids is not None else []
+                            ),
+                            "roi_anchor_json": roi_anchor_json,
+                            "anchor_consistency_weight": anchor_consistency_weight,
+                            "anchor_consistency_tasks": (
+                                sorted(enabled_anchor_task_ids) if enabled_anchor_task_ids is not None else []
+                            ),
                             "use_ema": use_ema,
                             "ema_decay": ema_decay,
                             "task_loss_weight_overrides": task_loss_weight_overrides or {},
@@ -1729,6 +2059,13 @@ if __name__ == "__main__":
         help=f"Backbone model name (default: {ENCODER}).",
     )
     parser.add_argument(
+        "--encoder-feature-mode",
+        type=str,
+        choices=("final", "multilayer_fusion_v1", "feature_pyramid_fusion_v1"),
+        default=ENCODER_FEATURE_MODE,
+        help=f"Backbone feature extraction mode (default: {ENCODER_FEATURE_MODE}).",
+    )
+    parser.add_argument(
         "--input-size",
         type=int,
         default=INPUT_SIZE,
@@ -1787,14 +2124,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_aop_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_segment_specialist_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "context_local_stylemix_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "highres_texture_v1", "pixel_unet_v1", "hrnet_residual_v1", "encoder_task_context_local_v1", "encoder_task_hard_context_local_v1", "boundary_context_v1", "taskfilm_v1"),
         default=TASK_ADAPTER_PROFILE,
         help=f"Task-specific feature adapter profile (default: {TASK_ADAPTER_PROFILE}).",
     )
@@ -1888,6 +2225,48 @@ if __name__ == "__main__":
         help="Auxiliary anatomy-structure map loss. Use 0.0 to disable.",
     )
     parser.add_argument(
+        "--aop-angle-loss-weight",
+        type=float,
+        default=0.0,
+        help="Auxiliary AOP inter-line angle loss weight. Use 0.0 to disable.",
+    )
+    parser.add_argument(
+        "--teacher-checkpoint",
+        type=str,
+        default=None,
+        help="Optional frozen teacher checkpoint for coordinate consistency regularization.",
+    )
+    parser.add_argument(
+        "--teacher-consistency-weight",
+        type=float,
+        default=0.0,
+        help="Weight for smooth-L1 consistency against the frozen teacher coordinates.",
+    )
+    parser.add_argument(
+        "--teacher-consistency-tasks",
+        type=str,
+        default=None,
+        help="Optional comma-separated task IDs that receive teacher consistency. Default: all tasks.",
+    )
+    parser.add_argument(
+        "--roi-anchor-json",
+        type=str,
+        default=None,
+        help="Optional local prediction JSON used to crop ROI samples around anchor predictions.",
+    )
+    parser.add_argument(
+        "--anchor-consistency-weight",
+        type=float,
+        default=0.0,
+        help="Smooth-L1 weight that keeps ROI predictions close to anchor coordinates.",
+    )
+    parser.add_argument(
+        "--anchor-consistency-tasks",
+        type=str,
+        default=None,
+        help="Optional comma-separated task IDs that receive anchor consistency. Default: all tasks.",
+    )
+    parser.add_argument(
         "--task-loss-weights",
         type=str,
         default=None,
@@ -1948,6 +2327,33 @@ if __name__ == "__main__":
         help="When --train-task-ids is set, freeze heads for all non-target tasks.",
     )
     parser.add_argument(
+        "--train-highres-texture-only",
+        action="store_true",
+        help="Freeze the warm-started base model and train only the high-resolution texture branch.",
+    )
+    parser.add_argument(
+        "--train-boundary-branch-only",
+        action="store_true",
+        help="Freeze the warm-started base model and train only the boundary residual branch.",
+    )
+    parser.add_argument(
+        "--train-encoder-task-adapter-only",
+        action="store_true",
+        help="Freeze the warm-started base model and train only the pre-FPN task encoder adapter.",
+    )
+    parser.add_argument(
+        "--domain-adversarial-weight",
+        type=float,
+        default=0.0,
+        help="Weight for pseudo-domain adversarial classification loss. Use 0.0 to disable.",
+    )
+    parser.add_argument(
+        "--domain-adversarial-lambda",
+        type=float,
+        default=1.0,
+        help="Gradient reversal strength for pseudo-domain adversarial training.",
+    )
+    parser.add_argument(
         "--train-roi-crop",
         action="store_true",
         help="Enable GT-centered ROI crop augmentation for selected training tasks.",
@@ -2001,6 +2407,7 @@ if __name__ == "__main__":
         early_stopping_min_delta=float(args.early_stopping_min_delta),
         output_dir=str(args.output_dir),
         encoder_name=str(args.encoder_name),
+        encoder_feature_mode=str(args.encoder_feature_mode),
         input_size=int(args.input_size),
         heatmap_size=(int(args.heatmap_size), int(args.heatmap_size)),
         heatmap_sigma=float(args.heatmap_sigma),
@@ -2025,6 +2432,13 @@ if __name__ == "__main__":
         fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),
         ivc_band_loss_weight=float(args.ivc_band_loss_weight),
         structure_loss_weight=float(args.structure_loss_weight),
+        aop_angle_loss_weight=float(args.aop_angle_loss_weight),
+        teacher_checkpoint=args.teacher_checkpoint,
+        teacher_consistency_weight=float(args.teacher_consistency_weight),
+        teacher_consistency_tasks=_parse_task_id_set_csv(args.teacher_consistency_tasks),
+        roi_anchor_json=args.roi_anchor_json,
+        anchor_consistency_weight=float(args.anchor_consistency_weight),
+        anchor_consistency_tasks=_parse_task_id_set_csv(args.anchor_consistency_tasks),
         task_loss_weight_overrides=_parse_weight_csv(args.task_loss_weights),
         checkpoint_task_weight_overrides=_parse_weight_csv(args.checkpoint_task_weights),
         sampler_task_weight_overrides=_parse_weight_csv(args.sampler_task_weights),
@@ -2036,6 +2450,11 @@ if __name__ == "__main__":
         freeze_fpn=bool(args.freeze_fpn),
         freeze_adapters=bool(args.freeze_adapters),
         freeze_other_heads=bool(args.freeze_other_heads),
+        train_highres_texture_only=bool(args.train_highres_texture_only),
+        train_boundary_branch_only=bool(args.train_boundary_branch_only),
+        train_encoder_task_adapter_only=bool(args.train_encoder_task_adapter_only),
+        domain_adversarial_weight=float(args.domain_adversarial_weight),
+        domain_adversarial_lambda=float(args.domain_adversarial_lambda),
         train_roi_crop=bool(args.train_roi_crop),
         roi_crop_tasks=_parse_task_id_set_csv(args.roi_crop_tasks),
         roi_context_min=float(args.roi_context_min),

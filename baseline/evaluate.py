@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from utils import canonicalize_task_coords
+from utils import canonicalize_task_coords, compute_angle_measurements_from_points
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
@@ -28,7 +28,13 @@ def normalize_eval_image_path(image_path: str, task_id: str) -> str:
 class Evaluator:
     """Evaluator for keypoint localization tasks only."""
 
-    def __init__(self, data_root: str, pred_root: str, prediction_file: str = "regression_predictions.json"):
+    def __init__(
+        self,
+        data_root: str,
+        pred_root: str,
+        prediction_file: str = "regression_predictions.json",
+        split_csv: str | None = None,
+    ):
         self.data_root = data_root
         self.pred_root = pred_root
         self.prediction_file = prediction_file
@@ -50,6 +56,29 @@ class Evaluator:
                 "No keypoint records found. Expect task_name == 'Regression' or task_id in "
                 f"{sorted(EXTRA_REGRESSION_TASK_IDS)}."
             )
+        if split_csv is not None:
+            if not os.path.exists(split_csv):
+                raise FileNotFoundError(f"Split CSV not found: {split_csv}")
+            split_df = pd.read_csv(split_csv)
+            if "image_path" not in split_df.columns or "task_id" not in split_df.columns:
+                raise ValueError(f"Split CSV must contain image_path and task_id columns: {split_csv}")
+            split_keys = {
+                (
+                    str(row["task_id"]),
+                    normalize_eval_image_path(str(row["image_path"]), str(row["task_id"])),
+                )
+                for _, row in split_df.iterrows()
+            }
+            row_keys = self.dataframe.apply(
+                lambda row: (
+                    str(row["task_id"]),
+                    normalize_eval_image_path(str(row["image_path"]), str(row["task_id"])),
+                ),
+                axis=1,
+            )
+            self.dataframe = self.dataframe[row_keys.isin(split_keys)].reset_index(drop=True)
+            if self.dataframe.empty:
+                raise ValueError(f"No matching rows found after applying split CSV: {split_csv}")
 
         self.task_configs = {}
         for _, row in self.dataframe.iterrows():
@@ -83,6 +112,7 @@ class Evaluator:
             num_points = self.task_configs[task_id]["num_classes"]
 
             mre_scores = []
+            angle_scores = []
             for _, row in tqdm(task_data.iterrows(), total=len(task_data), desc=f"  {task_id}", leave=False):
                 image_path = normalize_eval_image_path(row["image_path"], task_id)
                 gt_coords = []
@@ -98,12 +128,17 @@ class Evaluator:
                     gt_coords = np.asarray(canonicalize_task_coords(gt_coords, task_id), dtype=np.float32).tolist()
                     pred_coords = np.asarray(canonicalize_task_coords(pred_coords, task_id), dtype=np.float32).tolist()
                     mre_scores.append(self._compute_mre(pred_coords, gt_coords))
+                    angle_mae = self._compute_angle_mae(pred_coords, gt_coords, task_id)
+                    if angle_mae is not None:
+                        angle_scores.append(angle_mae)
 
             if mre_scores:
                 task_results[task_id] = {
                     "MRE": round(float(np.mean(mre_scores)), OUTPUT_DECIMALS),
                     "num_samples": len(mre_scores),
                 }
+                if angle_scores:
+                    task_results[task_id]["Angle_MAE_degrees"] = round(float(np.mean(angle_scores)), OUTPUT_DECIMALS)
             else:
                 task_results[task_id] = {"MRE": 0.0, "num_samples": 0}
 
@@ -116,6 +151,16 @@ class Evaluator:
         distances = np.sqrt(np.sum((pred_coords - gt_coords) ** 2, axis=1))
         return float(np.mean(distances))
 
+    @staticmethod
+    def _compute_angle_mae(pred_coords: List[float], gt_coords: List[float], task_id: str) -> float | None:
+        pred_points = np.array(pred_coords, dtype=np.float32).reshape(1, -1, 2)
+        gt_points = np.array(gt_coords, dtype=np.float32).reshape(1, -1, 2)
+        pred_angles = compute_angle_measurements_from_points(pred_points, task_id)
+        gt_angles = compute_angle_measurements_from_points(gt_points, task_id)
+        if pred_angles.shape[1] == 0 or gt_angles.shape[1] == 0:
+            return None
+        return float(np.mean(np.abs(pred_angles - gt_angles)))
+
     def print_summary(self, results: Dict, save_path: str = None):
         reg_results = results.get("regression", {})
         all_mre = [r["MRE"] for r in reg_results.values() if r["num_samples"] > 0]
@@ -126,9 +171,10 @@ class Evaluator:
             lines.append(f"Number of tasks: {len(all_mre)}")
             for task_id, task_result in reg_results.items():
                 if task_result["num_samples"] > 0:
-                    lines.append(
-                        f"  {task_id}: MRE={task_result['MRE']:.6f}, samples={task_result['num_samples']}"
-                    )
+                    line = f"  {task_id}: MRE={task_result['MRE']:.6f}, samples={task_result['num_samples']}"
+                    if "Angle_MAE_degrees" in task_result:
+                        line += f", Angle_MAE_degrees={task_result['Angle_MAE_degrees']:.6f}"
+                    lines.append(line)
         else:
             lines.append("No valid keypoint predictions found.")
 
@@ -168,9 +214,20 @@ if __name__ == "__main__":
         default="evaluation_summary.txt",
         help="Path for text evaluation summary",
     )
+    parser.add_argument(
+        "--split-csv",
+        type=str,
+        default=None,
+        help="Optional CSV restricting evaluation rows, e.g. output/runs/<run>/splits/val_split.csv",
+    )
     args = parser.parse_args()
 
-    evaluator = Evaluator(args.data_root, args.pred_root, prediction_file=args.prediction_file)
+    evaluator = Evaluator(
+        args.data_root,
+        args.pred_root,
+        prediction_file=args.prediction_file,
+        split_csv=args.split_csv,
+    )
     results = evaluator.evaluate_all()
     evaluator.print_summary(results, save_path=args.summary_file)
     evaluator.save_results(results, args.output_file)

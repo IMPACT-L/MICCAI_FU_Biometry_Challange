@@ -52,6 +52,8 @@ TASK_LOSS_FAMILY_PRESETS = {
 }
 
 DEFAULT_NORMALIZER_EPS = 1.0
+AOP_ANGLE_TASK_ID = "AOP"
+AOP_ANGLE_POINT_INDICES = (0, 1, 2, 3)
 
 
 def _canonical_pair_swap_mask(p0, p1, rule: str):
@@ -295,12 +297,36 @@ def compute_measurements_from_points(points_px: np.ndarray, task_id: str) -> np.
     return np.stack(measures, axis=1) if measures else np.zeros((points_px.shape[0], 0), dtype=np.float32)
 
 
+def compute_aop_angle_degrees_from_points(points_px: np.ndarray) -> np.ndarray:
+    """Compute AOP as the angle in degrees between the two annotated line segments."""
+    points_px = np.asarray(points_px, dtype=np.float32)
+    if points_px.ndim != 3 or points_px.shape[1] < 4:
+        return np.zeros((points_px.shape[0], 0), dtype=np.float32)
+
+    p0_idx, p1_idx, p2_idx, p3_idx = AOP_ANGLE_POINT_INDICES
+    first_vec = points_px[:, p1_idx, :] - points_px[:, p0_idx, :]
+    second_vec = points_px[:, p3_idx, :] - points_px[:, p2_idx, :]
+    first_norm = np.linalg.norm(first_vec, axis=-1)
+    second_norm = np.linalg.norm(second_vec, axis=-1)
+    denom = np.maximum(first_norm * second_norm, 1e-6)
+    cos_angle = np.sum(first_vec * second_vec, axis=-1) / denom
+    angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))).astype(np.float32)
+    return angle[:, None]
+
+
+def compute_angle_measurements_from_points(points_px: np.ndarray, task_id: str) -> np.ndarray:
+    if task_id == AOP_ANGLE_TASK_ID:
+        return compute_aop_angle_degrees_from_points(points_px)
+    return np.zeros((points_px.shape[0], 0), dtype=np.float32)
+
+
 def compute_normalization_stats_from_dataframe(dataframe: pd.DataFrame) -> dict:
     stats = {}
     for task_id, task_df in dataframe.groupby("task_id", sort=True):
         num_points = int(task_df["num_classes"].iloc[0])
         pairs = MEASUREMENT_PAIRS.get(task_id, [])
         measurement_values = []
+        angle_values = []
         mre_reference_values = []
 
         for _, row in task_df.iterrows():
@@ -316,6 +342,9 @@ def compute_normalization_stats_from_dataframe(dataframe: pd.DataFrame) -> dict:
                 measures = compute_measurements_from_points(points[None, ...], task_id)[0]
                 measurement_values.append(measures)
                 mre_reference_values.extend(measures.tolist())
+            angles = compute_angle_measurements_from_points(points[None, ...], task_id)
+            if angles.shape[1] > 0:
+                angle_values.extend(angles.reshape(-1).tolist())
 
         task_stats = {
             "mre_iqr": DEFAULT_NORMALIZER_EPS,
@@ -331,6 +360,10 @@ def compute_normalization_stats_from_dataframe(dataframe: pd.DataFrame) -> dict:
             for measure_idx in range(measurement_array.shape[1]):
                 q1, q3 = np.percentile(measurement_array[:, measure_idx], [25, 75])
                 task_stats["measurement_iqr"].append(float(max(q3 - q1, DEFAULT_NORMALIZER_EPS)))
+
+        if angle_values:
+            q1, q3 = np.percentile(np.array(angle_values, dtype=np.float32), [25, 75])
+            task_stats["angle_iqr"] = float(max(q3 - q1, DEFAULT_NORMALIZER_EPS))
 
         stats[task_id] = task_stats
 
@@ -367,6 +400,21 @@ def calculate_measurement_mae_case_values(
     return np.mean(np.abs(pred_measures - gt_measures), axis=1).astype(np.float32)
 
 
+def calculate_angle_mae_case_values(
+    y_true: torch.Tensor,
+    y_pred: torch.Tensor,
+    meta: list[dict],
+    task_id: str,
+) -> np.ndarray:
+    gt_points = _coords_to_pixel_points(y_true, meta)
+    pred_points = _coords_to_pixel_points(y_pred, meta)
+    gt_angles = compute_angle_measurements_from_points(gt_points, task_id)
+    pred_angles = compute_angle_measurements_from_points(pred_points, task_id)
+    if gt_angles.shape[1] == 0:
+        return np.zeros((gt_points.shape[0],), dtype=np.float32)
+    return np.mean(np.abs(pred_angles - gt_angles), axis=1).astype(np.float32)
+
+
 def compute_measurement_loss(
     pred_coords: torch.Tensor,
     target_coords: torch.Tensor,
@@ -393,6 +441,32 @@ def compute_measurement_loss(
     if not losses:
         return pred_coords.new_tensor(0.0)
     return torch.stack(losses).mean()
+
+
+def compute_aop_angle_loss(
+    pred_coords: torch.Tensor,
+    target_coords: torch.Tensor,
+    meta: list[dict],
+) -> torch.Tensor:
+    """Normalized AOP angle loss in radians/pi for stable weighting."""
+    pred_pts = _coords_to_pixel_points_torch(pred_coords, meta)
+    target_pts = _coords_to_pixel_points_torch(target_coords, meta)
+    if pred_pts.shape[1] < 4 or target_pts.shape[1] < 4:
+        return pred_coords.new_tensor(0.0)
+
+    p0_idx, p1_idx, p2_idx, p3_idx = AOP_ANGLE_POINT_INDICES
+
+    def _angle(points: torch.Tensor) -> torch.Tensor:
+        first_vec = points[:, p1_idx, :] - points[:, p0_idx, :]
+        second_vec = points[:, p3_idx, :] - points[:, p2_idx, :]
+        first_unit = first_vec / first_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        second_unit = second_vec / second_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        cos_angle = (first_unit * second_unit).sum(dim=-1).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        return torch.acos(cos_angle)
+
+    pred_angle = _angle(pred_pts)
+    target_angle = _angle(target_pts)
+    return (pred_angle - target_angle).abs().div(np.pi).mean()
 
 
 def _coords_to_pixel_points_torch(coords: torch.Tensor, meta: list[dict]) -> torch.Tensor:
@@ -629,6 +703,34 @@ def _weighted_mean(values: list[float], weights: list[float]) -> float:
     return float(np.sum(values_np * weights_np) / np.sum(weights_np))
 
 
+def _collect_normalized_parameter_errors(row: pd.Series, task_stats: dict) -> list[float]:
+    """Return normalized clinical parameter errors for one task row.
+
+    Distance-like parameters are stored as Measurement MAE. Degree-valued
+    parameters, currently AOP angle, are stored separately so they do not get
+    mixed with pixel/mm-like distances before normalization.
+    """
+
+    values: list[float] = []
+
+    measurement_value = row.get("Measurement MAE (pixels)")
+    if measurement_value is not None and np.isfinite(measurement_value):
+        measurement_norms = task_stats.get("measurement_iqr", [])
+        if measurement_norms:
+            values.append(
+                float(measurement_value)
+                / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS)
+            )
+
+    angle_value = row.get("Angle MAE (degrees)")
+    if angle_value is not None and np.isfinite(angle_value):
+        angle_norm = task_stats.get("angle_iqr")
+        if angle_norm:
+            values.append(float(angle_value) / max(float(angle_norm), DEFAULT_NORMALIZER_EPS))
+
+    return values
+
+
 def compute_combined_score(
     results_df: pd.DataFrame,
     normalization_stats: dict | None = None,
@@ -650,14 +752,10 @@ def compute_combined_score(
         normalized_mre_values.append(float(row["MRE (pixels)"]) / max(mre_norm, DEFAULT_NORMALIZER_EPS))
         normalized_mre_weights.append(task_weight)
 
-        measurement_value = row.get("Measurement MAE (pixels)")
-        if measurement_value is not None and np.isfinite(measurement_value):
-            measurement_norms = task_stats.get("measurement_iqr", [])
-            if measurement_norms:
-                normalized_measurement_values.append(
-                    float(measurement_value) / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS)
-                )
-                normalized_measurement_weights.append(task_weight)
+        parameter_errors = _collect_normalized_parameter_errors(row, task_stats)
+        if parameter_errors:
+            normalized_measurement_values.append(float(np.mean(parameter_errors)))
+            normalized_measurement_weights.append(task_weight)
 
     normalized_mre = _weighted_mean(normalized_mre_values, normalized_mre_weights)
     if not normalized_measurement_values:
@@ -679,15 +777,10 @@ def _collect_task_combined_scores(
         mre_norm = float(task_stats.get("mre_iqr", DEFAULT_NORMALIZER_EPS))
         normalized_mre = float(row["MRE (pixels)"]) / max(mre_norm, DEFAULT_NORMALIZER_EPS)
 
-        measurement_value = row.get("Measurement MAE (pixels)")
+        parameter_errors = _collect_normalized_parameter_errors(row, task_stats)
         normalized_measurement = None
-        if measurement_value is not None and np.isfinite(measurement_value):
-            measurement_norms = task_stats.get("measurement_iqr", [])
-            if measurement_norms:
-                normalized_measurement = float(measurement_value) / max(
-                    float(np.mean(measurement_norms)),
-                    DEFAULT_NORMALIZER_EPS,
-                )
+        if parameter_errors:
+            normalized_measurement = float(np.mean(parameter_errors))
 
         combined = (
             0.5 * normalized_mre + 0.5 * float(normalized_measurement)
@@ -922,6 +1015,15 @@ def evaluate_keypoint(
                         task_id,
                     )
                     task_metrics[task_id]["Measurement MAE (pixels)"].append(measurement_per_sample)
+                angle_per_sample = calculate_angle_mae_case_values(
+                    task_labels,
+                    pred_coords,
+                    task_meta,
+                    task_id,
+                )
+                has_angle_metric = task_id == AOP_ANGLE_TASK_ID and angle_per_sample.size > 0
+                if has_angle_metric:
+                    task_metrics[task_id]["Angle MAE (degrees)"].append(angle_per_sample)
 
                 if return_case_df:
                     for local_idx, batch_idx in enumerate(task_indices):
@@ -934,6 +1036,8 @@ def evaluate_keypoint(
                         }
                         if measurement_per_sample is not None:
                             case_row["Measurement MAE (pixels)"] = float(measurement_per_sample[local_idx])
+                        if has_angle_metric:
+                            case_row["Angle MAE (degrees)"] = float(angle_per_sample[local_idx])
                         case_rows.append(case_row)
 
     results = []
@@ -951,6 +1055,10 @@ def evaluate_keypoint(
             measurement_norms = task_stats.get("measurement_iqr", [])
             if measurement_norms:
                 row["Normalized Measurement MAE"] = row["Measurement MAE (pixels)"] / max(float(np.mean(measurement_norms)), DEFAULT_NORMALIZER_EPS)
+        if "Angle MAE (degrees)" in row:
+            angle_iqr = task_stats.get("angle_iqr")
+            if angle_iqr:
+                row["Normalized Angle MAE"] = row["Angle MAE (degrees)"] / max(float(angle_iqr), DEFAULT_NORMALIZER_EPS)
         results.append(row)
 
     results_df = pd.DataFrame(results)

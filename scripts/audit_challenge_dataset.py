@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -29,6 +30,34 @@ EXPECTED_VALIDATION_COUNTS = {
     "PLAX": 26,
     "PSAX": 18,
     "fetal_femur": 62,
+}
+
+FETAL_FEMUR_ORIENTATION_ANOMALY_BASENAMES = {
+    "Patient00757_Plane5_1_of_1.png",
+    "Patient00863_Plane5_1_of_2.png",
+    "Patient00863_Plane5_2_of_2.png",
+    "Patient01025_Plane5_1_of_1.png",
+    "Patient01035_Plane5_2_of_4.png",
+    "Patient01035_Plane5_4_of_4.png",
+    "Patient01130_Plane5_2_of_4.png",
+    "Patient01221_Plane5_2_of_2.png",
+    "Patient01246_Plane5_1_of_2.png",
+    "Patient01248_Plane5_1_of_1.png",
+    "Patient01249_Plane5_1_of_1.png",
+    "Patient01301_Plane5_1_of_2.png",
+    "Patient01301_Plane5_2_of_2.png",
+    "Patient01304_Plane5_2_of_2.png",
+    "Patient01475_Plane5_1_of_1.png",
+    "Patient01476_Plane5_1_of_1.png",
+    "Patient01477_Plane5_1_of_2.png",
+    "Patient01478_Plane5_1_of_1.png",
+    "Patient01480_Plane5_1_of_1.png",
+    "Patient01481_Plane5_1_of_1.png",
+    "Patient01605_Plane5_2_of_2.png",
+    "Patient01606_Plane5_2_of_2.png",
+    "Patient01607_Plane5_1_of_2.png",
+    "Patient01608_Plane5_1_of_1.png",
+    "Patient01609_Plane5_1_of_1.png",
 }
 
 
@@ -120,11 +149,34 @@ def audit_fa_note(data_root: Path) -> None:
         print("  - prepared FA file looks internally consistent with the point-order fix path")
 
 
+def audit_fetal_femur_orientation_note(data_root: Path) -> None:
+    femur_path = data_root / "csv" / "Reg-Two_3.fetal_femur.csv"
+    df = pd.read_csv(femur_path)
+    basenames = df["image_path"].astype(str).map(os.path.basename)
+    anomaly_mask = basenames.isin(FETAL_FEMUR_ORIENTATION_ANOMALY_BASENAMES)
+    anomaly_count = int(anomaly_mask.sum())
+    expected_count = len(FETAL_FEMUR_ORIENTATION_ANOMALY_BASENAMES)
+
+    print("\nfetal_femur orientation-note audit")
+    print(f"  - organizer-listed flipped rows found in raw CSV={anomaly_count}")
+    print(f"  - effective training rows after loader exclusion={len(df) - anomaly_count}")
+    if anomaly_count not in (0, expected_count):
+        fail(
+            "fetal_femur orientation anomaly count mismatch: "
+            f"got {anomaly_count}, expected 0 if already removed or {expected_count} if raw CSV is intact"
+        )
+    if anomaly_count == expected_count:
+        print("  - training loader excludes these rows; raw CSV is intentionally unchanged")
+    else:
+        print("  - organizer-listed rows are already absent from the prepared CSV")
+
+
 def main() -> None:
     data_root = Path("data")
     audit_train_csvs(data_root)
     audit_validation_manifest(data_root)
     audit_fa_note(data_root)
+    audit_fetal_femur_orientation_note(data_root)
     print("\nDATASET AUDIT PASSED")
 
 

@@ -104,6 +104,13 @@ def load_checkpoint_payload(checkpoint_path: str, device: torch.device):
     return checkpoint, {}
 
 
+def infer_num_domain_classes(checkpoint: dict) -> int:
+    for key, value in checkpoint.items():
+        if key == "domain_classifier.classifier.5.weight" and getattr(value, "ndim", 0) == 2:
+            return int(value.shape[0])
+    return 0
+
+
 class InferenceDataset(Dataset):
     """Inference dataset for keypoint tasks only."""
 
@@ -132,6 +139,7 @@ class InferenceDataset(Dataset):
         is_regression = dataframe["task_name"].astype(str).eq("Regression")
         is_extra_task = dataframe["task_id"].astype(str).isin(EXTRA_REGRESSION_TASK_IDS)
         self.dataframe = dataframe[is_regression | is_extra_task].reset_index(drop=True)
+        self.full_dataframe = self.dataframe.copy()
         if self.dataframe.empty:
             raise ValueError(
                 "No keypoint records found. Expect task_name == 'Regression' or task_id in "
@@ -226,6 +234,7 @@ class Model:
         self,
         checkpoint_path: str = "best_model.pth",
         encoder_name: str = "vit_base_patch14_dinov2.lvd142m",
+        encoder_feature_mode: Optional[str] = None,
         model_profile: Optional[str] = None,
         use_fpn: Optional[bool] = None,
         fpn_mode: Optional[str] = None,
@@ -242,6 +251,7 @@ class Model:
         self.checkpoint_path = checkpoint_path
         self.model_profile = model_profile
         self.encoder_name = encoder_name
+        self.encoder_feature_mode = encoder_feature_mode
         self.use_fpn = use_fpn
         self.fpn_mode = fpn_mode
         self.fpn_type = fpn_type
@@ -324,8 +334,11 @@ class Model:
         checkpoint, checkpoint_meta = load_checkpoint_payload(model_path, self.device)
         checkpoint_has_shared_fpn = any(key.startswith("fpn.") for key in checkpoint.keys())
         checkpoint_has_task_fpns = any(key.startswith("task_fpns.") for key in checkpoint.keys())
+        checkpoint_has_domain_classifier = any(key.startswith("domain_classifier.") for key in checkpoint.keys())
         checkpoint_has_fpn = checkpoint_has_shared_fpn or checkpoint_has_task_fpns
         use_fpn = checkpoint_meta.get("use_fpn", checkpoint_has_fpn) if self.use_fpn is None else self.use_fpn
+        domain_adversarial = bool(checkpoint_meta.get("domain_adversarial", checkpoint_has_domain_classifier))
+        num_domain_classes = int(checkpoint_meta.get("num_domain_classes", infer_num_domain_classes(checkpoint)))
         inferred_fpn_mode = checkpoint_meta.get(
             "fpn_mode",
             "task_specific" if checkpoint_has_task_fpns else "shared",
@@ -334,6 +347,11 @@ class Model:
         self.fpn_mode = inferred_fpn_mode if self.fpn_mode is None else self.fpn_mode
         self.fpn_type = inferred_fpn_type if self.fpn_type is None else self.fpn_type
         self.encoder_name = checkpoint_meta.get("encoder_name", self.encoder_name)
+        self.encoder_feature_mode = (
+            self.encoder_feature_mode
+            if self.encoder_feature_mode is not None
+            else checkpoint_meta.get("encoder_feature_mode", "final")
+        )
         self.head_type = checkpoint_meta.get("head_type", self.head_type)
         self.task_head_profile = (
             self.task_head_profile
@@ -356,6 +374,7 @@ class Model:
                 "inference",
                 {
                     "encoder_name": self.encoder_name,
+                    "encoder_feature_mode": self.encoder_feature_mode,
                     "use_fpn": use_fpn,
                     "fpn_mode": self.fpn_mode,
                     "fpn_type": self.fpn_type,
@@ -365,6 +384,7 @@ class Model:
                 },
             )
             self.encoder_name = str(profile_config["encoder_name"])
+            self.encoder_feature_mode = str(profile_config.get("encoder_feature_mode", self.encoder_feature_mode))
             use_fpn = bool(profile_config["use_fpn"])
             self.fpn_mode = str(profile_config["fpn_mode"])
             self.fpn_type = str(profile_config["fpn_type"])
@@ -376,6 +396,7 @@ class Model:
         print(
             "Checkpoint architecture: "
             f"encoder={self.encoder_name}, "
+            f"encoder_feature_mode={self.encoder_feature_mode}, "
             f"head={self.head_type}, "
             f"task_head_profile={self.task_head_profile}, "
             f"task_decoder_profile={self.task_decoder_profile}, "
@@ -383,6 +404,7 @@ class Model:
             f"fpn_mode={self.fpn_mode}, "
             f"fpn_type={self.fpn_type}, "
             f"heatmap_size={self.heatmap_size}, "
+            f"domain_adversarial={domain_adversarial}, "
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
         )
@@ -396,6 +418,7 @@ class Model:
         self.model = MultiTaskModelFactory(
             encoder_name=self.encoder_name,
             encoder_weights="pretrained",
+            encoder_feature_mode=self.encoder_feature_mode,
             task_configs=self.task_configs,
             heatmap_size=self.heatmap_size,
             use_fpn=use_fpn,
@@ -405,6 +428,8 @@ class Model:
             task_head_profile=self.task_head_profile,
             task_decoder_profile=self.task_decoder_profile,
             task_adapter_profile=self.task_adapter_profile,
+            domain_adversarial=domain_adversarial,
+            num_domain_classes=num_domain_classes,
         ).to(self.device)
 
         self.model.load_state_dict(checkpoint)
@@ -437,7 +462,10 @@ class Model:
             input_size=self.input_size,
         )
 
-        self.task_configs = self._build_task_configs(dataset.dataframe)
+        # A split CSV may contain only one task, but checkpoints usually contain all
+        # task-specific heads/FPNs. Build from the full dataset so strict loading
+        # remains compatible, while inference still iterates only the split rows.
+        self.task_configs = self._build_task_configs(dataset.full_dataframe)
         self.task_id_to_name = {cfg["task_id"]: cfg["task_name"] for cfg in self.task_configs}
         self._load_model()
 
@@ -548,6 +576,13 @@ if __name__ == "__main__":
         help="Backbone name used for model construction.",
     )
     parser.add_argument(
+        "--encoder-feature-mode",
+        type=str,
+        choices=("final", "multilayer_fusion_v1", "feature_pyramid_fusion_v1"),
+        default=None,
+        help="Optional backbone feature extraction mode override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
         "--task-head-profile",
         type=str,
         choices=("uniform", "challenge_legacy_v1", "challenge_v1"),
@@ -557,14 +592,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_aop_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_segment_specialist_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
         default=None,
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "taskfilm_v1"),
+        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "context_local_stylemix_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "highres_texture_v1", "pixel_unet_v1", "hrnet_residual_v1", "encoder_task_context_local_v1", "encoder_task_hard_context_local_v1", "boundary_context_v1", "taskfilm_v1"),
         default=None,
         help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
@@ -613,6 +648,7 @@ if __name__ == "__main__":
     model = Model(
         checkpoint_path=args.checkpoint_path,
         encoder_name=args.encoder_name,
+        encoder_feature_mode=args.encoder_feature_mode,
         model_profile=args.model_profile,
         use_fpn=args.use_fpn,
         fpn_mode=args.fpn_mode,

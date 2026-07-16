@@ -340,3 +340,34 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
   - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_fugc_hc_seed42` scored `24.23`.
   - `dinov3_vitb_hidden_context_target_equiv_blend_safe_v2_mid_seed42` scored `24.22`.
   - conclusion: target-equivariance produced competitive but not best signals. Keep the `24.21` AOP-locked femur-clean blend as the primary anchor.
+
+## 2026-07-15 multi-layer DINO feature fusion probe
+
+- run: `dinov3_vitb_hidden_context_multilayer_offset128_v1_seed42`
+- hidden score reported by user: `29.82`
+- architecture change: learned fusion of intermediate and final DINOv3 transformer layers before the task-specific FPN.
+- conclusion: this was a real architecture change, but the hidden result regressed badly versus the `24.21` anchor. Do not continue this exact multi-layer fusion branch; if revisited, it needs stronger regularization or a separate warm-start strategy instead of replacing the final-layer feature source.
+
+## 2026-07-15 gated ROI refiner result
+
+- run: `dinov3_vitb_hidden_context_roi_hcivcplax_v1_seed42`
+- hidden score reported by user: `24.19`
+- submission id: `851212`
+- account: `saharch`
+- rank at submission: `7`
+- leaderboard row:
+  - `24.19 29.46 22.91 17.6 14.42 8.11 19.75 93.23 21.1 18.58 8.74 7.41 49.2 73.62 28.25 15.35 16.62 8.95 36.76 22.29`
+- anchor: `dinov3_vitb_hidden_context_offset128_femurclean_v10_probe_aop850_locked_seed42`
+- pre-submit audit: PASS, mean task shift `0.1240px` versus the anchor.
+- ROI acceptance summary: accepted `3/10` IVC rows; rejected all HC and PLAX rows under the safety gate.
+- conclusion: the gated ROI refiner produced the new best score, but the useful signal was narrow. The next ROI work should focus on making HC/PLAX refinements pass the gate only when they are genuinely better, rather than relaxing gates globally.
+- Follow-up AOP/FA ROI adaptation (`dinov3_vitb_hidden_context_roi_anchor_aopfa_v2_relaxed_seed42`) scored `24.20`, slightly worse than the `24.19` best. It accepted only `2/60` AOP and `37/188` FA rows, so AOP/FA ROI refinement is not a useful next direction.
+- Current-anchor pseudo-student full output was too broad, but a small taskwise blend was useful:
+  - `current_anchor_student_blends_v1/hcivcplax_mid`: `24.21`, not useful.
+  - `current_anchor_student_blends_v1/all_hard_light`: `24.18`, new best.
+  - winning weights: `A4C=0.10`, `AOP=0.08`, `HC=0.20`, `IVC=0.18`, `PLAX=0.16`, `PSAX=0.10`; keep `FA/FUGC/fetal_femur` anchored.
+  - conclusion: the next sweep should stay near this very small broad blend. Larger model movements are risky; the useful signal is a low-amplitude hidden-domain correction.
+- v2 follow-up:
+  - `aop_lower` scored `24.19`; reducing AOP from `0.08` to `0.05` loses the gain.
+  - `hcivc_higher` scored `24.19`; increasing HC/IVC beyond the v1 winner loses the gain.
+  - conclusion: keep `AOP=0.08`, `HC=0.20`, `IVC=0.18` fixed for the next sweep; only test A4C, PSAX, and PLAX around the winner.
