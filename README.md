@@ -237,7 +237,7 @@ Current read of the results:
 - The current best direction is the `hidden_context` family: `vit_base_patch16_dinov3` with task-specific FPN, grouped split, baseline augmentation, `context_local_v1` adapters, and the hidden `A4C/HC/IVC/FUGC` refinement decoder.
 - The strongest result so far came from target-domain adaptation on the official validation distribution, not from broader decoder changes or stronger augmentation.
 - The first clearly positive architecture change after the `25.31` plateau is `offset128_v1`: it keeps the hidden-context family but uses `128x128` heatmaps and learned subpixel offset refinement for dense point tasks.
-- The best current public score comes from the `offset128_v1` anchor plus conservative image-edge snapping, focused audit-safe taskwise blending, and a gated ROI refiner that accepted only safe IVC changes.
+- The best current public score comes from the `offset128_v1` anchor plus conservative image-edge snapping, focused audit-safe taskwise blending, gated ROI refinement, and content-aware anatomical retrieval with ultrasound content-box geometry features.
 - The `offset128_v3_hardtask_ft` branch strongly improved local validation but did not beat the hidden server score, so it should be treated as an over-adapted near-miss rather than a new anchor.
 - The next high-leverage test is not another weight soup. It is cardiac split-screen normalization: detected split-screen cardiac training rows are kept but cropped to the landmark-containing panel, matching the organizer statement that the test set has no split-screen images.
 - A small targeted measurement term can help slightly, but only when it is softened carefully. The stronger/default measurement variant regressed.
@@ -247,6 +247,7 @@ Comparable saved runs:
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
 | `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` | `NA` | `24.03` |
+| `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030` | `NA` | `24.06` |
 | `current_anchor_student_blends_v1/all_hard_light` | `NA` | `24.18` |
 | `current_anchor_student_blends_v2/aop_lower` | `NA` | `24.19` |
 | `current_anchor_student_blends_v2/hcivc_higher` | `NA` | `24.19` |
@@ -838,5 +839,6 @@ Lower overall score is better. The table below lists the saved CodaBench leaderb
 | 2026-07-16 10:52 | 7 | 852036 | hmzrse | 24.16 | `dinov3_vitb_hidden_context_ivc_anatomy_v2_strong_seed42` |
 | 2026-07-16 | - | - | - | 24.21 | `dinov3_vitb_hidden_context_fugc_axis_anatomy_v2_medium_seed42` |
 | 2026-07-16 | - | - | - | 24.03 | `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` |
+| 2026-07-16 | - | - | - | 24.06 | `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030` |
 
 </details>

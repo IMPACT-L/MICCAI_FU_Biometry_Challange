@@ -371,3 +371,13 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
   - `aop_lower` scored `24.19`; reducing AOP from `0.08` to `0.05` loses the gain.
   - `hcivc_higher` scored `24.19`; increasing HC/IVC beyond the v1 winner loses the gain.
   - conclusion: keep `AOP=0.08`, `HC=0.20`, `IVC=0.18` fixed for the next sweep; only test A4C, PSAX, and PLAX around the winner.
+
+## 2026-07-16 content-aware anatomical retrieval result
+
+- current best:
+  - `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030`
+  - hidden score reported by user: `24.03`
+- follow-up top-k check:
+  - `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030`
+  - hidden score reported by user: `24.06`
+- conclusion: adding ultrasound content-box geometry to same-task retrieval is useful, but the top-3 variant did not beat the `24.03` v4 operating point. Keep v4 as the current anchor unless a later retrieval source improves below `24.03`.
