@@ -380,4 +380,7 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
 - follow-up top-k check:
   - `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030`
   - hidden score reported by user: `24.06`
+- DINO semantic retrieval check:
+  - `dinov3_vitb_hidden_context_content_roi_retrieval_v7_dino_w1_top1_from_v4_anchor/a0p030`
+  - hidden score reported by user: `24.06`
 - conclusion: adding ultrasound content-box geometry to same-task retrieval is useful, but the top-3 variant did not beat the `24.03` v4 operating point. Keep v4 as the current anchor unless a later retrieval source improves below `24.03`.

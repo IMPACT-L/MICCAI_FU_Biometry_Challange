@@ -20,6 +20,7 @@ import json
 import os
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -211,6 +212,93 @@ def image_feature(
     return feat
 
 
+class TimmEmbeddingExtractor:
+    """Extract normalized pretrained image embeddings from content crops."""
+
+    def __init__(
+        self,
+        model_name: str,
+        input_size: int,
+        batch_size: int,
+        device: str,
+    ) -> None:
+        import timm
+        import torch
+
+        self.torch = torch
+        self.device = torch.device(device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.model = timm.create_model(model_name, pretrained=True, num_classes=0).to(self.device)
+        self.model.eval()
+        self.input_size = int(input_size)
+        self.batch_size = int(batch_size)
+        default_cfg = getattr(self.model, "default_cfg", {}) or {}
+        self.mean = np.asarray(default_cfg.get("mean", (0.485, 0.456, 0.406)), dtype=np.float32)
+        self.std = np.asarray(default_cfg.get("std", (0.229, 0.224, 0.225)), dtype=np.float32)
+        print(f"Embedding retrieval model: {model_name} on {self.device}, input={self.input_size}")
+
+    def _preprocess(self, image_bgr: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+        x0, y0, x1, y1 = box
+        crop = image_bgr[y0:y1, x0:x1]
+        if crop.size == 0:
+            crop = image_bgr
+        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        rgb = cv2.resize(rgb, (self.input_size, self.input_size), interpolation=cv2.INTER_AREA)
+        arr = rgb.astype(np.float32) / 255.0
+        arr = (arr - self.mean[None, None, :]) / self.std[None, None, :]
+        return np.transpose(arr, (2, 0, 1)).astype(np.float32)
+
+    def extract_paths(self, image_paths: list[str], boxes: list[tuple[int, int, int, int]]) -> np.ndarray:
+        if len(image_paths) != len(boxes):
+            raise ValueError("image_paths and boxes must have the same length")
+        outputs: list[np.ndarray] = []
+        tensors: list[np.ndarray] = []
+        for image_path, box in zip(image_paths, boxes):
+            image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+            if image is None:
+                raise FileNotFoundError(f"Could not read image for embedding: {image_path}")
+            tensors.append(self._preprocess(image, box))
+            if len(tensors) >= self.batch_size:
+                outputs.append(self._run_batch(tensors))
+                tensors = []
+        if tensors:
+            outputs.append(self._run_batch(tensors))
+        if not outputs:
+            return np.zeros((0, 1), dtype=np.float32)
+        return np.concatenate(outputs, axis=0).astype(np.float32)
+
+    def _run_batch(self, tensors: list[np.ndarray]) -> np.ndarray:
+        torch = self.torch
+        batch = torch.from_numpy(np.stack(tensors, axis=0)).to(self.device)
+        with torch.inference_mode():
+            features = self.model(batch)
+        if isinstance(features, dict):
+            if "x_norm_clstoken" in features:
+                features = features["x_norm_clstoken"]
+            elif "pooled" in features:
+                features = features["pooled"]
+            else:
+                first_value = next(iter(features.values()))
+                features = first_value
+        if isinstance(features, (list, tuple)):
+            features = features[0]
+        if features.ndim == 4:
+            features = features.mean(dim=(2, 3))
+        elif features.ndim == 3:
+            features = features.mean(dim=1)
+        features = features.float()
+        features = features / features.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        return features.cpu().numpy().astype(np.float32)
+
+
+def fuse_feature(base_feature: np.ndarray, embedding: np.ndarray | None, embedding_weight: float) -> np.ndarray:
+    if embedding is None or embedding_weight <= 0.0:
+        return base_feature.astype(np.float32)
+    fused = np.concatenate([base_feature.astype(np.float32), float(embedding_weight) * embedding.astype(np.float32)], axis=0)
+    fused -= float(fused.mean())
+    fused /= max(float(np.linalg.norm(fused)), 1e-6)
+    return fused.astype(np.float32)
+
+
 def load_manifest_sizes(manifest_path: str) -> dict[tuple[str, str], tuple[int, int]]:
     sizes = {}
     with open(manifest_path, newline="", encoding="utf-8") as handle:
@@ -227,11 +315,14 @@ def load_task_memory(
     feature_size: int,
     pad_ratio: float,
     box_feature_weight: float,
+    embedding_extractor: TimmEmbeddingExtractor | None = None,
+    embedding_weight: float = 0.0,
 ) -> dict[str, np.ndarray]:
     csv_path = os.path.join(csv_root, TASK_CSV[task_id])
     features = []
     labels = []
     paths = []
+    resolved_paths = []
     boxes = []
     with open(csv_path, newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
@@ -247,15 +338,73 @@ def load_task_memory(
             features.append(image_feature(image, box, feature_size, box_feature_weight=box_feature_weight))
             labels.append(crop_normalize_points(points, box))
             paths.append(image_path)
+            resolved_paths.append(resolved)
             boxes.append(box)
     if not features:
         raise RuntimeError(f"No memory loaded for {task_id}")
+    if embedding_extractor is not None and embedding_weight > 0.0:
+        print(f"Extracting {task_id} retrieval embeddings: {len(resolved_paths)} images")
+        embeddings = embedding_extractor.extract_paths(resolved_paths, boxes)
+        features = [
+            fuse_feature(base_feature, embedding, embedding_weight)
+            for base_feature, embedding in zip(features, embeddings)
+        ]
     return {
         "features": np.stack(features, axis=0).astype(np.float32),
         "labels": np.stack(labels, axis=0).astype(np.float32),
         "paths": np.asarray(paths),
         "boxes": np.asarray(boxes, dtype=np.int32),
     }
+
+
+def build_query_features(
+    anchor_predictions: list[dict[str, Any]],
+    data_root: str,
+    sizes: dict[tuple[str, str], tuple[int, int]],
+    tasks: set[str],
+    feature_size: int,
+    pad_ratio: float,
+    box_feature_weight: float,
+    embedding_extractor: TimmEmbeddingExtractor | None,
+    embedding_weight: float,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    query_items: list[tuple[tuple[str, str], str, int, int, tuple[int, int, int, int], np.ndarray]] = []
+    embedding_paths: list[str] = []
+    embedding_boxes: list[tuple[int, int, int, int]] = []
+    for record in anchor_predictions:
+        task_id = str(record["task_id"])
+        if task_id not in tasks:
+            continue
+        key = normalize_key(task_id, str(record["image_path"]))
+        image_path = resolve_image(data_root, key[1], task_id)
+        if image_path is None or key not in sizes:
+            continue
+        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if image is None:
+            continue
+        height, width = sizes[key]
+        box = detect_content_box(image, pad_ratio=pad_ratio)
+        base_feature = image_feature(image, box, feature_size, box_feature_weight=box_feature_weight)
+        query_items.append((key, image_path, height, width, box, base_feature))
+        embedding_paths.append(image_path)
+        embedding_boxes.append(box)
+
+    embeddings: np.ndarray | None = None
+    if embedding_extractor is not None and embedding_weight > 0.0 and embedding_paths:
+        print(f"Extracting validation retrieval embeddings: {len(embedding_paths)} images")
+        embeddings = embedding_extractor.extract_paths(embedding_paths, embedding_boxes)
+
+    queries: dict[tuple[str, str], dict[str, Any]] = {}
+    for index, (key, image_path, height, width, box, base_feature) in enumerate(query_items):
+        embedding = None if embeddings is None else embeddings[index]
+        queries[key] = {
+            "image_path": image_path,
+            "height": height,
+            "width": width,
+            "box": box,
+            "feature": fuse_feature(base_feature, embedding, embedding_weight),
+        }
+    return queries
 
 
 def update_prediction(record: dict, norm_points: np.ndarray, height: int, width: int) -> dict:
@@ -289,6 +438,15 @@ def main() -> int:
     parser.add_argument("--feature-size", type=int, default=128)
     parser.add_argument("--pad-ratio", type=float, default=0.06)
     parser.add_argument("--box-feature-weight", type=float, default=0.0)
+    parser.add_argument(
+        "--embedding-model",
+        default="",
+        help="Optional timm/DINO model used to append content-crop embeddings for retrieval.",
+    )
+    parser.add_argument("--embedding-weight", type=float, default=0.0)
+    parser.add_argument("--embedding-input-size", type=int, default=256)
+    parser.add_argument("--embedding-batch-size", type=int, default=16)
+    parser.add_argument("--embedding-device", default="auto")
     parser.add_argument("--shift-gates", default=None)
     parser.add_argument("--zip-submission", action="store_true")
     args = parser.parse_args()
@@ -305,6 +463,16 @@ def main() -> int:
     with open(args.anchor_json, "r", encoding="utf-8") as handle:
         anchor_predictions = json.load(handle)
     sizes = load_manifest_sizes(args.manifest)
+    embedding_extractor = None
+    if args.embedding_weight > 0.0:
+        if not args.embedding_model:
+            raise ValueError("--embedding-model is required when --embedding-weight > 0")
+        embedding_extractor = TimmEmbeddingExtractor(
+            model_name=args.embedding_model,
+            input_size=args.embedding_input_size,
+            batch_size=args.embedding_batch_size,
+            device=args.embedding_device,
+        )
     memories = {
         task: load_task_memory(
             args.data_root,
@@ -313,9 +481,22 @@ def main() -> int:
             args.feature_size,
             args.pad_ratio,
             args.box_feature_weight,
+            embedding_extractor=embedding_extractor,
+            embedding_weight=args.embedding_weight,
         )
         for task in tasks
     }
+    queries = build_query_features(
+        anchor_predictions=anchor_predictions,
+        data_root=args.data_root,
+        sizes=sizes,
+        tasks=set(tasks),
+        feature_size=args.feature_size,
+        pad_ratio=args.pad_ratio,
+        box_feature_weight=args.box_feature_weight,
+        embedding_extractor=embedding_extractor,
+        embedding_weight=args.embedding_weight,
+    )
 
     retrieval = {}
     for record in anchor_predictions:
@@ -323,15 +504,13 @@ def main() -> int:
         if task_id not in memories:
             continue
         key = normalize_key(task_id, str(record["image_path"]))
-        image_path = resolve_image(args.data_root, key[1], task_id)
-        if image_path is None or key not in sizes:
+        if key not in queries:
             continue
-        image = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if image is None:
-            continue
-        height, width = sizes[key]
-        box = detect_content_box(image, pad_ratio=args.pad_ratio)
-        query = image_feature(image, box, args.feature_size, box_feature_weight=args.box_feature_weight)
+        query_item = queries[key]
+        height = int(query_item["height"])
+        width = int(query_item["width"])
+        box = query_item["box"]
+        query = query_item["feature"]
         memory = memories[task_id]
         sims = memory["features"] @ query
         top_idx = np.argsort(-sims)[: args.top_k]
@@ -407,6 +586,10 @@ def main() -> int:
             "feature_size": args.feature_size,
             "pad_ratio": args.pad_ratio,
             "box_feature_weight": args.box_feature_weight,
+            "embedding_model": args.embedding_model,
+            "embedding_weight": args.embedding_weight,
+            "embedding_input_size": args.embedding_input_size,
+            "embedding_batch_size": args.embedding_batch_size,
             "shift_gates": gates,
             "changed_by_task": changed,
             "rejected_by_task": rejected,
