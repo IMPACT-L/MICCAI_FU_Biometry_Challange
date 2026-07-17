@@ -386,4 +386,7 @@ CUDA_VISIBLE_DEVICES=0 python baseline/train.py \
 - task-isolated FUGC DINO retrieval:
   - `dinov3_vitb_hidden_context_content_roi_retrieval_v8_isolated_fugc_dino_top1_from_v4_anchor/a0p030`
   - hidden score reported by user: `24.02`
-- conclusion: adding ultrasound content-box geometry to same-task retrieval is useful, broad DINO retrieval did not beat the `24.03` anchor, but isolating the DINO top-1 retrieval signal to `FUGC` improved the best result to `24.02`. Use this FUGC-isolated v8 result as the new anchor for the next isolated-task experiments.
+- task-isolated HC DINO retrieval on top of the FUGC anchor:
+  - `dinov3_vitb_hidden_context_content_roi_retrieval_v9_fugc_anchor_plus_hc_dino_top1/a0p020`
+  - hidden score reported by user: `23.98`
+- conclusion: adding ultrasound content-box geometry to same-task retrieval is useful, broad DINO retrieval did not beat the `24.03` anchor, but isolating the DINO top-1 retrieval signal first to `FUGC` and then to `HC` improved the best result to `23.98`. Use this FUGC+HC v9 result as the new anchor for the next isolated-task experiments.

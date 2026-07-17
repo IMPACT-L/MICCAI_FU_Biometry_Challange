@@ -106,6 +106,12 @@ Dedicated-head documentation:
 
 Current best public submission so far:
 
+- Run: `dinov3_vitb_hidden_context_content_roi_retrieval_v9_fugc_anchor_plus_hc_dino_top1/a0p020`
+- Overall score: `23.98`
+- Note: HC-isolated DINO top-1 content retrieval applied on top of the `24.02` FUGC-isolated retrieval anchor.
+
+Previous best public submission:
+
 - Run: `dinov3_vitb_hidden_context_content_roi_retrieval_v8_isolated_fugc_dino_top1_from_v4_anchor/a0p030`
 - Overall score: `24.02`
 - Note: FUGC-isolated DINO top-1 content retrieval on top of the `24.03` content-box retrieval anchor.
@@ -252,6 +258,7 @@ Comparable saved runs:
 
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
+| `dinov3_vitb_hidden_context_content_roi_retrieval_v9_fugc_anchor_plus_hc_dino_top1/a0p020` | `NA` | `23.98` |
 | `dinov3_vitb_hidden_context_content_roi_retrieval_v8_isolated_fugc_dino_top1_from_v4_anchor/a0p030` | `NA` | `24.02` |
 | `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` | `NA` | `24.03` |
 | `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030` | `NA` | `24.06` |
@@ -848,5 +855,6 @@ Lower overall score is better. The table below lists the saved CodaBench leaderb
 | 2026-07-16 | - | - | - | 24.03 | `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` |
 | 2026-07-16 | - | - | - | 24.06 | `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030` |
 | 2026-07-16 | - | - | - | 24.02 | `dinov3_vitb_hidden_context_content_roi_retrieval_v8_isolated_fugc_dino_top1_from_v4_anchor/a0p030` |
+| 2026-07-16 | - | - | - | 23.98 | `dinov3_vitb_hidden_context_content_roi_retrieval_v9_fugc_anchor_plus_hc_dino_top1/a0p020` |
 
 </details>
