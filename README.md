@@ -106,6 +106,12 @@ Dedicated-head documentation:
 
 Current best public submission so far:
 
+- Run: `dinov3_vitb_hidden_context_content_roi_retrieval_v8_isolated_fugc_dino_top1_from_v4_anchor/a0p030`
+- Overall score: `24.02`
+- Note: FUGC-isolated DINO top-1 content retrieval on top of the `24.03` content-box retrieval anchor.
+
+Previous best public submission:
+
 - Run: `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030`
 - Overall score: `24.03`
 - Note: content-aware anatomical retrieval with ultrasound content-box geometry features on top of the FUGC-length-prior/IVC-strong anchor.
@@ -246,6 +252,7 @@ Comparable saved runs:
 
 | Run | Local avg MRE | CodaBench overall |
 | --- | ---: | ---: |
+| `dinov3_vitb_hidden_context_content_roi_retrieval_v8_isolated_fugc_dino_top1_from_v4_anchor/a0p030` | `NA` | `24.02` |
 | `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` | `NA` | `24.03` |
 | `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030` | `NA` | `24.06` |
 | `current_anchor_student_blends_v1/all_hard_light` | `NA` | `24.18` |
@@ -840,5 +847,6 @@ Lower overall score is better. The table below lists the saved CodaBench leaderb
 | 2026-07-16 | - | - | - | 24.21 | `dinov3_vitb_hidden_context_fugc_axis_anatomy_v2_medium_seed42` |
 | 2026-07-16 | - | - | - | 24.03 | `dinov3_vitb_hidden_context_content_roi_retrieval_v4_boxgeom_w2_from_s0p986/a0p030` |
 | 2026-07-16 | - | - | - | 24.06 | `dinov3_vitb_hidden_context_content_roi_retrieval_v6_boxgeom_w2_top3_from_s0p986/a0p030` |
+| 2026-07-16 | - | - | - | 24.02 | `dinov3_vitb_hidden_context_content_roi_retrieval_v8_isolated_fugc_dino_top1_from_v4_anchor/a0p030` |
 
 </details>
