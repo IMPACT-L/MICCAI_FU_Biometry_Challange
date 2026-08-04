@@ -10,6 +10,7 @@ output/
 output/runs/
 output/runs/**
 output/submissions/
+!output/submissions/
 output/submissions/**
 !output/submissions/**/
 !output/submissions/**/codabench_result_*.txt
@@ -35,6 +36,7 @@ evaluation_results.json
 evaluation_summary.txt
 best_model.pth
 .DS_Store
+.docker_build/
 paper/**/*.aux
 paper/**/*.bbl
 paper/**/*.blg
