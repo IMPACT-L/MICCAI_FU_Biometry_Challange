@@ -1,5 +1,4 @@
 import argparse
-import glob
 import json
 import numpy as np
 import os
@@ -14,13 +13,19 @@ from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from model_factory import MultiTaskModelFactory
+from csv_utils import collect_effective_train_csvs
+from model_factory import TASK_ADAPTER_PROFILE_PRESETS, TASK_DECODER_PROFILE_PRESETS, MultiTaskModelFactory
 from model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 from utils import (
     canonicalize_task_coords,
+    CONTENT_CROP_MODES,
+    content_crop_image_and_points,
+    content_crop_enabled_for_task,
+    content_crop_pad_ratio,
     decode_heatmaps_to_normalized_coords,
     letterbox_image_and_points,
     transformed_coords_to_original_normalized,
+    update_letterbox_meta_for_crop,
 )
 
 
@@ -120,16 +125,20 @@ class InferenceDataset(Dataset):
         transforms: Optional[A.Compose] = None,
         split_csv: Optional[str] = None,
         input_size: int = 518,
+        input_crop_mode: str = "none",
     ):
         super().__init__()
         self.data_root = data_root
         self.transforms = transforms
         self.input_size = input_size
+        if str(input_crop_mode) not in {"none", *CONTENT_CROP_MODES}:
+            raise ValueError(f"Unsupported input_crop_mode: {input_crop_mode}")
+        self.input_crop_mode = str(input_crop_mode)
         self.csv_path = os.path.join(self.data_root, "csv")
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
 
-        all_csv_files = glob.glob(os.path.join(self.csv_path, "*.csv"))
+        all_csv_files = collect_effective_train_csvs(self.data_root, self.csv_path)
         if not all_csv_files:
             raise FileNotFoundError(f"No CSV files found in {self.csv_path}")
 
@@ -196,8 +205,21 @@ class InferenceDataset(Dataset):
 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         original_height, original_width = image.shape[:2]
+        content_crop_box = None
+        if content_crop_enabled_for_task(self.input_crop_mode, task_id):
+            image, _, content_crop_box = content_crop_image_and_points(
+                image,
+                None,
+                pad_ratio=content_crop_pad_ratio(self.input_crop_mode),
+            )
         dummy_points = np.zeros((int(record["num_classes"]), 2), dtype=np.float32)
         image, _, meta = letterbox_image_and_points(image, dummy_points, self.input_size)
+        if content_crop_box is not None:
+            meta = update_letterbox_meta_for_crop(
+                meta,
+                content_crop_box,
+                original_size=(original_height, original_width),
+            )
 
         if self.transforms:
             augmented = self.transforms(image=image)
@@ -242,6 +264,7 @@ class Model:
         task_head_profile: Optional[str] = None,
         task_decoder_profile: Optional[str] = None,
         task_adapter_profile: Optional[str] = None,
+        input_crop_mode: Optional[str] = None,
         tta_mode: str = "none",
         tta_task_ids: Optional[set[str]] = None,
     ):
@@ -259,6 +282,9 @@ class Model:
         self.task_head_profile = task_head_profile
         self.task_decoder_profile = task_decoder_profile
         self.task_adapter_profile = task_adapter_profile
+        if input_crop_mode is not None and str(input_crop_mode) not in {"none", *CONTENT_CROP_MODES}:
+            raise ValueError(f"Unsupported input_crop_mode: {input_crop_mode}")
+        self.input_crop_mode = input_crop_mode
         self.tta_mode = str(tta_mode)
         self.tta_task_ids = tta_task_ids
         self.model = None
@@ -368,6 +394,11 @@ class Model:
             if self.task_adapter_profile is not None
             else checkpoint_meta.get("task_adapter_profile", "uniform")
         )
+        self.input_crop_mode = (
+            self.input_crop_mode
+            if self.input_crop_mode is not None
+            else checkpoint_meta.get("input_crop_mode", "none")
+        )
         if self.model_profile is not None:
             profile_config = apply_model_profile(
                 self.model_profile,
@@ -381,6 +412,7 @@ class Model:
                     "task_head_profile": self.task_head_profile,
                     "task_decoder_profile": self.task_decoder_profile,
                     "task_adapter_profile": self.task_adapter_profile,
+                    "input_crop_mode": self.input_crop_mode,
                 },
             )
             self.encoder_name = str(profile_config["encoder_name"])
@@ -391,8 +423,14 @@ class Model:
             self.task_head_profile = str(profile_config["task_head_profile"])
             self.task_decoder_profile = str(profile_config["task_decoder_profile"])
             self.task_adapter_profile = str(profile_config["task_adapter_profile"])
+            self.input_crop_mode = str(profile_config.get("input_crop_mode", self.input_crop_mode))
         self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
         self.heatmap_size = tuple(checkpoint_meta.get("heatmap_size", list(self.heatmap_size)))
+        encoder_lora_rank = int(checkpoint_meta.get("encoder_lora_rank", 0))
+        encoder_lora_alpha = float(checkpoint_meta.get("encoder_lora_alpha", 16.0))
+        encoder_lora_last_blocks = int(checkpoint_meta.get("encoder_lora_last_blocks", 4))
+        encoder_lora_dropout = float(checkpoint_meta.get("encoder_lora_dropout", 0.05))
+        encoder_lora_task_specific = bool(checkpoint_meta.get("encoder_lora_task_specific", False))
         print(
             "Checkpoint architecture: "
             f"encoder={self.encoder_name}, "
@@ -401,9 +439,12 @@ class Model:
             f"task_head_profile={self.task_head_profile}, "
             f"task_decoder_profile={self.task_decoder_profile}, "
             f"task_adapter_profile={self.task_adapter_profile}, "
+            f"input_crop_mode={self.input_crop_mode}, "
             f"fpn_mode={self.fpn_mode}, "
             f"fpn_type={self.fpn_type}, "
             f"heatmap_size={self.heatmap_size}, "
+            f"encoder_lora_rank={encoder_lora_rank}, "
+            f"encoder_lora_task_specific={encoder_lora_task_specific}, "
             f"domain_adversarial={domain_adversarial}, "
             f"FPN {'ENABLED' if checkpoint_has_fpn else 'DISABLED'}; "
             f"loading model with FPN {'ENABLED' if use_fpn else 'DISABLED'}"
@@ -428,6 +469,11 @@ class Model:
             task_head_profile=self.task_head_profile,
             task_decoder_profile=self.task_decoder_profile,
             task_adapter_profile=self.task_adapter_profile,
+            encoder_lora_rank=encoder_lora_rank,
+            encoder_lora_alpha=encoder_lora_alpha,
+            encoder_lora_last_blocks=encoder_lora_last_blocks,
+            encoder_lora_dropout=encoder_lora_dropout,
+            encoder_lora_task_specific=encoder_lora_task_specific,
             domain_adversarial=domain_adversarial,
             num_domain_classes=num_domain_classes,
         ).to(self.device)
@@ -455,11 +501,34 @@ class Model:
             raise FileNotFoundError(f"Model file not found: {self.checkpoint_path}")
         _, checkpoint_meta = load_checkpoint_payload(self.checkpoint_path, self.device)
         self.input_size = int(checkpoint_meta.get("input_size", self.input_size))
+        self.input_crop_mode = (
+            self.input_crop_mode
+            if self.input_crop_mode is not None
+            else str(checkpoint_meta.get("input_crop_mode", "none"))
+        )
+        if self.model_profile is not None:
+            profile_config = apply_model_profile(
+                self.model_profile,
+                "inference",
+                {
+                    "encoder_name": checkpoint_meta.get("encoder_name", self.encoder_name),
+                    "encoder_feature_mode": checkpoint_meta.get("encoder_feature_mode", self.encoder_feature_mode or "final"),
+                    "use_fpn": checkpoint_meta.get("use_fpn", True),
+                    "fpn_mode": checkpoint_meta.get("fpn_mode", self.fpn_mode or "task_specific"),
+                    "fpn_type": checkpoint_meta.get("fpn_type", self.fpn_type or "fpn"),
+                    "task_head_profile": checkpoint_meta.get("task_head_profile", self.task_head_profile or "uniform"),
+                    "task_decoder_profile": checkpoint_meta.get("task_decoder_profile", self.task_decoder_profile or "uniform"),
+                    "task_adapter_profile": checkpoint_meta.get("task_adapter_profile", self.task_adapter_profile or "uniform"),
+                    "input_crop_mode": self.input_crop_mode,
+                },
+            )
+            self.input_crop_mode = str(profile_config.get("input_crop_mode", self.input_crop_mode))
         dataset = InferenceDataset(
             data_root=data_root,
             transforms=self.transforms,
             split_csv=split_csv,
             input_size=self.input_size,
+            input_crop_mode=self.input_crop_mode,
         )
 
         # A split CSV may contain only one task, but checkpoints usually contain all
@@ -592,14 +661,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_aop_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_segment_specialist_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=tuple(TASK_DECODER_PROFILE_PRESETS.keys()),
         default=None,
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "context_local_stylemix_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "highres_texture_v1", "pixel_unet_v1", "hrnet_residual_v1", "encoder_task_context_local_v1", "encoder_task_hard_context_local_v1", "boundary_context_v1", "taskfilm_v1"),
+        choices=tuple(TASK_ADAPTER_PROFILE_PRESETS.keys()),
         default=None,
         help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
@@ -631,6 +700,21 @@ if __name__ == "__main__":
         help="Optional FPN neck type override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
+        "--input-crop-mode",
+        type=str,
+        choices=(
+            "none",
+            "content_box",
+            "content_box_strict",
+            "content_box_wide",
+            "content_box_wide_strict",
+            "content_box_fugc_wide",
+            "content_box_fugc_xwide",
+        ),
+        default=None,
+        help="Optional input crop override. If omitted, inferred from checkpoint metadata.",
+    )
+    parser.add_argument(
         "--tta-mode",
         type=str,
         choices=("none", "hflip", "photometric", "hflip_photometric"),
@@ -656,6 +740,7 @@ if __name__ == "__main__":
         task_head_profile=args.task_head_profile,
         task_decoder_profile=args.task_decoder_profile,
         task_adapter_profile=args.task_adapter_profile,
+        input_crop_mode=args.input_crop_mode,
         tta_mode=args.tta_mode,
         tta_task_ids=(DEFAULT_TTA_TASK_IDS if args.tta_mode == "hflip" and args.tta_task_ids == "AOP,FA,FUGC,HC,IVC,PSAX,fetal_femur" else parse_task_id_csv(args.tta_task_ids)),
     )

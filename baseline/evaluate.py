@@ -1,4 +1,3 @@
-import glob
 import argparse
 import json
 import os
@@ -8,6 +7,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from csv_utils import collect_effective_train_csvs
 from utils import canonicalize_task_coords, compute_angle_measurements_from_points
 
 
@@ -42,7 +42,7 @@ class Evaluator:
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
 
-        all_csv_files = glob.glob(os.path.join(self.csv_path, "*.csv"))
+        all_csv_files = collect_effective_train_csvs(self.data_root, self.csv_path)
         if not all_csv_files:
             raise FileNotFoundError(f"No CSV files found in {self.csv_path}")
 

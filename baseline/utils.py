@@ -22,12 +22,13 @@ MEASUREMENT_PAIRS = {
 }
 
 TASK_PAIR_CANONICAL_RULES = {
+    "A4C": {pair_idx: "y_asc_stable" for pair_idx in range(8)},
     "AOP": {0: "x_desc", 1: "x_asc"},
     "FA": {0: "y_asc", 1: "x_desc"},
     "FUGC": {0: "x_asc"},
     "HC": {0: "y_asc", 1: "x_desc"},
     "IVC": {0: "y_asc"},
-    "PSAX": {0: "y_asc", 1: "y_asc"},
+    "PSAX": {0: "y_asc_stable", 1: "y_asc_stable"},
     "fetal_femur": {0: "x_asc"},
 }
 
@@ -63,6 +64,8 @@ def _canonical_pair_swap_mask(p0, p1, rule: str):
         return (p0[:, 0] < p1[:, 0]) | ((p0[:, 0] == p1[:, 0]) & (p0[:, 1] > p1[:, 1]))
     if rule == "y_asc":
         return (p0[:, 1] > p1[:, 1]) | ((p0[:, 1] == p1[:, 1]) & (p0[:, 0] > p1[:, 0]))
+    if rule == "y_asc_stable":
+        return p0[:, 1] > p1[:, 1]
     if rule == "y_desc":
         return (p0[:, 1] < p1[:, 1]) | ((p0[:, 1] == p1[:, 1]) & (p0[:, 0] > p1[:, 0]))
     raise ValueError(f"Unsupported canonical pair rule: {rule}")
@@ -166,8 +169,155 @@ def letterbox_image_and_points(
         "scale": float(scale),
         "pad_x": float(pad_x),
         "pad_y": float(pad_y),
+        "crop_x0": 0.0,
+        "crop_y0": 0.0,
+        "crop_width": float(original_width),
+        "crop_height": float(original_height),
     }
     return canvas, coords_px, meta
+
+
+def detect_ultrasound_content_box(
+    image: np.ndarray,
+    pad_ratio: float = 0.035,
+    min_area_ratio: float = 0.015,
+) -> tuple[int, int, int, int]:
+    """Detect the non-background ultrasound content box.
+
+    This is input normalization, not prediction postprocessing. It removes
+    scanner borders and black padding before letterboxing so anatomy appears at
+    a more consistent scale across devices.
+    """
+
+    if image.ndim == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image
+    height, width = gray.shape[:2]
+    if height < 32 or width < 32:
+        return 0, 0, width, height
+
+    blur = cv2.GaussianBlur(gray, (0, 0), 1.2)
+    threshold = max(6, int(np.percentile(blur, 72) * 0.18))
+    mask = (blur > threshold).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    min_area = float(min_area_ratio) * float(width * height)
+    best_label = None
+    best_area = 0
+    for label in range(1, n_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area > best_area and area >= min_area:
+            best_label = label
+            best_area = area
+
+    if best_label is None:
+        ys, xs = np.where(mask > 0)
+        if xs.size == 0:
+            return 0, 0, width, height
+        x0, x1 = int(xs.min()), int(xs.max()) + 1
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+    else:
+        x0 = int(stats[best_label, cv2.CC_STAT_LEFT])
+        y0 = int(stats[best_label, cv2.CC_STAT_TOP])
+        x1 = x0 + int(stats[best_label, cv2.CC_STAT_WIDTH])
+        y1 = y0 + int(stats[best_label, cv2.CC_STAT_HEIGHT])
+
+    box_w = max(x1 - x0, 1)
+    box_h = max(y1 - y0, 1)
+    pad = int(round(float(pad_ratio) * float(max(box_w, box_h))))
+    x0 = max(0, x0 - pad)
+    y0 = max(0, y0 - pad)
+    x1 = min(width, x1 + pad)
+    y1 = min(height, y1 + pad)
+
+    if (x1 - x0) < int(0.20 * width) or (y1 - y0) < int(0.20 * height):
+        return 0, 0, width, height
+    return x0, y0, x1, y1
+
+
+CONTENT_CROP_MODE_PAD_RATIOS = {
+    "content_box": 0.035,
+    "content_box_strict": 0.035,
+    "content_box_wide": 0.18,
+    "content_box_wide_strict": 0.18,
+    "content_box_fugc_wide": 0.18,
+    "content_box_fugc_xwide": 0.25,
+}
+CONTENT_CROP_MODES = set(CONTENT_CROP_MODE_PAD_RATIOS)
+CONTENT_CROP_MODE_TASKS = {
+    "content_box_fugc_wide": {"FUGC"},
+    "content_box_fugc_xwide": {"FUGC"},
+}
+
+
+def is_content_crop_mode(input_crop_mode: str) -> bool:
+    return str(input_crop_mode) in CONTENT_CROP_MODES
+
+
+def content_crop_enabled_for_task(input_crop_mode: str, task_id: str | None) -> bool:
+    mode = str(input_crop_mode)
+    if mode not in CONTENT_CROP_MODES:
+        return False
+    enabled_tasks = CONTENT_CROP_MODE_TASKS.get(mode)
+    return enabled_tasks is None or str(task_id) in enabled_tasks
+
+
+def content_crop_pad_ratio(input_crop_mode: str) -> float:
+    return float(CONTENT_CROP_MODE_PAD_RATIOS.get(str(input_crop_mode), 0.035))
+
+
+def content_crop_should_include_points(input_crop_mode: str) -> bool:
+    return str(input_crop_mode) in {"content_box", "content_box_wide", "content_box_fugc_wide", "content_box_fugc_xwide"}
+
+
+def content_crop_image_and_points(
+    image: np.ndarray,
+    coords_px: np.ndarray | None = None,
+    pad_ratio: float = 0.035,
+    include_points: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None, tuple[int, int, int, int]]:
+    x0, y0, x1, y1 = detect_ultrasound_content_box(image, pad_ratio=pad_ratio)
+    if include_points and coords_px is not None and len(coords_px):
+        coords = np.asarray(coords_px, dtype=np.float32).reshape(-1, 2)
+        valid = coords[np.isfinite(coords).all(axis=1)]
+        if len(valid):
+            height, width = image.shape[:2]
+            box_w = max(x1 - x0, 1)
+            box_h = max(y1 - y0, 1)
+            pad = int(round(float(pad_ratio) * float(max(box_w, box_h))))
+            x0 = max(0, min(x0, int(np.floor(float(valid[:, 0].min()))) - pad))
+            y0 = max(0, min(y0, int(np.floor(float(valid[:, 1].min()))) - pad))
+            x1 = min(width, max(x1, int(np.ceil(float(valid[:, 0].max()))) + pad + 1))
+            y1 = min(height, max(y1, int(np.ceil(float(valid[:, 1].max()))) + pad + 1))
+
+    cropped_image = image[y0:y1, x0:x1]
+    cropped_coords = None
+    if coords_px is not None:
+        cropped_coords = np.asarray(coords_px, dtype=np.float32).reshape(-1, 2).copy()
+        cropped_coords[:, 0] -= float(x0)
+        cropped_coords[:, 1] -= float(y0)
+    return cropped_image, cropped_coords, (x0, y0, x1, y1)
+
+
+def update_letterbox_meta_for_crop(
+    meta: dict,
+    crop_box: tuple[int, int, int, int],
+    original_size: tuple[int, int],
+) -> dict:
+    x0, y0, x1, y1 = crop_box
+    original_height, original_width = original_size
+    updated = dict(meta)
+    updated["original_width"] = float(original_width)
+    updated["original_height"] = float(original_height)
+    updated["crop_x0"] = float(x0)
+    updated["crop_y0"] = float(y0)
+    updated["crop_width"] = float(max(x1 - x0, 1))
+    updated["crop_height"] = float(max(y1 - y0, 1))
+    return updated
 
 
 def decode_heatmaps_to_transformed_coords(heatmaps: torch.Tensor) -> torch.Tensor:
@@ -206,6 +356,8 @@ def transformed_coords_to_original_normalized(
         sample[:, 1] = sample[:, 1] * input_size
         sample[:, 0] = (sample[:, 0] - float(sample_meta["pad_x"])) / max(float(sample_meta["scale"]), 1e-8)
         sample[:, 1] = (sample[:, 1] - float(sample_meta["pad_y"])) / max(float(sample_meta["scale"]), 1e-8)
+        sample[:, 0] += float(sample_meta.get("crop_x0", 0.0))
+        sample[:, 1] += float(sample_meta.get("crop_y0", 0.0))
         sample[:, 0] /= max(float(sample_meta["original_width"]) - 1.0, 1.0)
         sample[:, 1] /= max(float(sample_meta["original_height"]) - 1.0, 1.0)
         sample = np.clip(sample, 0.0, 1.0)
@@ -642,6 +794,42 @@ def compute_fugc_segment_loss(
         thickness=2,
     )
     return torch.nn.functional.binary_cross_entropy_with_logits(segment_logits, target_mask)
+
+
+def compute_fugc_canal_loss(
+    canal_logits: torch.Tensor | None,
+    canal_sample_grid_transformed: torch.Tensor | None,
+    target_coords_transformed: torch.Tensor,
+) -> torch.Tensor:
+    """Supervise a cervical-canal response in an anchor-aligned sampled strip."""
+    if canal_logits is None or canal_sample_grid_transformed is None:
+        return target_coords_transformed.new_tensor(0.0)
+
+    points = target_coords_transformed.reshape(-1, 2, 2)
+    start = points[:, 0, None, None, :]
+    segment = (points[:, 1] - points[:, 0])[:, None, None, :]
+    segment_length_sq = segment.square().sum(dim=-1).clamp_min(1e-6)
+    relative = canal_sample_grid_transformed - start
+    projection = (relative * segment).sum(dim=-1) / segment_length_sq
+    projection = projection.clamp(0.0, 1.0)
+    closest = start + projection[..., None] * segment
+    distance_sq = (canal_sample_grid_transformed - closest).square().sum(dim=-1)
+
+    sigma = 0.025
+    target = torch.exp(-0.5 * distance_sq / (sigma * sigma)).unsqueeze(1)
+    pixel_weight = 1.0 + 4.0 * target
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(
+        canal_logits,
+        target,
+        reduction="none",
+    )
+    bce = (bce * pixel_weight).sum() / pixel_weight.sum().clamp_min(1.0)
+    probability = torch.sigmoid(canal_logits)
+    intersection = (probability * target).sum()
+    dice = 1.0 - (2.0 * intersection + 1.0) / (
+        probability.sum() + target.sum() + 1.0
+    )
+    return 0.6 * bce + 0.4 * dice
 
 
 def compute_ivc_band_loss(

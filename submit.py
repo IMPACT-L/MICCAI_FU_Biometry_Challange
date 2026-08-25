@@ -14,13 +14,22 @@ from albumentations.pytorch import ToTensorV2
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from baseline.model_factory import MultiTaskModelFactory
+from baseline.model_factory import (
+    TASK_ADAPTER_PROFILE_PRESETS,
+    TASK_DECODER_PROFILE_PRESETS,
+    MultiTaskModelFactory,
+)
 from baseline.model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 from baseline.utils import (
     canonicalize_task_coords,
+    CONTENT_CROP_MODES,
+    content_crop_image_and_points,
+    content_crop_enabled_for_task,
+    content_crop_pad_ratio,
     decode_heatmaps_to_normalized_coords,
     letterbox_image_and_points,
     transformed_coords_to_original_normalized,
+    update_letterbox_meta_for_crop,
 )
 
 
@@ -112,10 +121,13 @@ def infer_num_domain_classes(checkpoint: dict) -> int:
 
 
 class ValidationManifestDataset(Dataset):
-    def __init__(self, manifest_path: str, input_size: int = 518):
+    def __init__(self, manifest_path: str, input_size: int = 518, input_crop_mode: str = "none"):
         self.manifest_path = os.path.abspath(manifest_path)
         self.manifest_dir = os.path.dirname(self.manifest_path)
         self.input_size = input_size
+        if str(input_crop_mode) not in {"none", *CONTENT_CROP_MODES}:
+            raise ValueError(f"Unsupported input_crop_mode: {input_crop_mode}")
+        self.input_crop_mode = str(input_crop_mode)
         with open(self.manifest_path, newline="", encoding="utf-8") as handle:
             self.rows = list(csv.DictReader(handle))
         if not self.rows:
@@ -142,8 +154,21 @@ class ValidationManifestDataset(Dataset):
             raise FileNotFoundError(f"Failed to read validation image: {abs_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         original_height, original_width = image.shape[:2]
+        content_crop_box = None
+        if content_crop_enabled_for_task(self.input_crop_mode, row["task_id"]):
+            image, _, content_crop_box = content_crop_image_and_points(
+                image,
+                None,
+                pad_ratio=content_crop_pad_ratio(self.input_crop_mode),
+            )
         dummy_points = np.zeros((int(row["num_points"]), 2), dtype=np.float32)
         image, _, meta = letterbox_image_and_points(image, dummy_points, self.input_size)
+        if content_crop_box is not None:
+            meta = update_letterbox_meta_for_crop(
+                meta,
+                content_crop_box,
+                original_size=(original_height, original_width),
+            )
         transformed = self.transforms(image=image)
 
         return {
@@ -186,17 +211,17 @@ def build_task_configs(manifest_path: str):
     return configs
 
 
-def validate_predictions(predictions):
+def validate_predictions(predictions, expected_counts: dict[str, int] | None = None):
     counts = Counter(item["task_id"] for item in predictions)
-    if len(predictions) != sum(EXPECTED_VALIDATION_COUNTS.values()):
+    if expected_counts is not None and len(predictions) != sum(expected_counts.values()):
         raise ValueError(
             f"Submission row count mismatch: got {len(predictions)}, "
-            f"expected {sum(EXPECTED_VALIDATION_COUNTS.values())}"
+            f"expected {sum(expected_counts.values())}"
         )
-    if dict(counts) != EXPECTED_VALIDATION_COUNTS:
+    if expected_counts is not None and dict(counts) != expected_counts:
         raise ValueError(
             f"Submission task counts mismatch: got {dict(sorted(counts.items()))}, "
-            f"expected {EXPECTED_VALIDATION_COUNTS}"
+            f"expected {expected_counts}"
         )
 
     seen = set()
@@ -207,7 +232,7 @@ def validate_predictions(predictions):
         seen.add(key)
 
 
-def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, str, bool, str, str, str, str, str, str, int, tuple]:
+def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) -> tuple[str, str, bool, str, str, str, str, str, str, int, tuple, str]:
     meta_encoder_name = checkpoint_meta.get("encoder_name")
     meta_encoder_feature_mode = checkpoint_meta.get("encoder_feature_mode", "final")
     meta_use_fpn = checkpoint_meta.get("use_fpn")
@@ -219,6 +244,7 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
     meta_task_adapter_profile = checkpoint_meta.get("task_adapter_profile", "uniform")
     meta_input_size = int(checkpoint_meta.get("input_size", 518))
     meta_heatmap_size = tuple(checkpoint_meta.get("heatmap_size", [64, 64]))
+    meta_input_crop_mode = str(checkpoint_meta.get("input_crop_mode", "none"))
     if meta_encoder_name is not None and meta_use_fpn is not None:
         return (
             str(meta_encoder_name),
@@ -232,6 +258,7 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
             str(meta_task_adapter_profile),
             meta_input_size,
             meta_heatmap_size,
+            meta_input_crop_mode,
         )
 
     checkpoint_has_shared_fpn = any(key.startswith("fpn.") for key in checkpoint.keys())
@@ -245,11 +272,11 @@ def infer_model_config_from_checkpoint(checkpoint: dict, checkpoint_meta: dict) 
     if checkpoint_has_fpn:
         if in_channels != 256:
             raise ValueError(f"Unexpected FPN head width in checkpoint: {in_channels}")
-        return "vit_base_patch14_dinov2.lvd142m", "final", True, inferred_fpn_mode, "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", "final", True, inferred_fpn_mode, "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size, meta_input_crop_mode
     if in_channels == 384:
-        return "vit_small_patch14_dinov2.lvd142m", "final", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_small_patch14_dinov2.lvd142m", "final", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size, meta_input_crop_mode
     if in_channels == 768:
-        return "vit_base_patch14_dinov2.lvd142m", "final", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size
+        return "vit_base_patch14_dinov2.lvd142m", "final", False, "shared", "fpn", "basic", "uniform", "uniform", "uniform", meta_input_size, meta_heatmap_size, meta_input_crop_mode
     raise ValueError(f"Unsupported checkpoint head width: {in_channels}")
 
 
@@ -303,6 +330,15 @@ def main():
         help="Trained checkpoint path.",
     )
     parser.add_argument(
+        "--encoder-weights",
+        default="none",
+        choices=("none", "pretrained"),
+        help=(
+            "Weights used only when constructing the encoder before checkpoint loading. "
+            "Use 'none' for offline Docker inference."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         default="submission_output",
         help="Directory to write regression_predictions.json and submission.zip.",
@@ -341,13 +377,13 @@ def main():
     parser.add_argument(
         "--task-decoder-profile",
         default=None,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_aop_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_segment_specialist_v1", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=tuple(TASK_DECODER_PROFILE_PRESETS.keys()),
         help="Optional task-specific decoder-family override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
         "--task-adapter-profile",
         default=None,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "context_local_stylemix_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "highres_texture_v1", "pixel_unet_v1", "hrnet_residual_v1", "encoder_task_context_local_v1", "encoder_task_hard_context_local_v1", "boundary_context_v1", "taskfilm_v1"),
+        choices=tuple(TASK_ADAPTER_PROFILE_PRESETS.keys()),
         help="Optional task-specific feature adapter override. If omitted, inferred from checkpoint.",
     )
     parser.add_argument(
@@ -367,6 +403,20 @@ def main():
         type=int,
         default=None,
         help="Optional square letterbox input size override. If omitted, inferred from checkpoint.",
+    )
+    parser.add_argument(
+        "--input-crop-mode",
+        default=None,
+        choices=(
+            "none",
+            "content_box",
+            "content_box_strict",
+            "content_box_wide",
+            "content_box_wide_strict",
+            "content_box_fugc_wide",
+            "content_box_fugc_xwide",
+        ),
+        help="Optional model-side crop override. If omitted, inferred from checkpoint metadata.",
     )
     parser.add_argument(
         "--tta-mode",
@@ -390,6 +440,14 @@ def main():
         dest="use_fpn",
         action="store_false",
         help="Force no-FPN model construction.",
+    )
+    parser.add_argument(
+        "--skip-count-validation",
+        action="store_true",
+        help=(
+            "Do not enforce the public validation manifest row counts. "
+            "Use this for hidden/final Docker manifests whose counts are unknown."
+        ),
     )
     parser.set_defaults(use_fpn=None)
     args = parser.parse_args()
@@ -418,6 +476,7 @@ def main():
         inferred_task_adapter_profile,
         inferred_input_size,
         inferred_heatmap_size,
+        inferred_input_crop_mode,
     ) = infer_model_config_from_checkpoint(
         checkpoint,
         checkpoint_meta,
@@ -435,6 +494,7 @@ def main():
     task_adapter_profile = args.task_adapter_profile or inferred_task_adapter_profile
     use_fpn = inferred_use_fpn if args.use_fpn is None else args.use_fpn
     input_size = int(args.input_size or inferred_input_size)
+    input_crop_mode = str(args.input_crop_mode or inferred_input_crop_mode)
     if args.model_profile is not None:
         profile_config = apply_model_profile(
             args.model_profile,
@@ -448,6 +508,7 @@ def main():
                 "task_head_profile": task_head_profile,
                 "task_decoder_profile": task_decoder_profile,
                 "task_adapter_profile": task_adapter_profile,
+                "input_crop_mode": input_crop_mode,
             },
         )
         encoder_name = str(profile_config["encoder_name"])
@@ -458,13 +519,23 @@ def main():
         task_head_profile = str(profile_config["task_head_profile"])
         task_decoder_profile = str(profile_config["task_decoder_profile"])
         task_adapter_profile = str(profile_config["task_adapter_profile"])
+        input_crop_mode = str(profile_config.get("input_crop_mode", input_crop_mode))
     tta_task_ids = (
         DEFAULT_TTA_TASK_IDS
         if args.tta_mode == "hflip" and args.tta_task_ids == "AOP,FA,FUGC,HC,IVC,PSAX,fetal_femur"
         else parse_task_id_csv(args.tta_task_ids)
     )
+    encoder_lora_rank = int(checkpoint_meta.get("encoder_lora_rank", 0))
+    encoder_lora_alpha = float(checkpoint_meta.get("encoder_lora_alpha", 16.0))
+    encoder_lora_last_blocks = int(checkpoint_meta.get("encoder_lora_last_blocks", 4))
+    encoder_lora_dropout = float(checkpoint_meta.get("encoder_lora_dropout", 0.05))
+    encoder_lora_task_specific = bool(checkpoint_meta.get("encoder_lora_task_specific", False))
 
-    dataset = ValidationManifestDataset(manifest_path=manifest_path, input_size=input_size)
+    dataset = ValidationManifestDataset(
+        manifest_path=manifest_path,
+        input_size=input_size,
+        input_crop_mode=input_crop_mode,
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -484,7 +555,10 @@ def main():
         f"task_decoder_profile={inferred_task_decoder_profile}, "
         f"task_adapter_profile={inferred_task_adapter_profile}, "
         f"input_size={inferred_input_size}, "
+        f"input_crop_mode={inferred_input_crop_mode}, "
         f"heatmap_size={inferred_heatmap_size}, "
+        f"encoder_lora_rank={encoder_lora_rank}, "
+        f"encoder_lora_task_specific={encoder_lora_task_specific}, "
         f"domain_adversarial={domain_adversarial}, "
         f"FPN={'ENABLED' if inferred_use_fpn else 'DISABLED'}"
     )
@@ -498,6 +572,7 @@ def main():
         f"task_decoder_profile={task_decoder_profile}, "
         f"task_adapter_profile={task_adapter_profile}, "
         f"input_size={input_size}, "
+        f"input_crop_mode={input_crop_mode}, "
         f"heatmap_size={inferred_heatmap_size}, "
         f"FPN={'ENABLED' if use_fpn else 'DISABLED'}"
     )
@@ -507,7 +582,7 @@ def main():
 
     model = MultiTaskModelFactory(
         encoder_name=encoder_name,
-        encoder_weights="pretrained",
+        encoder_weights=None if args.encoder_weights == "none" else "pretrained",
         encoder_feature_mode=encoder_feature_mode,
         task_configs=task_configs,
         heatmap_size=inferred_heatmap_size,
@@ -518,6 +593,11 @@ def main():
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
         task_adapter_profile=task_adapter_profile,
+        encoder_lora_rank=encoder_lora_rank,
+        encoder_lora_alpha=encoder_lora_alpha,
+        encoder_lora_last_blocks=encoder_lora_last_blocks,
+        encoder_lora_dropout=encoder_lora_dropout,
+        encoder_lora_task_specific=encoder_lora_task_specific,
         domain_adversarial=domain_adversarial,
         num_domain_classes=num_domain_classes,
     ).to(device)
@@ -567,7 +647,8 @@ def main():
                         }
                     )
 
-    validate_predictions(predictions)
+    expected_counts = None if args.skip_count_validation else EXPECTED_VALIDATION_COUNTS
+    validate_predictions(predictions, expected_counts=expected_counts)
 
     os.makedirs(output_dir, exist_ok=True)
     json_path = os.path.join(output_dir, "regression_predictions.json")
@@ -580,7 +661,9 @@ def main():
 
     print(f"Wrote {json_path}")
     print(f"Wrote {zip_path}")
-    print(f"Validated counts: {EXPECTED_VALIDATION_COUNTS}")
+    print(f"Prediction counts: {dict(sorted(Counter(item['task_id'] for item in predictions).items()))}")
+    if expected_counts is not None:
+        print(f"Validated counts: {expected_counts}")
 
 
 if __name__ == "__main__":

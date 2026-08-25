@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,8 @@ EXPECTED_VALIDATION_COUNTS = {
     "PSAX": 18,
     "fetal_femur": 62,
 }
+
+VERTICAL_ORDER_CARDIAC_CSV_FILES = {"A4C_train.csv", "PSAX_train.csv"}
 
 FETAL_FEMUR_ORIENTATION_ANOMALY_BASENAMES = {
     "Patient00757_Plane5_1_of_1.png",
@@ -65,6 +68,27 @@ def fail(message: str) -> None:
     raise SystemExit(f"DATASET AUDIT FAILED: {message}")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def legacy_cardiac_csv_candidates(data_root: Path, file_name: str) -> list[Path]:
+    return [
+        data_root / "newcsv" / file_name,
+        data_root / "csv" / "newcsv" / file_name,
+        data_root / "csv_corrected" / file_name,
+        Path.cwd() / "newcsv" / file_name,
+    ]
+
+
+def effective_train_csv_path(data_root: Path, file_name: str) -> tuple[Path, bool]:
+    return data_root / "csv" / file_name, False
+
+
 def audit_train_csvs(data_root: Path) -> None:
     csv_root = data_root / "csv"
     if not csv_root.is_dir():
@@ -72,7 +96,7 @@ def audit_train_csvs(data_root: Path) -> None:
 
     print("Training CSV audit")
     for file_name, expected in EXPECTED_TRAIN_FILES.items():
-        csv_path = csv_root / file_name
+        csv_path, uses_corrected_override = effective_train_csv_path(data_root, file_name)
         if not csv_path.is_file():
             fail(f"missing required training CSV: {csv_path}")
 
@@ -89,7 +113,55 @@ def audit_train_csvs(data_root: Path) -> None:
                 f"{file_name} num_classes mismatch: got {unique_num_points}, expected {[expected['num_points']]}"
             )
 
-        print(f"  - {file_name}: rows={row_count}, num_points={expected['num_points']}")
+        source_note = "data/csv"
+        print(
+            f"  - {file_name}: rows={row_count}, num_points={expected['num_points']}, "
+            f"source={source_note}"
+        )
+
+
+def audit_cardiac_vertical_order(data_root: Path) -> None:
+    print("\nA4C/PSAX organizer vertical-order audit")
+    for file_name in sorted(VERTICAL_ORDER_CARDIAC_CSV_FILES):
+        csv_path = data_root / "csv" / file_name
+        df = pd.read_csv(csv_path)
+        num_points = int(df["num_classes"].iloc[0])
+        violations = []
+        ties = 0
+        for row_index, row in df.iterrows():
+            for point_index in range(1, num_points + 1, 2):
+                first = json.loads(row[f"point_{point_index}_xy"])
+                second = json.loads(row[f"point_{point_index + 1}_xy"])
+                first_y = float(first[1])
+                second_y = float(second[1])
+                if first_y > second_y:
+                    violations.append((row_index, point_index, first_y, second_y))
+                elif first_y == second_y:
+                    ties += 1
+        if violations:
+            fail(
+                f"{file_name} violates upper-to-lower odd-even ordering in "
+                f"{len(violations)} pairs; first violations={violations[:5]}"
+            )
+        print(
+            f"  - {file_name}: source={csv_path}, violations=0, "
+            f"vertical_ties_preserved={ties}"
+        )
+
+        ignored = [path for path in legacy_cardiac_csv_candidates(data_root, file_name) if path.is_file()]
+        if ignored:
+            matching = [path for path in ignored if file_sha256(path) == file_sha256(csv_path)]
+            stale = [path for path in ignored if path not in matching]
+            if matching:
+                print(
+                    "    ignored compatibility copy/copies match the official prepared CSV: "
+                    + ", ".join(str(path) for path in matching)
+                )
+            if stale:
+                print(
+                    "    warning: ignored stale override(s) differ from the official prepared CSV: "
+                    + ", ".join(str(path) for path in stale)
+                )
 
 
 def audit_validation_manifest(data_root: Path) -> None:
@@ -174,6 +246,7 @@ def audit_fetal_femur_orientation_note(data_root: Path) -> None:
 def main() -> None:
     data_root = Path("data")
     audit_train_csvs(data_root)
+    audit_cardiac_vertical_order(data_root)
     audit_validation_manifest(data_root)
     audit_fa_note(data_root)
     audit_fetal_femur_orientation_note(data_root)

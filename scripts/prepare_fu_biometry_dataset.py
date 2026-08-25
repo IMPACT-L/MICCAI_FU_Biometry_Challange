@@ -43,6 +43,7 @@ TASK_FOLDER_ALIASES = {
     "PSAK": ["PSAX", "PSAK"],
 }
 CSV_ENCODINGS = ("utf-8", "utf-8-sig", "gb18030", "gbk", "latin1")
+VERTICAL_ORDER_CARDIAC_CSV_FILES = {"A4C_train.csv", "PSAX_train.csv"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,8 +69,6 @@ def find_candidate_csvs(raw_root: Path) -> dict[str, Path]:
     for path in raw_root.rglob("*.csv"):
         name = path.name
         for canonical_name, aliases in CSV_ALIASES.items():
-            if canonical_name in found:
-                continue
             if name not in aliases:
                 continue
             expected_task = infer_task_folder(canonical_name)
@@ -78,9 +77,21 @@ def find_candidate_csvs(raw_root: Path) -> dict[str, Path]:
             if expected_task == "PSAX":
                 alias_ok = alias_ok or "psak" in parent_parts
             if alias_ok or name == canonical_name or canonical_name == "Reg-Two_3.fetal_femur.csv":
-                found[canonical_name] = path
+                current = found.get(canonical_name)
+                if current is None or csv_candidate_priority(canonical_name, path) < csv_candidate_priority(
+                    canonical_name, current
+                ):
+                    found[canonical_name] = path
                 break
     return found
+
+
+def csv_candidate_priority(canonical_name: str, path: Path) -> int:
+    if canonical_name in VERTICAL_ORDER_CARDIAC_CSV_FILES:
+        parts = {part.lower() for part in path.parts}
+        if "newcsv" in parts or "csv_corrected" in parts:
+            return 20
+    return 10
 
 
 def select_csvs(candidates: dict[str, Path]) -> list[tuple[str, Path]]:

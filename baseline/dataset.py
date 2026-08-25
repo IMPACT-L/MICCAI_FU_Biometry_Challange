@@ -1,4 +1,3 @@
-import glob
 import json
 import os
 import random
@@ -12,7 +11,17 @@ import torch
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
-from utils import canonicalize_task_coords, letterbox_image_and_points
+from csv_utils import collect_effective_train_csvs
+from utils import (
+    canonicalize_task_coords,
+    CONTENT_CROP_MODES,
+    content_crop_image_and_points,
+    content_crop_enabled_for_task,
+    content_crop_pad_ratio,
+    content_crop_should_include_points,
+    letterbox_image_and_points,
+    update_letterbox_meta_for_crop,
+)
 
 
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
@@ -62,6 +71,7 @@ class KeypointDataset(Dataset):
         roi_center_jitter: float = 0.0,
         roi_anchor_json: Optional[str] = None,
         cardiac_split_screen_mode: str = "keep",
+        input_crop_mode: str = "none",
         exclude_fetal_femur_orientation_anomalies: bool = True,
     ):
         super().__init__()
@@ -76,6 +86,9 @@ class KeypointDataset(Dataset):
         self.roi_center_jitter = float(roi_center_jitter)
         self.roi_anchor_predictions = self._load_roi_anchor_predictions(roi_anchor_json)
         self.cardiac_split_screen_mode = str(cardiac_split_screen_mode)
+        if str(input_crop_mode) not in {"none", *CONTENT_CROP_MODES}:
+            raise ValueError(f"Unsupported input_crop_mode: {input_crop_mode}")
+        self.input_crop_mode = str(input_crop_mode)
         self.exclude_fetal_femur_orientation_anomalies = bool(
             exclude_fetal_femur_orientation_anomalies
         )
@@ -83,7 +96,7 @@ class KeypointDataset(Dataset):
         if not os.path.isdir(self.csv_path):
             raise FileNotFoundError(f"CSV path not found: {self.csv_path}")
 
-        all_csv_files = glob.glob(os.path.join(self.csv_path, "*.csv"))
+        all_csv_files = collect_effective_train_csvs(self.data_root, self.csv_path)
         if not all_csv_files:
             raise FileNotFoundError(f"No CSV files found in {self.csv_path}")
 
@@ -427,17 +440,39 @@ class KeypointDataset(Dataset):
             )
 
         original_height, original_width = image.shape[:2]
-        label_original = label_points.reshape(-1).astype(np.float32)
+        label_original_points = label_points.copy()
+
+        content_crop_box = None
+        if content_crop_enabled_for_task(self.input_crop_mode, task_id):
+            image, label_points, content_crop_box = content_crop_image_and_points(
+                image,
+                label_points,
+                pad_ratio=content_crop_pad_ratio(self.input_crop_mode),
+                include_points=content_crop_should_include_points(self.input_crop_mode),
+            )
+            if anchor_points is not None:
+                anchor_points = anchor_points.copy()
+                anchor_points[:, 0] -= float(content_crop_box[0])
+                anchor_points[:, 1] -= float(content_crop_box[1])
+
+        label_original = label_original_points.reshape(-1).astype(np.float32)
 
         image, transformed_points, meta = letterbox_image_and_points(
             image=image,
             coords_px=label_points,
             input_size=self.input_size,
         )
+        if content_crop_box is not None:
+            meta = update_letterbox_meta_for_crop(
+                meta,
+                content_crop_box,
+                original_size=(original_height, original_width),
+            )
         transformed_anchor = None
         if anchor_points is not None:
+            anchor_height, anchor_width = image.shape[:2]
             _, transformed_anchor, _ = letterbox_image_and_points(
-                image=np.zeros((original_height, original_width, 3), dtype=np.uint8),
+                image=np.zeros((anchor_height, anchor_width, 3), dtype=np.uint8),
                 coords_px=anchor_points,
                 input_size=self.input_size,
             )

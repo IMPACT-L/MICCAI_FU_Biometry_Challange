@@ -10,6 +10,7 @@ from typing import Iterable
 import albumentations as A
 import cv2
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -19,15 +20,23 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from dataset import KeypointDataset, KeypointUniformSampler
-from model_factory import MultiTaskModelFactory
+from lora import TaskSpecificLoRALinear, remap_checkpoint_for_lora
+from model_factory import (
+    CANONICAL_PAIR_RULES,
+    TASK_ADAPTER_PROFILE_PRESETS,
+    TASK_DECODER_PROFILE_PRESETS,
+    MultiTaskModelFactory,
+)
 from model_profiles import MODEL_PROFILE_NAMES, apply_model_profile
 from utils import (
     build_line_mask_from_transformed_coords,
+    CONTENT_CROP_MODES,
     compute_aop_angle_loss,
     compute_combined_score,
     compute_dataset_specific_loss,
     compute_femur_shaft_loss,
     compute_fugc_segment_loss,
+    compute_fugc_canal_loss,
     compute_ivc_band_loss,
     compute_normalization_stats_from_dataframe,
     compute_measurement_loss,
@@ -73,6 +82,7 @@ SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES = {
     "A4C": 1.20,
 }
 INPUT_SIZE = 512
+INPUT_CROP_MODE = "none"
 EXTRA_REGRESSION_TASK_IDS = {"A4C", "AOP", "FA", "HC", "IVC", "PLAX", "PSAX"}
 USE_FPN = True  # ← 开关：设为 True 启用 FPN 特征金字塔
 FPN_MODE = "shared"
@@ -334,6 +344,7 @@ def _load_checkpoint_payload(checkpoint_path: str, device: torch.device):
 
 def _load_matching_state_dict(model: torch.nn.Module, checkpoint_state_dict: dict[str, torch.Tensor]):
     model_state = model.state_dict()
+    checkpoint_state_dict = remap_checkpoint_for_lora(model_state, checkpoint_state_dict)
     matched_state = {}
     skipped = []
     for name, value in checkpoint_state_dict.items():
@@ -388,6 +399,11 @@ def _freeze_for_targeted_finetune(
     if freeze_other_heads and target_task_ids:
         for task_id, head in model.heads.items():
             _set_module_requires_grad(head, task_id in target_task_ids)
+        query_refiners = getattr(model, "landmark_query_refiners", None)
+        if query_refiners is not None:
+            for task_id, refiner in query_refiners.items():
+                _set_module_requires_grad(refiner, task_id in target_task_ids)
+        _set_module_requires_grad(getattr(model, "shared_landmark_query_refiner", None), True)
 
 
 def _freeze_except_highres_texture_branch(model: torch.nn.Module):
@@ -449,6 +465,131 @@ def _freeze_except_boundary_branch(model: torch.nn.Module):
         raise ValueError("No boundary branch parameters were found to train.")
 
 
+def _freeze_except_pair_transfer_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    adapter = getattr(model, "context_local_adapters", None)
+    if adapter is None:
+        raise ValueError("--train-pair-transfer-only requires the pair-transfer adapter profile.")
+
+    trainable_prefixes = (
+        "pair_transfer_input.",
+        "pair_task_modulation.",
+        "pair_transfer_shared.",
+        "pair_task_scale.",
+    )
+    enabled = 0
+    for name, param in adapter.named_parameters():
+        if name.startswith(trainable_prefixes):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError("No shared pair-transfer parameters were found to train.")
+
+
+def _freeze_except_fugc_dualscale_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    heads = getattr(model, "heads", None)
+    fugc_head = heads["FUGC"] if heads is not None and "FUGC" in heads else None
+    if fugc_head is None:
+        raise ValueError("--train-fugc-dualscale-only requires a FUGC head.")
+
+    enabled = 0
+    for name, param in fugc_head.named_parameters():
+        if name.startswith("detail_"):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError(
+            "--train-fugc-dualscale-only requires the FUGC dual-scale decoder profile."
+        )
+
+
+def _freeze_except_fugc_anatomy_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    heads = getattr(model, "heads", None)
+    fugc_head = heads["FUGC"] if heads is not None and "FUGC" in heads else None
+    if fugc_head is None:
+        raise ValueError("--train-fugc-anatomy-only requires a FUGC head.")
+
+    enabled = 0
+    for name, param in fugc_head.named_parameters():
+        if name.startswith("anatomy_"):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError(
+            "--train-fugc-anatomy-only requires the asymmetric FUGC anatomy decoder profile."
+        )
+
+
+def _freeze_except_fugc_canal_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    heads = getattr(model, "heads", None)
+    fugc_head = heads["FUGC"] if heads is not None and "FUGC" in heads else None
+    if fugc_head is None:
+        raise ValueError("--train-fugc-canal-only requires a FUGC head.")
+
+    enabled = 0
+    for name, param in fugc_head.named_parameters():
+        if name.startswith("canal_"):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError(
+            "--train-fugc-canal-only requires the cervical-canal FUGC decoder profile."
+        )
+
+
+def _freeze_except_fugc_cervix_endpoint_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    heads = getattr(model, "heads", None)
+    fugc_head = heads["FUGC"] if heads is not None and "FUGC" in heads else None
+    if fugc_head is None:
+        raise ValueError("--train-fugc-cervix-endpoints-only requires a FUGC head.")
+
+    trainable_prefixes = ("cervix_endpoint_", "cervix_local_refine_")
+    enabled = 0
+    for name, param in fugc_head.named_parameters():
+        if name.startswith(trainable_prefixes):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError(
+            "--train-fugc-cervix-endpoints-only requires the segmentation-guided "
+            "FUGC decoder profile."
+        )
+
+
+def _freeze_except_fugc_cervix_branch(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    heads = getattr(model, "heads", None)
+    fugc_head = heads["FUGC"] if heads is not None and "FUGC" in heads else None
+    if fugc_head is None:
+        raise ValueError("--train-fugc-cervix-all requires a FUGC head.")
+
+    enabled = 0
+    for name, param in fugc_head.named_parameters():
+        if name.startswith("cervix_"):
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError(
+            "--train-fugc-cervix-all requires a segmentation-guided FUGC decoder profile."
+        )
+
+
 def _freeze_except_encoder_task_adapter(model: torch.nn.Module):
     for param in model.parameters():
         param.requires_grad = False
@@ -465,10 +606,212 @@ def _freeze_except_encoder_task_adapter(model: torch.nn.Module):
         raise ValueError("No encoder task adapter parameters were found to train.")
 
 
+def _freeze_except_encoder_lora(model: torch.nn.Module):
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    enabled = 0
+    for name, parameter in model.encoder.named_parameters():
+        if ".lora_a" in name or ".lora_b" in name:
+            parameter.requires_grad = True
+            enabled += parameter.numel()
+    if enabled == 0:
+        raise ValueError("--train-encoder-lora-only requires --encoder-lora-rank greater than zero.")
+
+
+def _freeze_except_encoder_lora_and_task_heads(
+    model: torch.nn.Module,
+    train_task_ids: list[str] | None,
+):
+    """Adapt task-specific encoder routes together with selected landmark heads."""
+
+    target_task_ids = {str(task_id) for task_id in (train_task_ids or [])}
+    if not target_task_ids:
+        raise ValueError("Task-head LoRA adaptation requires --train-task-ids.")
+
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    enabled_lora = 0
+    for name, parameter in model.encoder.named_parameters():
+        if ".lora_a" in name or ".lora_b" in name:
+            parameter.requires_grad = True
+            enabled_lora += parameter.numel()
+
+    enabled_heads = 0
+    for task_id, head in model.heads.items():
+        if str(task_id) in target_task_ids:
+            for parameter in head.parameters():
+                parameter.requires_grad = True
+                enabled_heads += parameter.numel()
+
+    query_refiners = getattr(model, "landmark_query_refiners", None)
+    if query_refiners is not None:
+        for task_id, refiner in query_refiners.items():
+            if str(task_id) in target_task_ids:
+                for parameter in refiner.parameters():
+                    parameter.requires_grad = True
+                    enabled_heads += parameter.numel()
+
+    if enabled_lora == 0:
+        raise ValueError(
+            "--train-encoder-lora-and-task-heads-only requires "
+            "--encoder-lora-rank greater than zero."
+        )
+    if enabled_heads == 0:
+        raise ValueError("No target task heads were found for LoRA adaptation.")
+
+
+def _freeze_batch_norm_statistics(model: torch.nn.Module) -> None:
+    """Keep running statistics fixed when only parameter-efficient routes train."""
+
+    for module in model.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+
+def _capture_task_lora_state(model: torch.nn.Module, task_id: str) -> dict[str, torch.Tensor]:
+    state = {}
+    for module_name, module in model.named_modules():
+        if not isinstance(module, TaskSpecificLoRALinear):
+            continue
+        task_index = module.task_to_index[str(task_id)]
+        state[f"{module_name}.lora_a"] = module.lora_a[task_index].detach().cpu().clone()
+        state[f"{module_name}.lora_b"] = module.lora_b[task_index].detach().cpu().clone()
+    if not state:
+        raise ValueError(f"No task-specific LoRA parameters found for task '{task_id}'.")
+    return state
+
+
+def _restore_task_lora_state(
+    model: torch.nn.Module,
+    task_id: str,
+    state: dict[str, torch.Tensor],
+) -> None:
+    modules = dict(model.named_modules())
+    with torch.no_grad():
+        for state_name, value in state.items():
+            module_name, parameter_name = state_name.rsplit(".", 1)
+            module = modules[module_name]
+            task_index = module.task_to_index[str(task_id)]
+            parameter = getattr(module, parameter_name)
+            parameter[task_index].copy_(value.to(device=parameter.device, dtype=parameter.dtype))
+
+
+def _freeze_except_landmark_query_refiners(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    refiners = getattr(model, "landmark_query_refiners", None)
+    shared_refiner = getattr(model, "shared_landmark_query_refiner", None)
+    if (refiners is None or len(refiners) == 0) and shared_refiner is None:
+        raise ValueError("--train-query-refiners-only requires a landmark-query model profile.")
+
+    enabled = 0
+    if refiners is not None:
+        for param in refiners.parameters():
+            param.requires_grad = True
+            enabled += param.numel()
+    if shared_refiner is not None:
+        for param in shared_refiner.parameters():
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError("No landmark query-refiner parameters were found to train.")
+
+
+def _freeze_except_cardiac_pair_set_refiners(model: torch.nn.Module):
+    for param in model.parameters():
+        param.requires_grad = False
+
+    enabled = 0
+    heads = getattr(model, "heads", None)
+    for task_id in ("A4C", "PSAX"):
+        head = heads[task_id] if heads is not None and task_id in heads else None
+        pair_set_refiner = getattr(head, "pair_set_refiner", None)
+        if pair_set_refiner is None:
+            continue
+        for param in pair_set_refiner.parameters():
+            param.requires_grad = True
+            enabled += param.numel()
+    if enabled == 0:
+        raise ValueError(
+            "--train-cardiac-pair-set-only requires a decoder profile with a cardiac pair-set refiner."
+        )
+
+
 def _collect_trainable_params(module: torch.nn.Module | None):
     if module is None:
         return []
     return [param for param in module.parameters() if param.requires_grad]
+
+
+def _pair_order_invariant_coord_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    task_id: str,
+) -> torch.Tensor:
+    rule = CANONICAL_PAIR_RULES.get(task_id)
+    if rule is None:
+        return F.l1_loss(prediction, target)
+
+    pairs, _ = rule
+    pred_points = prediction.view(prediction.shape[0], -1, 2)
+    target_points = target.view(target.shape[0], -1, 2)
+    pair_indices = {index for pair in pairs for index in pair}
+    point_losses = []
+    for point_index in range(pred_points.shape[1]):
+        if point_index not in pair_indices:
+            point_losses.append(
+                torch.abs(pred_points[:, point_index] - target_points[:, point_index]).mean(dim=-1)
+            )
+    for first_index, second_index in pairs:
+        direct = 0.5 * (
+            torch.abs(pred_points[:, first_index] - target_points[:, first_index]).mean(dim=-1)
+            + torch.abs(pred_points[:, second_index] - target_points[:, second_index]).mean(dim=-1)
+        )
+        swapped = 0.5 * (
+            torch.abs(pred_points[:, first_index] - target_points[:, second_index]).mean(dim=-1)
+            + torch.abs(pred_points[:, second_index] - target_points[:, first_index]).mean(dim=-1)
+        )
+        pair_loss = torch.minimum(direct, swapped)
+        point_losses.extend((pair_loss, pair_loss))
+    return torch.stack(point_losses, dim=0).mean()
+
+
+def _pair_order_invariant_heatmap_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    task_id: str,
+) -> torch.Tensor:
+    rule = CANONICAL_PAIR_RULES.get(task_id)
+    if rule is None:
+        return F.mse_loss(prediction, target)
+
+    pairs, _ = rule
+    pair_indices = {index for pair in pairs for index in pair}
+    channel_losses = []
+    for channel_index in range(prediction.shape[1]):
+        if channel_index not in pair_indices:
+            channel_losses.append(
+                F.mse_loss(
+                    prediction[:, channel_index],
+                    target[:, channel_index],
+                    reduction="none",
+                ).mean(dim=(-2, -1))
+            )
+    for first_index, second_index in pairs:
+        direct = 0.5 * (
+            F.mse_loss(prediction[:, first_index], target[:, first_index], reduction="none").mean(dim=(-2, -1))
+            + F.mse_loss(prediction[:, second_index], target[:, second_index], reduction="none").mean(dim=(-2, -1))
+        )
+        swapped = 0.5 * (
+            F.mse_loss(prediction[:, first_index], target[:, second_index], reduction="none").mean(dim=(-2, -1))
+            + F.mse_loss(prediction[:, second_index], target[:, first_index], reduction="none").mean(dim=(-2, -1))
+        )
+        pair_loss = torch.minimum(direct, swapped)
+        channel_losses.extend((pair_loss, pair_loss))
+    return torch.stack(channel_losses, dim=0).mean()
 
 
 def _build_task_configs(dataframe):
@@ -604,6 +947,121 @@ def _build_train_transforms(profile: str):
             ],
             keypoint_params=keypoint_params,
         )
+    if profile == "cardiac_mild_affine_v1":
+        return A.Compose(
+            [
+                A.Affine(
+                    scale={"x": (0.95, 1.05), "y": (0.95, 1.05)},
+                    translate_percent={"x": (-0.02, 0.02), "y": (-0.02, 0.02)},
+                    rotate=(-7, 7),
+                    shear={"x": (-3, 3), "y": (-2, 2)},
+                    fit_output=False,
+                    keep_ratio=False,
+                    mode=cv2.BORDER_CONSTANT,
+                    cval=0,
+                    p=0.50,
+                ),
+                A.OneOf(
+                    [
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.10,
+                            contrast_limit=0.10,
+                            p=1.0,
+                        ),
+                        A.RandomGamma(gamma_limit=(90, 110), p=1.0),
+                    ],
+                    p=0.25,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ],
+            keypoint_params=keypoint_params,
+        )
+    if profile == "fugc_consistency_v1":
+        return A.Compose(
+            [
+                A.Affine(
+                    scale={"x": (0.94, 1.06), "y": (0.94, 1.06)},
+                    translate_percent={"x": (-0.025, 0.025), "y": (-0.025, 0.025)},
+                    rotate=(-7, 7),
+                    shear={"x": (-3, 3), "y": (-2, 2)},
+                    fit_output=False,
+                    keep_ratio=False,
+                    mode=cv2.BORDER_CONSTANT,
+                    cval=0,
+                    p=0.70,
+                ),
+                A.OneOf(
+                    [
+                        A.RandomGamma(gamma_limit=(92, 108), p=1.0),
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.08,
+                            contrast_limit=0.10,
+                            p=1.0,
+                        ),
+                        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+                    ],
+                    p=0.35,
+                ),
+                A.OneOf(
+                    [
+                        A.GaussianBlur(blur_limit=(3, 3), p=1.0),
+                        A.GaussNoise(p=1.0),
+                        A.ImageCompression(quality_lower=90, quality_upper=98, p=1.0),
+                    ],
+                    p=0.15,
+                ),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ],
+            keypoint_params=keypoint_params,
+        )
+    if profile == "validation_style_v1":
+        return A.Compose(
+            [
+                A.Affine(
+                    scale={"x": (0.96, 1.05), "y": (0.96, 1.05)},
+                    translate_percent={"x": (-0.018, 0.018), "y": (-0.018, 0.018)},
+                    rotate=(-5, 5),
+                    shear={"x": (-2.5, 2.5), "y": (-2.0, 2.0)},
+                    fit_output=False,
+                    keep_ratio=False,
+                    mode=cv2.BORDER_CONSTANT,
+                    cval=0,
+                    p=0.45,
+                ),
+                A.OneOf(
+                    [
+                        A.Downscale(
+                            scale_min=0.72,
+                            scale_max=0.92,
+                            interpolation=cv2.INTER_LINEAR,
+                            p=1.0,
+                        ),
+                        A.ImageCompression(quality_lower=72, quality_upper=96, p=1.0),
+                        A.GaussianBlur(blur_limit=(3, 3), p=1.0),
+                        A.Sharpen(alpha=(0.10, 0.24), lightness=(0.80, 1.10), p=1.0),
+                    ],
+                    p=0.35,
+                ),
+                A.OneOf(
+                    [
+                        A.RandomGamma(gamma_limit=(86, 116), p=1.0),
+                        A.RandomBrightnessContrast(
+                            brightness_limit=0.12,
+                            contrast_limit=0.13,
+                            p=1.0,
+                        ),
+                        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+                    ],
+                    p=0.38,
+                ),
+                A.GaussNoise(p=0.08),
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ],
+            keypoint_params=keypoint_params,
+        )
     if profile == "strong_ultrasound_v1":
         return A.Compose(
             [
@@ -651,7 +1109,7 @@ def _build_train_transforms(profile: str):
                     [
                         A.GaussianBlur(blur_limit=(3, 3), p=1.0),
                         A.GaussNoise(p=1.0),
-                        A.ImageCompression(quality_range=(85, 98), p=1.0),
+                        A.ImageCompression(quality_lower=85, quality_upper=98, p=1.0),
                     ],
                     p=0.20,
                 ),
@@ -691,7 +1149,7 @@ def _build_train_transforms(profile: str):
                     [
                         A.GaussianBlur(blur_limit=(3, 3), p=1.0),
                         A.GaussNoise(p=1.0),
-                        A.ImageCompression(quality_range=(85, 98), p=1.0),
+                        A.ImageCompression(quality_lower=85, quality_upper=98, p=1.0),
                     ],
                     p=0.20,
                 ),
@@ -732,7 +1190,7 @@ def _build_train_transforms(profile: str):
                         A.GaussianBlur(blur_limit=(3, 5), p=1.0),
                         A.MotionBlur(blur_limit=5, p=1.0),
                         A.GaussNoise(p=1.0),
-                        A.ImageCompression(quality_range=(82, 97), p=1.0),
+                        A.ImageCompression(quality_lower=82, quality_upper=97, p=1.0),
                     ],
                     p=0.28,
                 ),
@@ -780,7 +1238,7 @@ def _build_train_transforms(profile: str):
                         A.NoOp(p=1.0),
                         A.GaussianBlur(blur_limit=(3, 3), p=1.0),
                         A.GaussNoise(p=1.0),
-                        A.ImageCompression(quality_range=(88, 98), p=1.0),
+                        A.ImageCompression(quality_lower=88, quality_upper=98, p=1.0),
                     ],
                     p=0.15,
                 ),
@@ -832,7 +1290,13 @@ def main(
     output_dir: str = OUTPUT_DIR,
     encoder_name: str = ENCODER,
     encoder_feature_mode: str = ENCODER_FEATURE_MODE,
+    encoder_lora_rank: int = 0,
+    encoder_lora_alpha: float = 16.0,
+    encoder_lora_last_blocks: int = 4,
+    encoder_lora_dropout: float = 0.05,
+    encoder_lora_task_specific: bool = False,
     input_size: int = INPUT_SIZE,
+    input_crop_mode: str = INPUT_CROP_MODE,
     heatmap_size: tuple[int, int] = HEATMAP_SIZE,
     heatmap_sigma: float = HEATMAP_SIGMA,
     head_type: str = HEAD_TYPE,
@@ -849,6 +1313,7 @@ def main(
     dataset_loss_weight: float = 0.0,
     femur_shaft_loss_weight: float = FEMUR_SHAFT_LOSS_WEIGHT,
     fugc_segment_loss_weight: float = FUGC_SEGMENT_LOSS_WEIGHT,
+    fugc_geometry_loss_weight: float = 0.0,
     ivc_band_loss_weight: float = IVC_BAND_LOSS_WEIGHT,
     structure_loss_weight: float = STRUCTURE_LOSS_WEIGHT,
     aop_angle_loss_weight: float = 0.0,
@@ -875,7 +1340,18 @@ def main(
     freeze_other_heads: bool = False,
     train_highres_texture_only: bool = False,
     train_boundary_branch_only: bool = False,
+    train_pair_transfer_only: bool = False,
+    train_fugc_dualscale_only: bool = False,
+    train_fugc_anatomy_only: bool = False,
+    train_fugc_canal_only: bool = False,
+    train_fugc_cervix_endpoints_only: bool = False,
+    train_fugc_cervix_all: bool = False,
     train_encoder_task_adapter_only: bool = False,
+    train_encoder_lora_only: bool = False,
+    train_encoder_lora_and_task_heads_only: bool = False,
+    taskwise_lora_checkpointing: bool = False,
+    train_query_refiners_only: bool = False,
+    train_cardiac_pair_set_only: bool = False,
     domain_adversarial_weight: float = 0.0,
     domain_adversarial_lambda: float = 1.0,
     split_mode: str = SPLIT_MODE,
@@ -884,6 +1360,8 @@ def main(
     checkpoint_score_mode: str = CHECKPOINT_SCORE_MODE,
     cardiac_split_screen_mode: str = CARDIAC_SPLIT_SCREEN_MODE,
     cardiac_split_screen_vdark_threshold: float = CARDIAC_SPLIT_SCREEN_VDARK_THRESHOLD,
+    fixed_val_split_csv: str | None = None,
+    include_fixed_val_in_train: bool = False,
 ):
     if model_profile is not None:
         profile_config = apply_model_profile(
@@ -893,6 +1371,7 @@ def main(
                 "encoder_name": encoder_name,
                 "encoder_feature_mode": encoder_feature_mode,
                 "input_size": input_size,
+                "input_crop_mode": input_crop_mode,
                 "heatmap_size": list(heatmap_size),
                 "heatmap_sigma": heatmap_sigma,
                 "use_fpn": use_fpn,
@@ -913,6 +1392,7 @@ def main(
                 "dataset_loss_weight": dataset_loss_weight,
                 "femur_shaft_loss_weight": femur_shaft_loss_weight,
                 "fugc_segment_loss_weight": fugc_segment_loss_weight,
+                "fugc_geometry_loss_weight": fugc_geometry_loss_weight,
                 "ivc_band_loss_weight": ivc_band_loss_weight,
                 "structure_loss_weight": structure_loss_weight,
                 "aop_angle_loss_weight": aop_angle_loss_weight,
@@ -923,6 +1403,7 @@ def main(
         encoder_name = str(profile_config["encoder_name"])
         encoder_feature_mode = str(profile_config.get("encoder_feature_mode", encoder_feature_mode))
         input_size = int(profile_config["input_size"])
+        input_crop_mode = str(profile_config.get("input_crop_mode", input_crop_mode))
         if profile_config.get("heatmap_size"):
             profile_heatmap_size = profile_config["heatmap_size"]
             if isinstance(profile_heatmap_size, int):
@@ -963,12 +1444,17 @@ def main(
     metric_column = "MRE (pixels)"
     metric_label_map = {
         "combined": CHECKPOINT_SCORE_NAME,
+        "target_task_v1": "Target-task combined score",
         "server_proxy_v1": "Server proxy score",
         "server_proxy_v2": "Server proxy score",
         "server_proxy_v3": "Server proxy score",
         "robust_domain_v1": "Robust domain score",
     }
     metric_label = metric_label_map.get(checkpoint_score_mode, CHECKPOINT_SCORE_NAME)
+    if checkpoint_score_mode == "target_task_v1" and len(train_task_ids or []) != 1:
+        raise ValueError(
+            "--checkpoint-score-mode target_task_v1 requires exactly one --train-task-ids value."
+        )
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = os.path.abspath(output_dir)
     log_dir = os.path.join(output_dir, "log")
@@ -1030,12 +1516,29 @@ def main(
                 task_loss_family_profile = str(init_checkpoint_meta["task_loss_family_profile"])
             if input_size == INPUT_SIZE and init_checkpoint_meta.get("input_size"):
                 input_size = int(init_checkpoint_meta["input_size"])
+            if input_crop_mode == INPUT_CROP_MODE and init_checkpoint_meta.get("input_crop_mode"):
+                input_crop_mode = str(init_checkpoint_meta["input_crop_mode"])
             if use_fpn == USE_FPN and "use_fpn" in init_checkpoint_meta:
                 use_fpn = bool(init_checkpoint_meta["use_fpn"])
             if fpn_mode == FPN_MODE and init_checkpoint_meta.get("fpn_mode"):
                 fpn_mode = str(init_checkpoint_meta["fpn_mode"])
             if fpn_type == FPN_TYPE and init_checkpoint_meta.get("fpn_type"):
                 fpn_type = str(init_checkpoint_meta["fpn_type"])
+            if encoder_lora_rank == 0 and int(init_checkpoint_meta.get("encoder_lora_rank", 0)) > 0:
+                encoder_lora_rank = int(init_checkpoint_meta["encoder_lora_rank"])
+                encoder_lora_alpha = float(init_checkpoint_meta.get("encoder_lora_alpha", encoder_lora_alpha))
+                encoder_lora_last_blocks = int(
+                    init_checkpoint_meta.get("encoder_lora_last_blocks", encoder_lora_last_blocks)
+                )
+                encoder_lora_dropout = float(
+                    init_checkpoint_meta.get("encoder_lora_dropout", encoder_lora_dropout)
+                )
+                encoder_lora_task_specific = bool(
+                    init_checkpoint_meta.get(
+                        "encoder_lora_task_specific",
+                        encoder_lora_task_specific,
+                    )
+                )
         elif task_head_profile == TASK_HEAD_PROFILE:
             task_head_profile = "uniform"
     logger.info(f"Device used: {device}")
@@ -1043,7 +1546,14 @@ def main(
     logger.info(f"Random seed: {random_seed}")
     logger.info(f"Encoder: {encoder_name}")
     logger.info(f"Encoder feature mode: {encoder_feature_mode}")
+    logger.info(
+        "Encoder LoRA: "
+        f"rank={encoder_lora_rank}, alpha={encoder_lora_alpha:g}, "
+        f"last_blocks={encoder_lora_last_blocks}, dropout={encoder_lora_dropout:.3f}, "
+        f"task_specific={encoder_lora_task_specific}"
+    )
     logger.info(f"Input size: {input_size}")
+    logger.info(f"Input crop mode: {input_crop_mode}")
     logger.info(f"Head type: {head_type}")
     logger.info(f"Task head profile: {task_head_profile}")
     logger.info(f"Task decoder profile: {task_decoder_profile}")
@@ -1060,6 +1570,7 @@ def main(
     logger.info(f"Dataset-specific loss weight: {dataset_loss_weight:.6f}")
     logger.info(f"Femur shaft loss weight: {femur_shaft_loss_weight:.6f}")
     logger.info(f"FUGC segment loss weight: {fugc_segment_loss_weight:.6f}")
+    logger.info(f"FUGC geometry loss weight: {fugc_geometry_loss_weight:.6f}")
     logger.info(f"IVC band loss weight: {ivc_band_loss_weight:.6f}")
     logger.info(f"Structure map loss weight: {structure_loss_weight:.6f}")
     logger.info(f"AOP angle loss weight: {aop_angle_loss_weight:.6f}")
@@ -1089,7 +1600,20 @@ def main(
     logger.info(f"Freeze other heads: {freeze_other_heads}")
     logger.info(f"Train high-res texture branch only: {train_highres_texture_only}")
     logger.info(f"Train boundary branch only: {train_boundary_branch_only}")
+    logger.info(f"Train pair-transfer branch only: {train_pair_transfer_only}")
+    logger.info(f"Train FUGC dual-scale branch only: {train_fugc_dualscale_only}")
+    logger.info(f"Train FUGC anatomy branch only: {train_fugc_anatomy_only}")
+    logger.info(f"Train FUGC cervical-canal branch only: {train_fugc_canal_only}")
+    logger.info(
+        "Train FUGC segmentation-guided endpoint layers only: "
+        f"{train_fugc_cervix_endpoints_only}"
+    )
+    logger.info(f"Train complete FUGC cervical parser: {train_fugc_cervix_all}")
     logger.info(f"Train encoder task adapter only: {train_encoder_task_adapter_only}")
+    logger.info(f"Train encoder LoRA only: {train_encoder_lora_only}")
+    logger.info(f"Taskwise LoRA checkpointing: {taskwise_lora_checkpointing}")
+    logger.info(f"Train landmark query refiners only: {train_query_refiners_only}")
+    logger.info(f"Train cardiac pair-set refiners only: {train_cardiac_pair_set_only}")
     logger.info(f"Domain adversarial weight: {domain_adversarial_weight:.6f}")
     logger.info(f"Domain adversarial GRL lambda: {domain_adversarial_lambda:.6f}")
     logger.info(f"Split mode: {split_mode}")
@@ -1099,6 +1623,16 @@ def main(
     logger.info(f"Cardiac split-screen vertical-darkness threshold: {cardiac_split_screen_vdark_threshold:.6f}")
     logger.info(f"Heatmap size: {heatmap_size}")
     logger.info(f"Heatmap sigma: {heatmap_sigma:.6f}")
+    if taskwise_lora_checkpointing:
+        if not encoder_lora_task_specific or not train_encoder_lora_only:
+            raise ValueError(
+                "--taskwise-lora-checkpointing requires "
+                "--encoder-lora-task-specific and --train-encoder-lora-only."
+            )
+        if use_ema:
+            raise ValueError("--taskwise-lora-checkpointing requires --no-ema.")
+        if init_checkpoint is None:
+            raise ValueError("--taskwise-lora-checkpointing requires --init-checkpoint.")
     effective_task_loss_weights = dict(TASK_LOSS_WEIGHTS)
     if task_loss_weight_overrides:
         effective_task_loss_weights.update(task_loss_weight_overrides)
@@ -1126,6 +1660,7 @@ def main(
         heatmap_size=heatmap_size,
         sigma=heatmap_sigma,
         input_size=input_size,
+        input_crop_mode=input_crop_mode,
     )
     temp_dataset.dataframe = _assign_cardiac_split_screen_flags(
         temp_dataset.dataframe,
@@ -1174,7 +1709,41 @@ def main(
     if sampler_task_weight_overrides:
         effective_sampler_task_weights.update(sampler_task_weight_overrides)
 
-    if split_mode == "row":
+    if fixed_val_split_csv is not None:
+        if not os.path.isfile(fixed_val_split_csv):
+            raise FileNotFoundError(f"Fixed validation split not found: {fixed_val_split_csv}")
+        fixed_val_df = pd.read_csv(fixed_val_split_csv)
+        if "image_path" not in fixed_val_df.columns:
+            raise ValueError(
+                f"Fixed validation split must contain image_path: {fixed_val_split_csv}"
+            )
+
+        def normalized_split_path(value: str) -> str:
+            return os.path.normpath(str(value)).replace("\\", "/")
+
+        fixed_val_paths = {
+            normalized_split_path(path)
+            for path in fixed_val_df["image_path"].astype(str).tolist()
+        }
+        row_paths = temp_dataset.dataframe["image_path"].astype(str).map(normalized_split_path)
+        val_mask = row_paths.isin(fixed_val_paths)
+        val_indices = temp_dataset.dataframe.index[val_mask].tolist()
+        if include_fixed_val_in_train:
+            train_indices = temp_dataset.dataframe.index.tolist()
+        else:
+            train_indices = temp_dataset.dataframe.index[~val_mask].tolist()
+        if not val_indices:
+            raise ValueError(
+                f"No dataset rows matched fixed validation split: {fixed_val_split_csv}"
+            )
+        if not train_indices:
+            raise ValueError("No training rows remain after applying fixed validation split.")
+        logger.info(
+            f"Using fixed validation split {fixed_val_split_csv}: "
+            f"{len(train_indices)} train rows, {len(val_indices)} validation rows"
+            + ("; fixed validation rows are also included in training" if include_fixed_val_in_train else "")
+        )
+    elif split_mode == "row":
         train_indices, val_indices = _stratified_split_indices(
             temp_dataset.dataframe,
             val_split=val_split,
@@ -1212,6 +1781,7 @@ def main(
         roi_center_jitter=roi_center_jitter,
         roi_anchor_json=roi_anchor_json,
         cardiac_split_screen_mode=cardiac_split_screen_mode,
+        input_crop_mode=input_crop_mode,
     )
     train_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
     if train_task_ids:
@@ -1225,6 +1795,20 @@ def main(
             "No training samples remain after applying train task filter. "
             f"Requested task IDs: {train_task_ids}"
         )
+    if checkpoint_score_mode == "target_task_v1":
+        target_task_id = str(train_task_ids[0])
+        val_indices = [
+            idx
+            for idx in val_indices
+            if str(temp_dataset.dataframe.iloc[idx]["task_id"]) == target_task_id
+        ]
+        if not val_indices:
+            raise ValueError(f"No validation samples remain for target task '{target_task_id}'.")
+        logger.info(
+            f"Restricted validation to target task {target_task_id}: {len(val_indices)} samples"
+        )
+    train_size = len(train_indices)
+    val_size = len(val_indices)
     train_split_path = os.path.join(splits_dir, "train_split.csv")
     val_split_path = os.path.join(splits_dir, "val_split.csv")
     train_split_df = temp_dataset.dataframe.iloc[train_indices].reset_index(drop=True)
@@ -1246,6 +1830,7 @@ def main(
         roi_center_jitter=0.0,
         roi_anchor_json=roi_anchor_json,
         cardiac_split_screen_mode=cardiac_split_screen_mode,
+        input_crop_mode=input_crop_mode,
     )
     val_dataset.dataframe = temp_dataset.dataframe.reset_index(drop=True)
 
@@ -1309,6 +1894,11 @@ def main(
         fpn_mode=fpn_mode,
         fpn_type=fpn_type,
         encoder_feature_mode=encoder_feature_mode,
+        encoder_lora_rank=encoder_lora_rank,
+        encoder_lora_alpha=encoder_lora_alpha,
+        encoder_lora_last_blocks=encoder_lora_last_blocks,
+        encoder_lora_dropout=encoder_lora_dropout,
+        encoder_lora_task_specific=encoder_lora_task_specific,
         head_type=head_type,
         task_head_profile=task_head_profile,
         task_decoder_profile=task_decoder_profile,
@@ -1348,6 +1938,11 @@ def main(
             fpn_mode=fpn_mode,
             fpn_type=fpn_type,
             encoder_feature_mode=encoder_feature_mode,
+            encoder_lora_rank=encoder_lora_rank,
+            encoder_lora_alpha=encoder_lora_alpha,
+            encoder_lora_last_blocks=encoder_lora_last_blocks,
+            encoder_lora_dropout=encoder_lora_dropout,
+            encoder_lora_task_specific=encoder_lora_task_specific,
             head_type=head_type,
             task_head_profile=task_head_profile,
             task_decoder_profile=task_decoder_profile,
@@ -1380,8 +1975,28 @@ def main(
         _freeze_except_highres_texture_branch(model)
     if train_boundary_branch_only:
         _freeze_except_boundary_branch(model)
+    if train_pair_transfer_only:
+        _freeze_except_pair_transfer_branch(model)
+    if train_fugc_dualscale_only:
+        _freeze_except_fugc_dualscale_branch(model)
+    if train_fugc_anatomy_only:
+        _freeze_except_fugc_anatomy_branch(model)
+    if train_fugc_canal_only:
+        _freeze_except_fugc_canal_branch(model)
+    if train_fugc_cervix_endpoints_only:
+        _freeze_except_fugc_cervix_endpoint_branch(model)
+    if train_fugc_cervix_all:
+        _freeze_except_fugc_cervix_branch(model)
     if train_encoder_task_adapter_only:
         _freeze_except_encoder_task_adapter(model)
+    if train_encoder_lora_only:
+        _freeze_except_encoder_lora(model)
+    if train_encoder_lora_and_task_heads_only:
+        _freeze_except_encoder_lora_and_task_heads(model, train_task_ids)
+    if train_query_refiners_only:
+        _freeze_except_landmark_query_refiners(model)
+    if train_cardiac_pair_set_only:
+        _freeze_except_cardiac_pair_set_refiners(model)
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(param.numel() for param in model.parameters() if param.requires_grad)
     logger.info(
@@ -1390,9 +2005,21 @@ def main(
     )
 
     param_groups = []
-    encoder_params = _collect_trainable_params(model.encoder)
+    encoder_lora_params = [
+        parameter
+        for name, parameter in model.encoder.named_parameters()
+        if parameter.requires_grad and (".lora_a" in name or ".lora_b" in name)
+    ]
+    encoder_lora_param_ids = {id(parameter) for parameter in encoder_lora_params}
+    encoder_params = [
+        parameter
+        for parameter in model.encoder.parameters()
+        if parameter.requires_grad and id(parameter) not in encoder_lora_param_ids
+    ]
     if encoder_params:
         param_groups.append({"params": encoder_params, "lr": learning_rate * 0.2})
+    if encoder_lora_params:
+        param_groups.append({"params": encoder_lora_params, "lr": learning_rate * 5.0})
     if model.fpn is not None:
         fpn_params = _collect_trainable_params(model.fpn)
         if fpn_params:
@@ -1434,6 +2061,18 @@ def main(
         domain_params = _collect_trainable_params(model.domain_classifier)
         if domain_params:
             param_groups.append({"params": domain_params, "lr": learning_rate * 5.0})
+    if getattr(model, "landmark_query_refiners", None) is not None:
+        refiner_params = _collect_trainable_params(model.landmark_query_refiners)
+        if refiner_params:
+            param_groups.append({"params": refiner_params, "lr": learning_rate * 10.0})
+    if getattr(model, "shared_landmark_query_refiner", None) is not None:
+        refiner_params = _collect_trainable_params(model.shared_landmark_query_refiner)
+        if refiner_params:
+            param_groups.append({"params": refiner_params, "lr": learning_rate * 10.0})
+    if getattr(model, "shared_anatomical_query_decoder", None) is not None:
+        decoder_params = _collect_trainable_params(model.shared_anatomical_query_decoder)
+        if decoder_params:
+            param_groups.append({"params": decoder_params, "lr": learning_rate * 5.0})
     for task_id, head in model.heads.items():
         head_params = _collect_trainable_params(head)
         if head_params:
@@ -1447,9 +2086,157 @@ def main(
     ema = ModelEma(model, decay=ema_decay) if use_ema else None
     scaler = GradScaler(enabled=bool(use_amp and device.type == "cuda"))
 
+    def checkpoint_meta() -> dict:
+        return {
+            "encoder_name": encoder_name,
+            "encoder_feature_mode": encoder_feature_mode,
+            "encoder_lora_rank": encoder_lora_rank,
+            "encoder_lora_alpha": encoder_lora_alpha,
+            "encoder_lora_last_blocks": encoder_lora_last_blocks,
+            "encoder_lora_dropout": encoder_lora_dropout,
+            "encoder_lora_task_specific": encoder_lora_task_specific,
+            "taskwise_lora_checkpointing": taskwise_lora_checkpointing,
+            "taskwise_lora_best_epochs": dict(taskwise_best_epoch),
+            "taskwise_lora_tracking_score": taskwise_best_composed_score,
+            "use_fpn": use_fpn,
+            "fpn_mode": fpn_mode,
+            "fpn_type": fpn_type,
+            "head_type": head_type,
+            "task_head_profile": task_head_profile,
+            "task_decoder_profile": task_decoder_profile,
+            "task_adapter_profile": task_adapter_profile,
+            "task_loss_family_profile": task_loss_family_profile,
+            "input_size": input_size,
+            "input_crop_mode": input_crop_mode,
+            "heatmap_size": list(heatmap_size),
+            "heatmap_sigma": heatmap_sigma,
+            "checkpoint_metric": metric_label,
+            "measurement_loss_weight": measurement_loss_weight,
+            "measurement_loss_tasks": sorted(enabled_measurement_task_ids),
+            "measurement_task_weight_overrides": measurement_task_weight_overrides or {},
+            "dataset_loss_weight": dataset_loss_weight,
+            "femur_shaft_loss_weight": femur_shaft_loss_weight,
+            "fugc_segment_loss_weight": fugc_segment_loss_weight,
+            "fugc_geometry_loss_weight": fugc_geometry_loss_weight,
+            "ivc_band_loss_weight": ivc_band_loss_weight,
+            "structure_loss_weight": structure_loss_weight,
+            "aop_angle_loss_weight": aop_angle_loss_weight,
+            "domain_adversarial": float(domain_adversarial_weight) > 0.0,
+            "domain_adversarial_weight": domain_adversarial_weight,
+            "domain_adversarial_lambda": domain_adversarial_lambda,
+            "num_domain_classes": len(domain_label_to_idx),
+            "domain_label_to_idx": domain_label_to_idx,
+            "teacher_checkpoint": teacher_checkpoint,
+            "teacher_consistency_weight": teacher_consistency_weight,
+            "teacher_consistency_tasks": (
+                sorted(enabled_teacher_task_ids) if enabled_teacher_task_ids is not None else []
+            ),
+            "roi_anchor_json": roi_anchor_json,
+            "anchor_consistency_weight": anchor_consistency_weight,
+            "anchor_consistency_tasks": (
+                sorted(enabled_anchor_task_ids) if enabled_anchor_task_ids is not None else []
+            ),
+            "use_ema": use_ema,
+            "ema_decay": ema_decay,
+            "task_loss_weight_overrides": task_loss_weight_overrides or {},
+            "sampler_task_weight_overrides": sampler_task_weight_overrides or {},
+            "normalization_scheme": "train_iqr_proxy",
+            "train_roi_crop": train_roi_crop,
+            "roi_crop_tasks": sorted(roi_crop_tasks) if roi_crop_tasks else [],
+            "roi_context_range": [roi_context_min, roi_context_max],
+            "roi_center_jitter": roi_center_jitter,
+            "split_mode": split_mode,
+            "augmentation_profile": augmentation_profile,
+            "checkpoint_task_weight_overrides": checkpoint_task_weight_overrides or {},
+            "checkpoint_score_mode": checkpoint_score_mode,
+            "cardiac_split_screen_mode": cardiac_split_screen_mode,
+            "cardiac_split_screen_vdark_threshold": cardiac_split_screen_vdark_threshold,
+            "random_seed": random_seed,
+            "server_proxy_hard_task_ids": list(SERVER_PROXY_HARD_TASK_IDS),
+            "server_proxy_v2_hard_task_weight_overrides": SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
+            "server_proxy_v3_hard_task_weight_overrides": SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES,
+        }
+
+    def checkpoint_payload() -> dict:
+        return {
+            "state_dict": ema.shadow if ema is not None else model.state_dict(),
+            "meta": checkpoint_meta(),
+        }
+
+    def score_validation_results(val_results_df, val_case_df=None):
+        proxy_breakdown = None
+        robust_domain_breakdown = None
+        if checkpoint_score_mode == "target_task_v1":
+            target_task_id = str(train_task_ids[0])
+            target_results_df = val_results_df[
+                val_results_df["Task ID"].astype(str) == target_task_id
+            ]
+            if target_results_df.empty:
+                raise ValueError(
+                    f"Validation results do not contain target task '{target_task_id}'."
+                )
+            selected_val_score = compute_combined_score(
+                target_results_df,
+                normalization_stats=normalization_stats,
+            )
+        elif checkpoint_score_mode == "server_proxy_v1":
+            proxy_breakdown = compute_server_proxy_breakdown(
+                val_results_df,
+                normalization_stats=normalization_stats,
+                task_weights=effective_checkpoint_task_weights,
+                hard_task_ids=SERVER_PROXY_HARD_TASK_IDS,
+            )
+            selected_val_score = float(proxy_breakdown["proxy_score"])
+        elif checkpoint_score_mode == "server_proxy_v2":
+            proxy_breakdown = compute_server_proxy_breakdown(
+                val_results_df,
+                normalization_stats=normalization_stats,
+                task_weights=effective_checkpoint_task_weights,
+                hard_task_ids=tuple(SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES.keys()),
+                hard_task_weight_overrides=SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
+                base_weight=0.45,
+                hard_task_weight=0.35,
+                worst_task_weight=0.20,
+                worst_k=3,
+            )
+            selected_val_score = float(proxy_breakdown["proxy_score"])
+        elif checkpoint_score_mode == "server_proxy_v3":
+            proxy_breakdown = compute_server_proxy_breakdown(
+                val_results_df,
+                normalization_stats=normalization_stats,
+                task_weights=effective_checkpoint_task_weights,
+                hard_task_ids=tuple(SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES.keys()),
+                hard_task_weight_overrides=SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES,
+                base_weight=0.40,
+                hard_task_weight=0.40,
+                worst_task_weight=0.20,
+                worst_k=4,
+            )
+            selected_val_score = float(proxy_breakdown["proxy_score"])
+        elif checkpoint_score_mode == "robust_domain_v1":
+            robust_domain_breakdown = compute_robust_domain_breakdown(
+                val_results_df,
+                val_case_df,
+                normalization_stats=normalization_stats,
+                task_weights=effective_checkpoint_task_weights,
+            )
+            selected_val_score = float(robust_domain_breakdown["robust_score"])
+        else:
+            selected_val_score = compute_combined_score(
+                val_results_df,
+                normalization_stats=normalization_stats,
+                task_weights=effective_checkpoint_task_weights,
+            )
+        return selected_val_score, proxy_breakdown, robust_domain_breakdown
+
     best_val_score = float("inf")
     epochs_without_improvement = 0
     best_val_results_df = None
+    taskwise_best_score: dict[str, float] = {}
+    taskwise_best_epoch: dict[str, int] = {}
+    taskwise_best_state: dict[str, dict[str, torch.Tensor]] = {}
+    taskwise_best_row: dict[str, dict] = {}
+    taskwise_best_composed_score = float("inf")
     logger.info(f"Best-checkpoint metric: {metric_label} (lower is better)")
     if early_stopping_patience is None:
         logger.info("Early stopping: DISABLED")
@@ -1461,9 +2248,91 @@ def main(
     logger.info("=" * 50)
     logger.info("--- Start Keypoint Training ---")
 
+    if init_checkpoint is not None:
+        logger.info("--- Epoch 0 Warm-Start Validation ---")
+        if checkpoint_score_mode == "robust_domain_v1":
+            initial_val_results_df, initial_val_case_df = evaluate_keypoint(
+                model,
+                val_loader,
+                device,
+                task_id_to_name,
+                normalization_stats=normalization_stats,
+                return_case_df=True,
+            )
+        else:
+            initial_val_results_df = evaluate_keypoint(
+                model,
+                val_loader,
+                device,
+                task_id_to_name,
+                normalization_stats=normalization_stats,
+            )
+            initial_val_case_df = None
+        initial_val_score, _, _ = score_validation_results(
+            initial_val_results_df,
+            initial_val_case_df,
+        )
+        initial_metrics_path = os.path.join(metrics_dir, "validation_metrics_epoch0.csv")
+        initial_val_results_df.to_csv(initial_metrics_path, index=False)
+        logger.info(f"Epoch-0 validation metrics saved at: {initial_metrics_path}")
+        best_val_score = float(initial_val_score)
+        best_val_results_df = initial_val_results_df.copy()
+        if taskwise_lora_checkpointing:
+            selected_tasks = set(train_task_ids or initial_val_results_df["Task ID"].tolist())
+            for _, row in initial_val_results_df.iterrows():
+                task_id = str(row["Task ID"])
+                if task_id not in selected_tasks:
+                    continue
+                task_row_df = initial_val_results_df[
+                    initial_val_results_df["Task ID"].astype(str) == task_id
+                ]
+                taskwise_best_score[task_id] = compute_combined_score(
+                    task_row_df,
+                    normalization_stats=normalization_stats,
+                )
+                taskwise_best_epoch[task_id] = 0
+                taskwise_best_state[task_id] = _capture_task_lora_state(model, task_id)
+                taskwise_best_row[task_id] = row.to_dict()
+            taskwise_best_composed_score = best_val_score
+        torch.save(checkpoint_payload(), model_save_path)
+        writer.add_scalar("val/combined_score", best_val_score, 0)
+        if not initial_val_results_df.empty and metric_column in initial_val_results_df.columns:
+            writer.add_scalar(
+                "val/mre_pixels_mean",
+                float(initial_val_results_df[metric_column].mean()),
+                0,
+            )
+        logger.info(initial_val_results_df.to_string(index=False, float_format=lambda x: f"{x:.6f}"))
+        logger.info(
+            f"-> Protected warm-start checkpoint at epoch 0 with "
+            f"{metric_label}: {best_val_score:.6f}"
+        )
+
     try:
         for epoch in range(num_epochs):
             model.train()
+            if any(
+                (
+                    freeze_encoder,
+                    freeze_fpn,
+                    freeze_adapters,
+                    freeze_other_heads,
+                    train_highres_texture_only,
+                    train_boundary_branch_only,
+                    train_pair_transfer_only,
+                    train_fugc_dualscale_only,
+                    train_fugc_anatomy_only,
+                    train_fugc_canal_only,
+                    train_fugc_cervix_endpoints_only,
+                    train_fugc_cervix_all,
+                    train_encoder_task_adapter_only,
+                    train_encoder_lora_only,
+                    train_encoder_lora_and_task_heads_only,
+                    train_query_refiners_only,
+                    train_cardiac_pair_set_only,
+                )
+            ):
+                _freeze_batch_norm_statistics(model)
             epoch_train_losses = defaultdict(list)
             loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
             optimizer.zero_grad(set_to_none=True)
@@ -1491,17 +2360,60 @@ def main(
                         target_coords = torch.stack([batch["train_label"][i] for i in task_indices], 0).to(device)
                         pred_coords_transformed = softargmax_heatmaps_to_transformed_coords(pred_logits)
                         refined_coords_transformed = aux_outputs.get("refined_coords_transformed")
+                        pre_query_coords_transformed = aux_outputs.get("pre_query_coords_transformed")
+                        pre_canonical_coords_transformed = aux_outputs.get("pre_canonical_coords_transformed")
                         axis_coords_transformed = aux_outputs.get("axis_coords_transformed")
                         target_coords_transformed = target_coords.clone()
-                        coord_loss = F.l1_loss(pred_coords_transformed, target_coords_transformed)
-                        if refined_coords_transformed is not None and axis_coords_transformed is not None:
+                        if pre_canonical_coords_transformed is not None:
+                            coord_loss = _pair_order_invariant_coord_loss(
+                                pred_coords_transformed,
+                                target_coords_transformed,
+                                current_task_id,
+                            )
+                        else:
+                            coord_loss = F.l1_loss(pred_coords_transformed, target_coords_transformed)
+                        if refined_coords_transformed is not None and pre_query_coords_transformed is not None:
+                            refined_coord_loss = F.l1_loss(refined_coords_transformed, target_coords_transformed)
+                            pre_query_coord_loss = F.l1_loss(pre_query_coords_transformed, target_coords_transformed)
+                            coord_loss = 0.25 * coord_loss + 0.25 * pre_query_coord_loss + 0.50 * refined_coord_loss
+                        elif refined_coords_transformed is not None and pre_canonical_coords_transformed is not None:
+                            refined_coord_loss = F.l1_loss(refined_coords_transformed, target_coords_transformed)
+                            pre_canonical_coord_loss = _pair_order_invariant_coord_loss(
+                                pre_canonical_coords_transformed,
+                                target_coords_transformed,
+                                current_task_id,
+                            )
+                            coord_loss = 0.20 * coord_loss + 0.20 * pre_canonical_coord_loss + 0.60 * refined_coord_loss
+                        elif refined_coords_transformed is not None and axis_coords_transformed is not None:
                             refined_coord_loss = F.l1_loss(refined_coords_transformed, target_coords_transformed)
                             axis_coord_loss = F.l1_loss(axis_coords_transformed, target_coords_transformed)
                             coord_loss = 0.35 * coord_loss + 0.50 * refined_coord_loss + 0.15 * axis_coord_loss
                         elif refined_coords_transformed is not None:
                             refined_coord_loss = F.l1_loss(refined_coords_transformed, target_coords_transformed)
                             coord_loss = 0.4 * coord_loss + 0.6 * refined_coord_loss
-                        heatmap_loss = F.mse_loss(pred_heatmaps, task_heatmaps)
+                        anatomy_local_coords = aux_outputs.get("anatomy_local_coords_transformed")
+                        if anatomy_local_coords is not None:
+                            anatomy_local_coord_loss = F.l1_loss(
+                                anatomy_local_coords,
+                                target_coords_transformed,
+                            )
+                            coord_loss = 0.6 * coord_loss + 0.4 * anatomy_local_coord_loss
+                        canal_local_coords = aux_outputs.get("canal_local_coords_transformed")
+                        if canal_local_coords is not None:
+                            canal_local_coord_loss = F.smooth_l1_loss(
+                                canal_local_coords,
+                                target_coords_transformed,
+                                beta=0.01,
+                            )
+                            coord_loss = 0.5 * coord_loss + 0.5 * canal_local_coord_loss
+                        if pre_canonical_coords_transformed is not None:
+                            heatmap_loss = _pair_order_invariant_heatmap_loss(
+                                pred_heatmaps,
+                                task_heatmaps,
+                                current_task_id,
+                            )
+                        else:
+                            heatmap_loss = F.mse_loss(pred_heatmaps, task_heatmaps)
                         pred_coords_original = transformed_coords_to_original_normalized(
                             refined_coords_transformed if refined_coords_transformed is not None else pred_coords_transformed,
                             [batch["meta"][i] for i in task_indices],
@@ -1533,12 +2445,30 @@ def main(
                                 heatmap_size=heatmap_size,
                             )
                         fugc_segment_loss = pred_logits.new_tensor(0.0)
+                        fugc_geometry_loss = pred_logits.new_tensor(0.0)
                         if current_task_id == "FUGC":
                             fugc_segment_loss = compute_fugc_segment_loss(
                                 aux_outputs.get("segment_logits"),
                                 target_coords_transformed,
                                 heatmap_size=heatmap_size,
                             )
+                            fugc_canal_loss = compute_fugc_canal_loss(
+                                aux_outputs.get("canal_logits"),
+                                aux_outputs.get("canal_sample_grid_transformed"),
+                                target_coords_transformed,
+                            )
+                            if aux_outputs.get("canal_logits") is not None:
+                                fugc_segment_loss = 0.25 * fugc_segment_loss + 0.75 * fugc_canal_loss
+                            geometry_coords_transformed = aux_outputs.get("geometry_coords_transformed")
+                            if (
+                                geometry_coords_transformed is not None
+                                and float(fugc_geometry_loss_weight) > 0.0
+                            ):
+                                fugc_geometry_loss = F.smooth_l1_loss(
+                                    geometry_coords_transformed,
+                                    target_coords_transformed,
+                                    beta=0.01,
+                                )
                         ivc_band_loss = pred_logits.new_tensor(0.0)
                         if current_task_id == "IVC":
                             ivc_band_loss = compute_ivc_band_loss(
@@ -1645,6 +2575,7 @@ def main(
                             + dataset_loss_weight * dataset_specific_loss
                             + femur_shaft_loss_weight * femur_shaft_loss
                             + fugc_segment_loss_weight * fugc_segment_loss
+                            + fugc_geometry_loss_weight * fugc_geometry_loss
                             + ivc_band_loss_weight * ivc_band_loss
                             + structure_loss_weight * structure_map_loss
                             + aop_angle_loss_weight * aop_angle_loss
@@ -1719,56 +2650,9 @@ def main(
                 val_case_df = None
             if restore_state is not None:
                 model.load_state_dict(restore_state, strict=True)
-            proxy_breakdown = None
-            robust_domain_breakdown = None
-            if checkpoint_score_mode == "server_proxy_v1":
-                proxy_breakdown = compute_server_proxy_breakdown(
-                    val_results_df,
-                    normalization_stats=normalization_stats,
-                    task_weights=effective_checkpoint_task_weights,
-                    hard_task_ids=SERVER_PROXY_HARD_TASK_IDS,
-                )
-                selected_val_score = float(proxy_breakdown["proxy_score"])
-            elif checkpoint_score_mode == "server_proxy_v2":
-                proxy_breakdown = compute_server_proxy_breakdown(
-                    val_results_df,
-                    normalization_stats=normalization_stats,
-                    task_weights=effective_checkpoint_task_weights,
-                    hard_task_ids=tuple(SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES.keys()),
-                    hard_task_weight_overrides=SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
-                    base_weight=0.45,
-                    hard_task_weight=0.35,
-                    worst_task_weight=0.20,
-                    worst_k=3,
-                )
-                selected_val_score = float(proxy_breakdown["proxy_score"])
-            elif checkpoint_score_mode == "server_proxy_v3":
-                proxy_breakdown = compute_server_proxy_breakdown(
-                    val_results_df,
-                    normalization_stats=normalization_stats,
-                    task_weights=effective_checkpoint_task_weights,
-                    hard_task_ids=tuple(SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES.keys()),
-                    hard_task_weight_overrides=SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES,
-                    base_weight=0.40,
-                    hard_task_weight=0.40,
-                    worst_task_weight=0.20,
-                    worst_k=4,
-                )
-                selected_val_score = float(proxy_breakdown["proxy_score"])
-            elif checkpoint_score_mode == "robust_domain_v1":
-                robust_domain_breakdown = compute_robust_domain_breakdown(
-                    val_results_df,
-                    val_case_df,
-                    normalization_stats=normalization_stats,
-                    task_weights=effective_checkpoint_task_weights,
-                )
-                selected_val_score = float(robust_domain_breakdown["robust_score"])
-            else:
-                selected_val_score = compute_combined_score(
-                    val_results_df,
-                    normalization_stats=normalization_stats,
-                    task_weights=effective_checkpoint_task_weights,
-                )
+            selected_val_score, proxy_breakdown, robust_domain_breakdown = (
+                score_validation_results(val_results_df, val_case_df)
+            )
             selected_val_mre = float("inf")
             selected_val_measurement = float("inf")
             selected_val_normalized_mre = float("inf")
@@ -1785,6 +2669,42 @@ def main(
                 measurement_values = val_results_df["Normalized Measurement MAE"].dropna()
                 if len(measurement_values) > 0:
                     selected_val_normalized_measurement = float(measurement_values.mean())
+
+            taskwise_improved_tasks = []
+            taskwise_composed_score = selected_val_score
+            taskwise_composed_improved = False
+            if taskwise_lora_checkpointing:
+                for _, row in val_results_df.iterrows():
+                    task_id = str(row["Task ID"])
+                    if task_id not in taskwise_best_score:
+                        continue
+                    task_row_df = val_results_df[
+                        val_results_df["Task ID"].astype(str) == task_id
+                    ]
+                    task_score = compute_combined_score(
+                        task_row_df,
+                        normalization_stats=normalization_stats,
+                    )
+                    if task_score < taskwise_best_score[task_id]:
+                        taskwise_best_score[task_id] = task_score
+                        taskwise_best_epoch[task_id] = epoch + 1
+                        taskwise_best_state[task_id] = _capture_task_lora_state(model, task_id)
+                        taskwise_best_row[task_id] = row.to_dict()
+                        taskwise_improved_tasks.append(task_id)
+
+                composed_tracking_df = val_results_df.copy()
+                for task_id, best_row in taskwise_best_row.items():
+                    row_mask = composed_tracking_df["Task ID"].astype(str) == task_id
+                    for column, value in best_row.items():
+                        composed_tracking_df.loc[row_mask, column] = value
+                taskwise_composed_score, _, _ = score_validation_results(
+                    composed_tracking_df
+                )
+                taskwise_composed_improved = taskwise_composed_score < (
+                    taskwise_best_composed_score - early_stopping_min_delta
+                )
+                if taskwise_composed_improved:
+                    taskwise_best_composed_score = taskwise_composed_score
 
             logger.info(f"\n--- Epoch {epoch + 1} Validation Report ---")
             if not val_results_df.empty:
@@ -1863,76 +2783,39 @@ def main(
                     f"worst_domain={robust_domain_breakdown['worst_domain_score']:.6f} ---"
                 )
             logger.info(f"--- Average Val {metric_label} (Lower is better): {selected_val_score:.6f} ---")
+            if taskwise_lora_checkpointing:
+                logger.info(
+                    "--- Taskwise composed validation score "
+                    f"(Lower is better): {taskwise_composed_score:.6f} ---"
+                )
 
-            improved = selected_val_score < (best_val_score - early_stopping_min_delta)
-            if improved:
+            globally_improved = selected_val_score < (best_val_score - early_stopping_min_delta)
+            if globally_improved:
                 best_val_score = selected_val_score
-                epochs_without_improvement = 0
                 best_val_results_df = val_results_df.copy()
-                checkpoint_payload = {
-                    "state_dict": ema.shadow if ema is not None else model.state_dict(),
-                        "meta": {
-                            "encoder_name": encoder_name,
-                            "encoder_feature_mode": encoder_feature_mode,
-                            "use_fpn": use_fpn,
-                            "fpn_mode": fpn_mode,
-                            "fpn_type": fpn_type,
-                            "head_type": head_type,
-                            "task_head_profile": task_head_profile,
-                            "task_decoder_profile": task_decoder_profile,
-                            "task_adapter_profile": task_adapter_profile,
-                            "task_loss_family_profile": task_loss_family_profile,
-                            "input_size": input_size,
-                            "heatmap_size": list(heatmap_size),
-                            "heatmap_sigma": heatmap_sigma,
-                            "checkpoint_metric": metric_label,
-                            "measurement_loss_weight": measurement_loss_weight,
-                            "measurement_loss_tasks": sorted(enabled_measurement_task_ids),
-                            "measurement_task_weight_overrides": measurement_task_weight_overrides or {},
-                            "dataset_loss_weight": dataset_loss_weight,
-                            "femur_shaft_loss_weight": femur_shaft_loss_weight,
-                            "fugc_segment_loss_weight": fugc_segment_loss_weight,
-                            "ivc_band_loss_weight": ivc_band_loss_weight,
-                            "structure_loss_weight": structure_loss_weight,
-                            "aop_angle_loss_weight": aop_angle_loss_weight,
-                            "domain_adversarial": float(domain_adversarial_weight) > 0.0,
-                            "domain_adversarial_weight": domain_adversarial_weight,
-                            "domain_adversarial_lambda": domain_adversarial_lambda,
-                            "num_domain_classes": len(domain_label_to_idx),
-                            "domain_label_to_idx": domain_label_to_idx,
-                            "teacher_checkpoint": teacher_checkpoint,
-                            "teacher_consistency_weight": teacher_consistency_weight,
-                            "teacher_consistency_tasks": (
-                                sorted(enabled_teacher_task_ids) if enabled_teacher_task_ids is not None else []
-                            ),
-                            "roi_anchor_json": roi_anchor_json,
-                            "anchor_consistency_weight": anchor_consistency_weight,
-                            "anchor_consistency_tasks": (
-                                sorted(enabled_anchor_task_ids) if enabled_anchor_task_ids is not None else []
-                            ),
-                            "use_ema": use_ema,
-                            "ema_decay": ema_decay,
-                            "task_loss_weight_overrides": task_loss_weight_overrides or {},
-                            "sampler_task_weight_overrides": sampler_task_weight_overrides or {},
-                            "normalization_scheme": "train_iqr_proxy",
-                            "train_roi_crop": train_roi_crop,
-                            "roi_crop_tasks": sorted(roi_crop_tasks) if roi_crop_tasks else [],
-                            "roi_context_range": [roi_context_min, roi_context_max],
-                            "roi_center_jitter": roi_center_jitter,
-                            "split_mode": split_mode,
-                            "augmentation_profile": augmentation_profile,
-                            "checkpoint_task_weight_overrides": checkpoint_task_weight_overrides or {},
-                            "checkpoint_score_mode": checkpoint_score_mode,
-                            "cardiac_split_screen_mode": cardiac_split_screen_mode,
-                            "cardiac_split_screen_vdark_threshold": cardiac_split_screen_vdark_threshold,
-                            "random_seed": random_seed,
-                            "server_proxy_hard_task_ids": list(SERVER_PROXY_HARD_TASK_IDS),
-                            "server_proxy_v2_hard_task_weight_overrides": SERVER_PROXY_V2_HARD_TASK_WEIGHT_OVERRIDES,
-                            "server_proxy_v3_hard_task_weight_overrides": SERVER_PROXY_V3_HARD_TASK_WEIGHT_OVERRIDES,
-                        },
-                    }
-                torch.save(checkpoint_payload, model_save_path)
+                torch.save(checkpoint_payload(), model_save_path)
                 logger.info(f"-> New best model saved! {metric_label} improved to: {best_val_score:.6f}")
+            if taskwise_lora_checkpointing:
+                if taskwise_improved_tasks:
+                    logger.info(
+                        "-> Captured improved taskwise LoRA routes: "
+                        + ", ".join(sorted(taskwise_improved_tasks))
+                    )
+                if taskwise_composed_improved:
+                    epochs_without_improvement = 0
+                    logger.info(
+                        "-> Taskwise composed score improved significantly; "
+                        "early stopping counter reset."
+                    )
+                else:
+                    epochs_without_improvement += 1
+                    if early_stopping_patience is not None:
+                        logger.info(
+                            "-> No significant taskwise composed-score improvement. "
+                            f"Early stopping counter: {epochs_without_improvement}/{early_stopping_patience}"
+                        )
+            elif globally_improved:
+                epochs_without_improvement = 0
             else:
                 epochs_without_improvement += 1
                 if early_stopping_patience is not None:
@@ -1945,13 +2828,54 @@ def main(
 
             if (
                 early_stopping_patience is not None
-                and epochs_without_improvement > early_stopping_patience
+                and epochs_without_improvement >= early_stopping_patience
             ):
                 logger.info(
                     "Early stopping triggered after "
                     f"{epoch + 1} epochs. Best {metric_label}: {best_val_score:.6f}"
                 )
                 break
+
+        if taskwise_lora_checkpointing:
+            for task_id, task_state in taskwise_best_state.items():
+                _restore_task_lora_state(model, task_id, task_state)
+            model.eval()
+            if checkpoint_score_mode == "robust_domain_v1":
+                composed_results_df, composed_case_df = evaluate_keypoint(
+                    model,
+                    val_loader,
+                    device,
+                    task_id_to_name,
+                    normalization_stats=normalization_stats,
+                    return_case_df=True,
+                )
+            else:
+                composed_results_df = evaluate_keypoint(
+                    model,
+                    val_loader,
+                    device,
+                    task_id_to_name,
+                    normalization_stats=normalization_stats,
+                )
+                composed_case_df = None
+            composed_score, _, _ = score_validation_results(
+                composed_results_df,
+                composed_case_df,
+            )
+            best_val_score = float(composed_score)
+            best_val_results_df = composed_results_df.copy()
+            torch.save(checkpoint_payload(), model_save_path)
+            logger.info(
+                "Taskwise LoRA epochs: "
+                + ", ".join(
+                    f"{task_id}={taskwise_best_epoch[task_id]}"
+                    for task_id in sorted(taskwise_best_epoch)
+                )
+            )
+            logger.info(
+                f"Saved composed taskwise LoRA checkpoint with {metric_label}: "
+                f"{best_val_score:.6f}"
+            )
 
         if best_val_results_df is not None and not best_val_results_df.empty:
             best_val_results_df.to_csv(metrics_save_path, index=False)
@@ -2066,10 +2990,51 @@ if __name__ == "__main__":
         help=f"Backbone feature extraction mode (default: {ENCODER_FEATURE_MODE}).",
     )
     parser.add_argument(
+        "--encoder-lora-rank",
+        type=int,
+        default=0,
+        help="LoRA rank for qkv/proj in the final ViT attention blocks; 0 disables LoRA.",
+    )
+    parser.add_argument(
+        "--encoder-lora-alpha",
+        type=float,
+        default=16.0,
+        help="LoRA residual scaling numerator.",
+    )
+    parser.add_argument(
+        "--encoder-lora-last-blocks",
+        type=int,
+        default=4,
+        help="Number of final ViT blocks receiving LoRA attention adapters.",
+    )
+    parser.add_argument(
+        "--encoder-lora-dropout",
+        type=float,
+        default=0.05,
+        help="Dropout applied to the LoRA residual input.",
+    )
+    parser.add_argument(
+        "--encoder-lora-task-specific",
+        action="store_true",
+        help="Route an independent LoRA parameter set for each landmark task.",
+    )
+    parser.add_argument(
         "--input-size",
         type=int,
         default=INPUT_SIZE,
         help=f"Square letterbox input size (default: {INPUT_SIZE}).",
+    )
+    parser.add_argument(
+        "--input-crop-mode",
+        type=str,
+        choices=("none", *sorted(CONTENT_CROP_MODES)),
+        default=INPUT_CROP_MODE,
+        help=(
+            "Optional model-side crop applied before letterboxing. content_box removes "
+            "scanner background and expands training crops to include labels; "
+            "content_box_wide keeps a larger image-evidence margin; strict modes use "
+            "image evidence only in both training and inference."
+        ),
     )
     parser.add_argument(
         "--heatmap-size",
@@ -2124,14 +3089,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task-decoder-profile",
         type=str,
-        choices=("uniform", "cardiac_graph_v1", "coarse_refine_v1", "ivc_refine_v1", "ivc_refine_v2", "fugc_refine_v1", "hc_refine_v1", "hidden_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_refine_v1", "hidden_a4c_hc_ivc_fugc_refine_v1", "hidden_a4c_hc_ivc_fugc_offset_v1", "hidden_a4c_hc_ivc_fugc_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_aop_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_vector_offset_v1", "hidden_a4c_hc_ivc_fugc_strip_axis_offset_v1", "hidden_a4c_hc_ivc_fugc_segment_specialist_v1", "hidden_a4c_hc_ivc_fugc_offset_v2", "hidden_a4c_hc_ivc_plax_refine_v1", "hidden_a4c_hc_ivc_femur_refine_v1", "geometry_v1", "geometry_family_v2", "structure_v1", "weak_tasks_v1", "dedicated_legacy_v1", "dedicated_v1"),
+        choices=tuple(TASK_DECODER_PROFILE_PRESETS.keys()),
         default=TASK_DECODER_PROFILE,
         help=f"Task-specific decoder family profile (default: {TASK_DECODER_PROFILE}).",
     )
     parser.add_argument(
         "--task-adapter-profile",
         type=str,
-        choices=("uniform", "softsharing_v1", "localrefine_v1", "coarse_refine_v1", "context_experts_v1", "context_local_v1", "context_local_stylemix_v1", "texture_context_v1", "texture_residual_v1", "texture_residual_v2", "highres_texture_v1", "pixel_unet_v1", "hrnet_residual_v1", "encoder_task_context_local_v1", "encoder_task_hard_context_local_v1", "boundary_context_v1", "taskfilm_v1"),
+        choices=tuple(TASK_ADAPTER_PROFILE_PRESETS.keys()),
         default=TASK_ADAPTER_PROFILE,
         help=f"Task-specific feature adapter profile (default: {TASK_ADAPTER_PROFILE}).",
     )
@@ -2150,16 +3115,34 @@ if __name__ == "__main__":
         help=f"Validation split strategy (default: {SPLIT_MODE}).",
     )
     parser.add_argument(
+        "--fixed-val-split-csv",
+        type=str,
+        default=None,
+        help=(
+            "Optional CSV whose image_path rows define an immutable validation set. "
+            "All other resolved rows are assigned to training."
+        ),
+    )
+    parser.add_argument(
+        "--include-fixed-val-in-train",
+        action="store_true",
+        help=(
+            "When --fixed-val-split-csv is set, keep those rows in the validation monitor "
+            "but also include them in the training sampler. This is intended only for final "
+            "refit after selecting the recipe."
+        ),
+    )
+    parser.add_argument(
         "--augmentation-profile",
         type=str,
-        choices=("baseline", "strong_ultrasound_v1", "ultrasound_robust_v1", "ultrasound_domain_shift_v1", "ultrasound_domain_shift_v2", "ultrasound_mixed_v1"),
+        choices=("baseline", "cardiac_mild_affine_v1", "fugc_consistency_v1", "validation_style_v1", "strong_ultrasound_v1", "ultrasound_robust_v1", "ultrasound_domain_shift_v1", "ultrasound_domain_shift_v2", "ultrasound_mixed_v1"),
         default=AUGMENTATION_PROFILE,
         help=f"Training augmentation profile (default: {AUGMENTATION_PROFILE}).",
     )
     parser.add_argument(
         "--checkpoint-score-mode",
         type=str,
-        choices=("combined", "server_proxy_v1", "server_proxy_v2", "server_proxy_v3", "robust_domain_v1"),
+        choices=("combined", "target_task_v1", "server_proxy_v1", "server_proxy_v2", "server_proxy_v3", "robust_domain_v1"),
         default=CHECKPOINT_SCORE_MODE,
         help=f"Validation score used for best-checkpoint selection (default: {CHECKPOINT_SCORE_MODE}).",
     )
@@ -2181,6 +3164,12 @@ if __name__ == "__main__":
         type=float,
         default=FUGC_SEGMENT_LOSS_WEIGHT,
         help="Auxiliary short-segment mask loss for FUGC. Use 0.0 to disable.",
+    )
+    parser.add_argument(
+        "--fugc-geometry-loss-weight",
+        type=float,
+        default=0.0,
+        help="Direct differentiable mask-geometry coordinate loss for FUGC. Use 0.0 to disable.",
     )
     parser.add_argument(
         "--ivc-band-loss-weight",
@@ -2337,9 +3326,70 @@ if __name__ == "__main__":
         help="Freeze the warm-started base model and train only the boundary residual branch.",
     )
     parser.add_argument(
+        "--train-pair-transfer-only",
+        action="store_true",
+        help="Freeze the warm-started model and train only the shared segment-transfer residual.",
+    )
+    parser.add_argument(
+        "--train-fugc-dualscale-only",
+        action="store_true",
+        help="Freeze the warm-started model and train only the FUGC image-detail residual branch.",
+    )
+    parser.add_argument(
+        "--train-fugc-anatomy-only",
+        action="store_true",
+        help="Freeze the warm-started model and train only the asymmetric FUGC anatomy experts.",
+    )
+    parser.add_argument(
+        "--train-fugc-canal-only",
+        action="store_true",
+        help="Freeze the base model and train only the FUGC cervical-canal branch.",
+    )
+    parser.add_argument(
+        "--train-fugc-cervix-endpoints-only",
+        action="store_true",
+        help=(
+            "Freeze the segmentation backbone and base model, then train only the "
+            "segmentation-guided FUGC endpoint and local-refinement layers."
+        ),
+    )
+    parser.add_argument(
+        "--train-fugc-cervix-all",
+        action="store_true",
+        help="Freeze the base model and adapt the complete segmentation-guided FUGC branch.",
+    )
+    parser.add_argument(
         "--train-encoder-task-adapter-only",
         action="store_true",
         help="Freeze the warm-started base model and train only the pre-FPN task encoder adapter.",
+    )
+    parser.add_argument(
+        "--train-encoder-lora-only",
+        action="store_true",
+        help="Freeze the warm-started model and train only encoder LoRA parameters.",
+    )
+    parser.add_argument(
+        "--train-encoder-lora-and-task-heads-only",
+        action="store_true",
+        help=(
+            "Freeze the base model and train task-specific encoder LoRA routes "
+            "plus the selected landmark heads."
+        ),
+    )
+    parser.add_argument(
+        "--taskwise-lora-checkpointing",
+        action="store_true",
+        help="Compose the final task-specific LoRA checkpoint from each task's best validation epoch.",
+    )
+    parser.add_argument(
+        "--train-query-refiners-only",
+        action="store_true",
+        help="Freeze the warm-started base model and train only landmark query refiners.",
+    )
+    parser.add_argument(
+        "--train-cardiac-pair-set-only",
+        action="store_true",
+        help="Freeze the warm-started base model and train only A4C/PSAX pair-set refiners.",
     )
     parser.add_argument(
         "--domain-adversarial-weight",
@@ -2408,7 +3458,13 @@ if __name__ == "__main__":
         output_dir=str(args.output_dir),
         encoder_name=str(args.encoder_name),
         encoder_feature_mode=str(args.encoder_feature_mode),
+        encoder_lora_rank=int(args.encoder_lora_rank),
+        encoder_lora_alpha=float(args.encoder_lora_alpha),
+        encoder_lora_last_blocks=int(args.encoder_lora_last_blocks),
+        encoder_lora_dropout=float(args.encoder_lora_dropout),
+        encoder_lora_task_specific=bool(args.encoder_lora_task_specific),
         input_size=int(args.input_size),
+        input_crop_mode=str(args.input_crop_mode),
         heatmap_size=(int(args.heatmap_size), int(args.heatmap_size)),
         heatmap_sigma=float(args.heatmap_sigma),
         head_type=str(args.head_type),
@@ -2421,6 +3477,8 @@ if __name__ == "__main__":
         checkpoint_score_mode=str(args.checkpoint_score_mode),
         cardiac_split_screen_mode=str(args.cardiac_split_screen_mode),
         cardiac_split_screen_vdark_threshold=float(args.cardiac_split_screen_vdark_threshold),
+        fixed_val_split_csv=args.fixed_val_split_csv,
+        include_fixed_val_in_train=bool(args.include_fixed_val_in_train),
         learning_rate=float(args.learning_rate),
         init_checkpoint=args.init_checkpoint,
         train_task_ids=_parse_task_id_csv(args.train_task_ids),
@@ -2430,6 +3488,7 @@ if __name__ == "__main__":
         dataset_loss_weight=float(args.dataset_loss_weight),
         femur_shaft_loss_weight=float(args.femur_shaft_loss_weight),
         fugc_segment_loss_weight=float(args.fugc_segment_loss_weight),
+        fugc_geometry_loss_weight=float(args.fugc_geometry_loss_weight),
         ivc_band_loss_weight=float(args.ivc_band_loss_weight),
         structure_loss_weight=float(args.structure_loss_weight),
         aop_angle_loss_weight=float(args.aop_angle_loss_weight),
@@ -2452,7 +3511,18 @@ if __name__ == "__main__":
         freeze_other_heads=bool(args.freeze_other_heads),
         train_highres_texture_only=bool(args.train_highres_texture_only),
         train_boundary_branch_only=bool(args.train_boundary_branch_only),
+        train_pair_transfer_only=bool(args.train_pair_transfer_only),
+        train_fugc_dualscale_only=bool(args.train_fugc_dualscale_only),
+        train_fugc_anatomy_only=bool(args.train_fugc_anatomy_only),
+        train_fugc_canal_only=bool(args.train_fugc_canal_only),
+        train_fugc_cervix_endpoints_only=bool(args.train_fugc_cervix_endpoints_only),
+        train_fugc_cervix_all=bool(args.train_fugc_cervix_all),
         train_encoder_task_adapter_only=bool(args.train_encoder_task_adapter_only),
+        train_encoder_lora_only=bool(args.train_encoder_lora_only),
+        train_encoder_lora_and_task_heads_only=bool(args.train_encoder_lora_and_task_heads_only),
+        taskwise_lora_checkpointing=bool(args.taskwise_lora_checkpointing),
+        train_query_refiners_only=bool(args.train_query_refiners_only),
+        train_cardiac_pair_set_only=bool(args.train_cardiac_pair_set_only),
         domain_adversarial_weight=float(args.domain_adversarial_weight),
         domain_adversarial_lambda=float(args.domain_adversarial_lambda),
         train_roi_crop=bool(args.train_roi_crop),
