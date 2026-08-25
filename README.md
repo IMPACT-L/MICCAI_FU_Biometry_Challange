@@ -5,6 +5,10 @@ submission. The method uses one shared DINOv3 ViT-B encoder with
 task-specific feature pyramids, local adapters, and anatomy-aware landmark
 decoders for nine ultrasound tasks.
 
+**Paper:** [Unified Coarse-to-Fine Landmark Localization for Multi-Domain
+Ultrasound Biometry](https://openreview.net/search?term=Unified%20Coarse-to-Fine%20Landmark%20Localization%20for%20Multi-Domain%20Ultrasound%20Biometry)
+— Hamza Rasaee and Hassan Rivaz, MWM 2026.
+
 ## Method
 
 The selected configuration is `hidden_context_local_offset128_v1`:
@@ -130,7 +134,6 @@ If you use this code, please cite:
 
 > Rasaee, H., & Rivaz, H. (2026). **Unified Coarse-to-Fine Landmark
 > Localization for Multi-Domain Ultrasound Biometry.** MWM 2026.
-> [OpenReview](https://openreview.net/search?term=Unified%20Coarse-to-Fine%20Landmark%20Localization%20for%20Multi-Domain%20Ultrasound%20Biometry)
 
 ```bibtex
 @inproceedings{rasaee2026unified,
