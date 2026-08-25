@@ -25,6 +25,21 @@ The selected configuration is `hidden_context_local_offset128_v1`:
 The nine supported task IDs are `A4C`, `AOP`, `FA`, `FUGC`, `HC`, `IVC`,
 `PLAX`, `PSAX`, and `fetal_femur`.
 
+## Model weights
+
+The final single-model checkpoint used for the reported CodaBench submission
+is available on Hugging Face:
+
+- [fu_bio_2026.pth](https://huggingface.co/hmrasa/FU-Biometry-2026/blob/main/fu_bio_2026.pth)
+- SHA-256: `49d1d1478246c7e03468ba8bc3319db6e3aa66170494e9ff19d345865c00f512`
+
+Download it with:
+
+```bash
+huggingface-cli download hmrasa/FU-Biometry-2026 fu_bio_2026.pth \
+  --local-dir checkpoints
+```
+
 ## Repository layout
 
 ```text
