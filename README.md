@@ -123,3 +123,21 @@ The original code in this repository is released under the
 [MIT License](LICENSE). DINOv3 weights, challenge data, and other third-party
 resources remain subject to their respective upstream licenses and access
 terms.
+
+## Citation
+
+If you use this code, please cite:
+
+> Rasaee, H., & Rivaz, H. (2026). **Unified Coarse-to-Fine Landmark
+> Localization for Multi-Domain Ultrasound Biometry.** MWM 2026.
+> [OpenReview](https://openreview.net/search?term=Unified%20Coarse-to-Fine%20Landmark%20Localization%20for%20Multi-Domain%20Ultrasound%20Biometry)
+
+```bibtex
+@inproceedings{rasaee2026unified,
+  title     = {Unified Coarse-to-Fine Landmark Localization for Multi-Domain
+               Ultrasound Biometry},
+  author    = {Rasaee, Hamza and Rivaz, Hassan},
+  booktitle = {MWM 2026},
+  year      = {2026}
+}
+```
